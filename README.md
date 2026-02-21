@@ -1,12 +1,10 @@
 # KoreDB 🚀
 
 <p align="center">
-  <img src="logo.png" alt="KoreDB Logo" width="500">
+  <img src="logo.png" alt="KoreDB Logo" width="344">
   <br>
   <b>The AI-Native, High-Performance NoSQL Database for Modern Android.</b>
 </p>
-
-**The AI-Native, High-Performance NoSQL Database for Modern Android.**
 
 KoreDB is a pure Kotlin, embedded database engine built from the ground up using a **Log-Structured Merge-tree (LSM)** architecture. Unlike SQLite (designed for spinning disks in 2000), KoreDB is optimized for modern flash storage, high-concurrency Coroutines, and on-device AI applications.
 
