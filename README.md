@@ -27,11 +27,34 @@ Add the dependency to your `build.gradle.kts`:
 ```kotlin
 dependencies {
     implementation("io.github.raipankaj:koredb:0.0.1")
-    // Note: Ensure you have kotlinx-serialization plugin applied
 }
 ```
 
-### 2. Initialize Database
+### 2. Setup Serialization (Recommended)
+
+KoreDB uses **Kotlinx Serialization** to handle Data Classes. To use the built-in `collection<T>` API, add the serialization plugin to your project:
+
+**Project `build.gradle.kts`:**
+```kotlin
+plugins {
+    kotlin("plugin.serialization") version "2.0.21" 
+}
+```
+
+**Module `build.gradle.kts`:**
+```kotlin
+plugins {
+    kotlin("plugin.serialization")
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+}
+```
+
+> **Note:** Kotlinx Serialization is optional. If you prefer Moshi or Gson, you can implement the `KoreSerializer<T>` interface and pass it to the collection manually.
+
+### 3. Initialize Database
 
 Initialize KoreDB once in your `Application` class:
 
@@ -131,7 +154,7 @@ To find a record, KoreDB searches in this order:
 
 ---
 
-## 📊 Benchmarks vs Room (SQLite)
+## 📊 KoreDB vs SQLite
 
 | Operation | KoreDB                    | SQLite                   | Winner |
 | :--- |:--------------------------|:-------------------------| :--- |
