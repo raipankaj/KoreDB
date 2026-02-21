@@ -1,0 +1,38 @@
+# Built artifacts
+/build
+/*/build
+/captures
+
+# Gradle
+.gradle/
+
+# Local configuration
+/local.properties
+.DS_Store
+
+# IDE - IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Security / Signing
+*.gpg
+*.asc
+*.key
+*.jks
+secring.gpg
+
+# Local Publishing Scripts
+koredb/publish-maven.gradle
+
+# Unit test reports
+/*/build/reports/
+/*/build/test-results/
+
+# Log files
+*.log
+
+# Dokka output
+koredb/docs/
+koredb/build/dokka/
