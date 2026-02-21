@@ -105,7 +105,7 @@ KoreDB follows the classic LSM-Tree pattern used by Bigtable, Cassandra, and Roc
 
 ---
 
-## 📊 Benchmarks vs Room (SQLite)
+## 📊 KoreDB vs SQLite
 
 | Operation | KoreDB (LSM) | Room (B-Tree) | Winner |
 | :--- | :--- | :--- | :--- |
