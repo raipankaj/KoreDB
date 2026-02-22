@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 KoreDB Authors
+ * Copyright 2026 KoreDB Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 
 /**
- * Handles the creation and formatting of Static Sorted Tables (SSTables).
+ * Handles the creation and formatting of Sorted String Tables (SSTables).
  *
  * An SSTable is an immutable disk-resident file containing sorted key-value pairs.
  * The format includes:

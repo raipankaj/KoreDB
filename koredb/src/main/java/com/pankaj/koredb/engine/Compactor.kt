@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 KoreDB Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.pankaj.koredb.engine
 
 import com.pankaj.koredb.foundation.ByteArrayComparator
@@ -8,17 +24,32 @@ import com.pankaj.koredb.foundation.SSTableReader
 import java.io.File
 import java.util.PriorityQueue
 
+/**
+ * Handles the merging and cleaning of multiple SSTable segments.
+ *
+ * Compaction is a critical background process in LSM-Trees that maintains performance
+ * and reclaims disk space by:
+ * 1. **Merging:** Combining multiple sorted segments into a single new segment.
+ * 2. **Deduplication:** Keeping only the newest version of a key and discarding older ones.
+ * 3. **Tombstone Removal:** Physically deleting records that were marked for deletion, 
+ *    thus reclaiming space.
+ */
 object Compactor {
 
     /**
      * Merges multiple SSTables into a single, clean SSTable.
-     * Removes duplicates (keeps newest) and removes Tombstones.
+     *
+     * This implementation uses a multi-way merge algorithm with a [PriorityQueue]
+     * to efficiently process sorted data from multiple readers.
+     *
+     * @param readers A list of [SSTableReader]s for the segments to be compacted.
+     * @param outputFile The destination file for the new, compacted SSTable.
      */
     fun compact(
         readers: List<SSTableReader>,
         outputFile: File
     ) {
-        // 1. Create Iterators for every file
+        // 1. Initialize Iterators for all input files
         val queue = PriorityQueue<SSTableIterator>()
         readers.forEachIndexed { index, reader ->
             val iterator = SSTableIterator(reader, fileIndex = index)
@@ -27,49 +58,40 @@ object Compactor {
             }
         }
 
-        // 2. Prepare the Writer (using a temporary MemTable logic for simplicity, 
-        //    but properly streaming via a temp file writer is better. 
-        //    Here we reuse SSTable.writeFromMemTable logic but manually).
-        
-        // We will stream-write directly to the output file to avoid OOM
+        // 2. Process and Merge
+        // For simplicity, we aggregate the compacted data into a fresh MemTable 
+        // before flushing. In an extremely large-scale scenario, we would stream
+        // directly to a FileChannel.
         val tempMemTable = MemTable()
-        // Note: For a true 100GB DB, we would write directly to FileChannel.
-        // For this Enterprise implementation, buffering into a fresh MemTable 
-        // and then flushing is a safe, easy way to reuse our writing logic.
-
         var lastProcessedKey: ByteArray? = null
 
         while (queue.isNotEmpty()) {
-            // Get the iterator with the smallest key (and newest version)
+            // Retrieve the iterator with the smallest key (and newest version)
             val topIterator = queue.poll()
             val candidateKey = topIterator.currentKey!!
             val candidateValue = topIterator.currentValue!!
 
-            // --- DEDUPLICATION LOGIC ---
-            // Because our PriorityQueue sorts by Newest File Index when keys are equal,
-            // the first time we see a key, it is GUARANTEED to be the latest version.
-            // We process it, and then ignore any subsequent appearances of this key.
-
+            // Deduplication: The PriorityQueue ensures we see the newest version of a key first.
+            // Any subsequent appearances of the same key in older segments are ignored.
             val isNewKey = lastProcessedKey == null || ByteArrayComparator.compare(candidateKey, lastProcessedKey) != 0
             
             if (isNewKey) {
-                // This is the latest version of this key.
                 lastProcessedKey = candidateKey
 
-                // --- TOMBSTONE LOGIC ---
-                // If the value is empty, it's a delete. We do NOT write it. Space reclaimed!
+                // Tombstone Logic: If the value is empty, it represents a deletion.
+                // We omit it from the new segment to reclaim disk space.
                 if (candidateValue.isNotEmpty()) {
                     tempMemTable.put(candidateKey, candidateValue)
                 }
             }
 
-            // Advance this iterator and put it back in the queue if it has more data
+            // Advance the iterator and re-insert into the queue if more data is available
             if (topIterator.advance()) {
                 queue.add(topIterator)
             }
         }
 
-        // 3. Write the clean, merged data to disk
+        // 3. Persist the merged, deduplicated data to disk
         SSTable.writeFromMemTable(tempMemTable, outputFile)
     }
 }

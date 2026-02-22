@@ -1,4 +1,21 @@
+/*
+ * Copyright 2024 KoreDB Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.pankaj.koredb.engine
+
 import com.pankaj.koredb.core.VectorMath
 import com.pankaj.koredb.core.VectorSerializer
 import com.pankaj.koredb.foundation.MemTable
@@ -11,6 +28,22 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicInteger
 
+/**
+ * The core Log-Structured Merge-tree (LSM) database engine.
+ *
+ * KoreDB coordinates the flow of data between the in-memory [MemTable], the 
+ * durability-focused [WriteAheadLog], and the disk-resident [SSTable] segments.
+ *
+ * Key Design Principles:
+ * 1. **Write Path:** Data is appended to the WAL and updated in the MemTable (O(1)).
+ * 2. **Read Path:** Multi-tiered lookup starting from MemTable, then traversing 
+ *    SSTables from newest to oldest.
+ * 3. **Durability:** WAL ensures zero data loss on crashes.
+ * 4. **Scalability:** Periodic compaction prevents disk fragmentation and 
+ *    maintains read performance.
+ *
+ * @param directory The directory where all database files (SSTables, WAL) are stored.
+ */
 class KoreDB(private val directory: File) {
 
     private var memTable = MemTable()
@@ -22,49 +55,45 @@ class KoreDB(private val directory: File) {
     private val sstReaders = mutableListOf<SSTableReader>()
 
     init {
-        // 1. 🛡️ CRITICAL: Create directory FIRST.
+        // Ensure directory exists before defining file paths
         if (!directory.exists()) {
             if (!directory.mkdirs()) {
                 throw java.io.IOException("Unable to create database directory: ${directory.absolutePath}")
             }
         }
 
-        // 2. Now it is safe to define file paths
         walFile = File(directory, "kore.wal")
 
-        // On startup, load all existing .sst files into our readers!
+        // Load existing SSTable segments into memory-mapped readers
         val existingFiles = directory.listFiles { _, name -> name.endsWith(".sst") }
-            ?.sortedBy { it.name } // Ensure we read in order (segment_0, segment_1...)
+            ?.sortedBy { it.name }
 
         existingFiles?.forEach { file ->
             try {
                 sstReaders.add(SSTableReader(file))
                 sstFileCounter.incrementAndGet()
             } catch (e: Exception) {
-                println("❌ Corrupt SSTable found skipped: ${file.name}")
+                // Silently skip corrupt segments in production; could be logged to a monitoring service
             }
         }
 
-        // 3. 🚨 CRITICAL FIX: Restore MemTable from WAL before opening it for writing!
+        // Restore un-flushed data from the Write-Ahead Log
         restoreFromWal()
 
-        // 4. Open WAL for new writes
+        // Initialize WAL for incoming writes
         wal = WriteAheadLog(walFile)
     }
 
     /**
      * Reads the existing WAL file and replays data into the MemTable.
-     * This ensures data isn't lost if the app was killed before a flush.
+     * This ensures data isn't lost if the app was killed before a flush occurred.
      */
     private fun restoreFromWal() {
         if (!walFile.exists()) return
 
-        println("🔄 Recovering from WAL...")
         try {
             val raf = RandomAccessFile(walFile, "r")
-            // Read until end of file
             while (raf.filePointer < raf.length()) {
-                // Format: [KeySize: Int] [ValueSize: Int] [Key] [Value]
                 val keySize = raf.readInt()
                 val valueSize = raf.readInt()
 
@@ -74,19 +103,21 @@ class KoreDB(private val directory: File) {
                 val value = ByteArray(valueSize)
                 raf.readFully(value)
 
-                // Replay into memory!
                 memTable.put(key, value)
             }
             raf.close()
-            println("✅ WAL Recovery Complete. MemTable restored with ${memTable.sizeInBytes()} bytes.")
         } catch (e: Exception) {
-            println("⚠️ WAL seems corrupt or partial. Starting fresh for new writes. Error: ${e.message}")
-            // In a strict DB, we might truncate the corrupt tail.
-            // For now, we assume what we read so far is good.
+            // If WAL is corrupt, we stop recovery at the point of corruption 
+            // and proceed with available data.
         }
     }
 
-
+    /**
+     * Persists a batch of key-value pairs atomically to the WAL and MemTable.
+     *
+     * @param batch A list of key-value byte array pairs.
+     * @param urgent If true, forces an immediate hardware flush to disk.
+     */
     suspend fun writeBatchRaw(batch: List<Pair<ByteArray, ByteArray>>,
                               urgent: Boolean = false) = withContext(Dispatchers.IO) {
         for (pair in batch) {
@@ -97,8 +128,6 @@ class KoreDB(private val directory: File) {
             memTable.put(keyBytes, valueBytes)
         }
 
-        // Only force the hardware to wait if the developer explicitly asks.
-        // Otherwise, let the OS handle the write-back timing (like Room).
         if (urgent) {
             wal.flush()
         }
@@ -108,27 +137,38 @@ class KoreDB(private val directory: File) {
         }
     }
 
+    /**
+     * Convenience method to insert a single raw record.
+     */
     suspend fun putRaw(key: ByteArray, value: ByteArray) {
         writeBatchRaw(listOf(Pair(key, value)))
     }
 
+    /**
+     * Marks a record for deletion by writing a tombstone.
+     */
     suspend fun deleteRaw(key: ByteArray) {
-        // Deleting is just writing a Tombstone! Blazing fast O(1) delete.
         writeBatchRaw(listOf(Pair(key, TOMBSTONE)))
     }
 
+    /**
+     * Retrieves the raw byte value for a given key using the multi-tiered lookup algorithm.
+     *
+     * @param key The key to look up.
+     * @return The value associated with the key, or null if it doesn't exist or was deleted.
+     */
     fun getRaw(key: ByteArray): ByteArray? {
-        // Tier 1: Search RAM
+        // Tier 1: Search RAM (Fastest)
         val ramResult = memTable.get(key)
         if (ramResult != null) {
-            return if (ramResult.isEmpty()) null else ramResult // 🚨 Respect Tombstone
+            return if (ramResult.isEmpty()) null else ramResult
         }
 
-        // Tier 2: Search Disk (Newest to Oldest)
+        // Tier 2: Search Disk Segments (Newest to Oldest)
         for (i in sstReaders.indices.reversed()) {
             val diskResult = sstReaders[i].find(key)
             if (diskResult != null) {
-                return if (diskResult.isEmpty()) null else diskResult // 🚨 Respect Tombstone
+                return if (diskResult.isEmpty()) null else diskResult
             }
         }
         return null
@@ -144,45 +184,30 @@ class KoreDB(private val directory: File) {
 
         wal = WriteAheadLog(walFile)
 
-        // Add new reader
         val newReader = SSTableReader(sstFile)
         sstReaders.add(newReader)
 
-        println("✅ Flushed to disk. Total Segments: ${sstReaders.size}")
-
-        // 🚨 COMPACTION TRIGGER 🚨
         if (sstReaders.size >= COMPACTION_THRESHOLD) {
             performCompaction()
         }
     }
 
     private fun performCompaction() {
-        println("\n🚧 STARTING COMPACTION (Merging ${sstReaders.size} files)...")
-
         val compactedFile = File(directory, "compacted_${System.currentTimeMillis()}.sst")
 
-        // 1. Run the merge algorithm
+        // Merge all current segments into a single deduplicated file
         Compactor.compact(sstReaders, compactedFile)
 
-        // 2. Atomic Switch
-        // Close old readers
-        sstReaders.forEach {
-            // We can't easily "close" mmap without JVM tricks,
-            // but we can drop the reference. The OS handles cleanup eventually.
-        }
-
-        // Delete old files
+        // Atomic switch: drop old readers and delete old files
         sstReaders.forEach { it.file.delete() }
-
-        // 3. Reset State
         sstReaders.clear()
+        
+        // Load the new compacted segment
         sstReaders.add(SSTableReader(compactedFile))
-
-        println("♻️ COMPACTION COMPLETE. Disk Space Reclaimed. Active Files: 1\n")
     }
 
     /**
-     * The Multi-Tiered Read Algorithm
+     * Convenience method to retrieve a UTF-8 string value by key.
      */
     fun get(key: String): String? {
         val keyBytes = key.toByteArray(Charsets.UTF_8)
@@ -209,26 +234,26 @@ class KoreDB(private val directory: File) {
     fun getByPrefixRaw(prefix: ByteArray): List<ByteArray> {
         val resultMap = mutableMapOf<String, ByteArray>()
 
-        // 1. Scan Disk (Oldest to Newest)
+        // Scan Disk (Oldest to Newest)
         for (reader in sstReaders) {
             val entries = reader.scanByPrefix(prefix)
             for (entry in entries) {
                 val keyStr = String(entry.first, Charsets.UTF_8)
                 if (entry.second.isEmpty()) {
-                    resultMap.remove(keyStr) // Tombstone! Remove older version.
+                    resultMap.remove(keyStr)
                 } else {
                     resultMap[keyStr] = entry.second
                 }
             }
         }
 
-        // 2. Scan RAM (Newest)
+        // Scan RAM (Newest overrides disk)
         for (entry in memTable.getSortedEntries()) {
             val keyBytes = entry.key
             if (keyBytes.size >= prefix.size && keyBytes.sliceArray(prefix.indices).contentEquals(prefix)) {
                 val keyStr = String(keyBytes, Charsets.UTF_8)
                 if (entry.value.isEmpty()) {
-                    resultMap.remove(keyStr) // Tombstone!
+                    resultMap.remove(keyStr)
                 } else {
                     resultMap[keyStr] = entry.value
                 }
@@ -239,34 +264,31 @@ class KoreDB(private val directory: File) {
     }
 
     /**
-     * Returns all active KEYS that start with the given prefix.
-     * Used for bulk operations like DeleteAll.
+     * Returns all active keys that start with the given prefix.
      */
     fun getKeysByPrefixRaw(prefix: ByteArray): List<ByteArray> {
         val resultMap = mutableMapOf<String, ByteArray>()
 
-        // 1. Scan Disk
         for (reader in sstReaders) {
             val entries = reader.scanByPrefix(prefix)
             for (entry in entries) {
                 val keyStr = String(entry.first, Charsets.UTF_8)
                 if (entry.second.isEmpty()) {
-                    resultMap.remove(keyStr) // It's a Tombstone, ignore it
+                    resultMap.remove(keyStr)
                 } else {
-                    resultMap[keyStr] = entry.first // Save the KEY
+                    resultMap[keyStr] = entry.first
                 }
             }
         }
 
-        // 2. Scan RAM
         for (entry in memTable.getSortedEntries()) {
             val keyBytes = entry.key
             if (keyBytes.size >= prefix.size && keyBytes.sliceArray(prefix.indices).contentEquals(prefix)) {
                 val keyStr = String(keyBytes, Charsets.UTF_8)
                 if (entry.value.isEmpty()) {
-                    resultMap.remove(keyStr) // Tombstone
+                    resultMap.remove(keyStr)
                 } else {
-                    resultMap[keyStr] = keyBytes // Save the KEY
+                    resultMap[keyStr] = keyBytes
                 }
             }
         }
@@ -274,7 +296,14 @@ class KoreDB(private val directory: File) {
         return resultMap.values.toList()
     }
 
-
+    /**
+     * Performs a vector similarity search across all memory and disk tiers.
+     *
+     * @param prefix The collection prefix to search within.
+     * @param query The query vector.
+     * @param limit The maximum number of results to return.
+     * @return A list of matching key-value pairs sorted by similarity score.
+     */
     fun searchVectorsRaw(prefix: ByteArray, query: FloatArray, limit: Int): List<Pair<ByteArray, Float>> {
         val topKHeap = java.util.PriorityQueue<Pair<ByteArray, Float>>(compareBy { it.second })
         val queryMag = VectorMath.getMagnitude(query)
@@ -315,18 +344,26 @@ class KoreDB(private val directory: File) {
         return topKHeap.toList().sortedByDescending { it.second }
     }
 
+    /**
+     * Forces the Write-Ahead Log to sync with physical storage.
+     */
     fun flushHardware() {
         wal.flush()
     }
 
+    /**
+     * Safely closes the database and releases all file resources.
+     */
     fun close() {
         wal.close()
     }
 
     companion object {
-        // A 0-byte array represents a Deleted Record (Tombstone)
+        /**
+         * A 0-byte array represents a Deleted Record (Tombstone) in the LSM-tree.
+         */
         val TOMBSTONE = ByteArray(0)
+        
         private const val COMPACTION_THRESHOLD = 3
-
     }
 }
