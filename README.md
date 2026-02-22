@@ -30,7 +30,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("io.github.raipankaj:koredb:0.0.1")
+    implementation("io.github.raipankaj:koredb:0.0.2")
 }
 ```
 
