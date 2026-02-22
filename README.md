@@ -156,6 +156,92 @@ To find a record, KoreDB searches in this order:
 *   **Flushing:** Once the MemTable reaches its size limit, it is converted into an immutable **SSTable** and written to disk.
 *   **Compaction:** Periodically, KoreDB merges multiple SSTables in the background to remove deleted records (tombstones) and maintain speed.
 
+
+# 📊 KoreDB Benchmarks
+
+Performance testing conducted on high-end mobile hardware to simulate real-world "AI-Native" workloads.
+
+### 📱 Test Environment
+* **Device:** Google Pixel (Tensor G2 Chip)
+* **Build Type:** Release (R8/Proguard enabled, no debugger attached)
+* **Dataset Size:** Up to 100,000 records
+* **Concurrency:** 8 parallel Coroutines
+* **Baseline:** Room Persistence Library (SQLite)
+
+> ⚠️ **Note:** Performance varies by workload. KoreDB is engineered for **write-heavy** and **AI-vector** workloads. SQLite remains highly efficient for complex relational joins and ordered range scans.
+
+---
+
+## ⚡ Performance Breakdown
+
+### 🔍 Negative Lookups (1,000x Non-Existent Keys)
+*Tests the efficiency of the Bloom Filter in avoiding unnecessary disk I/O.*
+
+| Engine | Execution Time | Speedup |
+| :--- | :--- | :--- |
+| **KoreDB** | **4 ms** | **~212x Faster** |
+| Room (SQLite) | 848 ms | - |
+
+### 🤖 AI Vector Similarity Search
+*Dataset: 25,000 vectors | 384 dimensions | 50 queries.*
+
+
+
+| Operation | KoreDB (LSM + SIMD) | Room (SQLite) | Winner |
+| :--- | :--- | :--- | :--- |
+| **Insert** | **1,587 ms** | 1,977 ms | **KoreDB** |
+| **Search** | **6 ms** | 52,421 ms | **KoreDB (8700x)** |
+
+*SQLite lacks native vector indexing and is forced to perform expensive full-table scans for similarity math.*
+
+### 🧵 Parallel Reads (8 Coroutines)
+*Simulates high-concurrency UI rendering and background processing.*
+
+| Engine | Execution Time | Speedup |
+| :--- | :--- | :--- |
+| **KoreDB** | **1,213 ms** | **~5.8x Faster** |
+| Room (SQLite) | 7,123 ms | - |
+
+### 🚀 Cold Start (100,000 Records)
+*Time to initialize the engine and perform the first read after process boot.*
+
+| Engine | Execution Time | Speedup |
+| :--- | :--- | :--- |
+| **KoreDB** | **4 ms** | **~14.7x Faster** |
+| Room (SQLite) | 59 ms | - |
+
+### 🔄 Random Updates
+*50,000 initial records with 10,000 randomized updates.*
+
+| Engine | Execution Time | Speedup |
+| :--- | :--- | :--- |
+| **KoreDB** | **110 ms** | **~3.6x Faster** |
+| Room (SQLite) | 396 ms | - |
+
+### 📖 Prefix Scan (Range Query)
+*Retrieving a range of records based on a key prefix.*
+
+| Engine | Execution Time | Note |
+| :--- | :--- | :--- |
+| **Room (SQLite)** | **317 ms** | **Winner** |
+| KoreDB | 851 ms | B-Trees are natively optimized for range scans. |
+
+---
+
+## 🧠 Architectural Summary
+
+| Category | Winner | Why? |
+| :--- | :--- | :--- |
+| **Write Throughput** | 🟢 **KoreDB** | Sequential WAL appends vs Page updates. |
+| **Point Lookups** | 🟢 **KoreDB** | Bloom Filters skip disk reads for missing keys. |
+| **Vector Search** | 🟢 **KoreDB** | Native float array indexing vs BLOB parsing. |
+| **Cold Start** | 🟢 **KoreDB** | Minimal metadata overhead; no schema verification. |
+| **Concurrent Reads** | 🟢 **KoreDB** | Lock-free reads from immutable SSTables. |
+| **Range Queries** | 🟡 **SQLite** | B-Tree structures excel at ordered scans. |
+
+
+---
+*Benchmarks last updated: February 2026*
 ---
 
 ## 📊 KoreDB vs SQLite
