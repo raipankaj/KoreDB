@@ -258,7 +258,7 @@ Performance testing conducted on high-end mobile hardware to simulate real-world
 ## 📜 License
 
 ```text
-Copyright 2024 KoreDB Authors
+Copyright 2026 KoreDB Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
