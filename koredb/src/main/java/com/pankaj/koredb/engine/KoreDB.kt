@@ -17,76 +17,135 @@
 package com.pankaj.koredb.engine
 
 import com.pankaj.koredb.core.VectorMath
-import com.pankaj.koredb.core.VectorSerializer
 import com.pankaj.koredb.foundation.MemTable
 import com.pankaj.koredb.foundation.SSTable
 import com.pankaj.koredb.foundation.SSTableReader
 import com.pankaj.koredb.log.WriteAheadLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * The core Log-Structured Merge-tree (LSM) database engine.
+ * The core engine for KoreDB, implementing a Log-Structured Merge-tree (LSM-tree).
  *
- * KoreDB coordinates the flow of data between the in-memory [MemTable], the 
- * durability-focused [WriteAheadLog], and the disk-resident [SSTable] segments.
+ * KoreDB manages the lifecycle of data through three primary layers:
+ * 1. **MemTable**: An in-memory data structure for low-latency writes and recent reads.
+ * 2. **Write-Ahead Log (WAL)**: An append-only file ensuring durability for in-memory data.
+ * 3. **SSTables (Sorted String Tables)**: Immutable disk-resident files for long-term storage.
  *
- * Key Design Principles:
- * 1. **Write Path:** Data is appended to the WAL and updated in the MemTable (O(1)).
- * 2. **Read Path:** Multi-tiered lookup starting from MemTable, then traversing 
- *    SSTables from newest to oldest.
- * 3. **Durability:** WAL ensures zero data loss on crashes.
- * 4. **Scalability:** Periodic compaction prevents disk fragmentation and 
- *    maintains read performance.
+ * Design Architecture:
+ * - **Writes**: Appended to the WAL and inserted into the MemTable. When the MemTable exceeds
+ *   [MEMTABLE_FLUSH_THRESHOLD_BYTES], it is flushed to disk as a new SSTable.
+ * - **Reads**: Traverses the hierarchy from newest to oldest (MemTable -> SSTable segments).
+ * - **Compaction**: Periodic background merging of SSTables to reduce fragmentation and 
+ *   improve read performance.
  *
- * @param directory The directory where all database files (SSTables, WAL) are stored.
+ * @property directory The root directory where database segments and logs are persisted.
  */
 class KoreDB(private val directory: File) {
 
     private var memTable = MemTable()
     private val sstFileCounter = AtomicInteger(0)
-    private val MEMTABLE_FLUSH_THRESHOLD_BYTES = 1 * 1024 * 1024
+    private val MEMTABLE_FLUSH_THRESHOLD_BYTES = 16 * 1024 * 1024
 
     private val walFile: File
-    private var wal: WriteAheadLog
+    private lateinit var wal: WriteAheadLog
+
+    private val writeMutex = kotlinx.coroutines.sync.Mutex()
+
     private val sstReaders = mutableListOf<SSTableReader>()
 
-    init {
-        // Ensure directory exists before defining file paths
-        if (!directory.exists()) {
-            if (!directory.mkdirs()) {
-                throw java.io.IOException("Unable to create database directory: ${directory.absolutePath}")
-            }
-        }
+    @Volatile
+    private var isCompacting = false
 
+    init {
+        // Ensure the storage directory exists.
+        if (!directory.exists()) directory.mkdirs()
         walFile = File(directory, "kore.wal")
 
-        // Load existing SSTable segments into memory-mapped readers
-        val existingFiles = directory.listFiles { _, name -> name.endsWith(".sst") }
-            ?.sortedBy { it.name }
+        // Initialize state from the MANIFEST file, which tracks active SSTable segments.
+        val manifestFile = File(directory, "MANIFEST")
+        val activeFiles = if (manifestFile.exists()) {
+            manifestFile.readLines().filter { it.isNotBlank() }.map { File(directory, it) }
+        } else {
+            // Fallback: Discovery via file system scan if MANIFEST is missing.
+            directory.listFiles { _, name -> name.endsWith(".sst") }?.toList() ?: emptyList()
+        }
 
-        existingFiles?.forEach { file ->
-            try {
-                sstReaders.add(SSTableReader(file))
-                sstFileCounter.incrementAndGet()
-            } catch (e: Exception) {
-                // Silently skip corrupt segments in production; could be logged to a monitoring service
+        // Determine the next file index based on existing segments.
+        val maxIndex = activeFiles
+            .mapNotNull {
+                it.name.removePrefix("segment_")
+                    .removeSuffix(".sst")
+                    .toIntOrNull()
+            }
+            .maxOrNull() ?: -1
+
+        sstFileCounter.set(maxIndex + 1)
+
+        // Load active SSTable segments into memory-mapped readers.
+        activeFiles.sortedBy { it.name }.forEach { file ->
+            if (file.exists()) {
+                try {
+                    sstReaders.add(SSTableReader(file))
+                } catch (e: Exception) {
+                    println("❌ Skipping corrupt file: ${file.name}")
+                }
             }
         }
 
-        // Restore un-flushed data from the Write-Ahead Log
-        restoreFromWal()
+        // Recovery: Replay the Write-Ahead Log to restore data not yet flushed to SSTables.
+        WriteAheadLog.replay(walFile) { key, value ->
+            memTable.put(key, value)
+        }
 
-        // Initialize WAL for incoming writes
+        // Initialize the active WAL for new incoming writes.
         wal = WriteAheadLog(walFile)
     }
 
     /**
-     * Reads the existing WAL file and replays data into the MemTable.
-     * This ensures data isn't lost if the app was killed before a flush occurred.
+     * Persists the current list of active SSTable segments to the MANIFEST file.
+     * Uses a temporary file and atomic rename to ensure consistency during crashes.
+     */
+    private fun writeManifest() {
+        val tempManifest = File(directory, "MANIFEST.tmp")
+        tempManifest.writeText(sstReaders.joinToString("\n") { it.file.name })
+
+        // Force the manifest update to physical storage.
+        java.io.RandomAccessFile(tempManifest, "rw").use { raf ->
+            raf.channel.force(true)
+        }
+
+        // Atomic rename is guaranteed by the OS to be durable.
+        val manifest = File(directory, "MANIFEST")
+        tempManifest.renameTo(manifest)
+
+        // Sync directory metadata to ensure the rename is persisted.
+        fsyncDirectory()
+    }
+
+    /**
+     * Synchronizes the directory descriptor to ensure file system metadata changes
+     * (like renames or creations) survive a power loss.
+     */
+    private fun fsyncDirectory() {
+        try {
+            val channel = java.nio.channels.FileChannel.open(
+                directory.toPath(),
+                java.nio.file.StandardOpenOption.READ
+            )
+            channel.force(true)
+            channel.close()
+        } catch (e: Exception) {
+            // Logged or ignored depending on OS support for directory syncing.
+        }
+    }
+
+    /**
+     * Replays the Write-Ahead Log to populate the MemTable during initialization.
      */
     private fun restoreFromWal() {
         if (!walFile.exists()) return
@@ -107,64 +166,65 @@ class KoreDB(private val directory: File) {
             }
             raf.close()
         } catch (e: Exception) {
-            // If WAL is corrupt, we stop recovery at the point of corruption 
-            // and proceed with available data.
+            // Stop recovery at the first sign of log corruption.
         }
     }
 
     /**
-     * Persists a batch of key-value pairs atomically to the WAL and MemTable.
+     * Writes a batch of entries to the database. 
+     * The operation is first logged to the WAL, then applied to the MemTable.
      *
-     * @param batch A list of key-value byte array pairs.
-     * @param urgent If true, forces an immediate hardware flush to disk.
+     * @param batch A list of key-value pairs to persist.
+     * @param urgent If true, forces an immediate hardware-level sync of the WAL.
      */
     suspend fun writeBatchRaw(batch: List<Pair<ByteArray, ByteArray>>,
-                              urgent: Boolean = false) = withContext(Dispatchers.IO) {
-        for (pair in batch) {
-            val keyBytes = pair.first
-            val valueBytes = pair.second
+                              urgent: Boolean = false) = writeMutex.withLock {
 
-            wal.append(keyBytes, valueBytes)
-            memTable.put(keyBytes, valueBytes)
-        }
+        withContext(Dispatchers.IO) {
+            wal.appendBatch(batch)
 
-        if (urgent) {
-            wal.flush()
-        }
+            for (pair in batch) {
+                memTable.put(pair.first, pair.second)
+            }
 
-        if (memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
-            flushMemTable()
+            if (urgent) {
+                wal.flush()
+            }
+
+            // Trigger a flush to disk if the MemTable has grown beyond its capacity.
+            if (memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
+                flushMemTableInternal()
+            }
         }
     }
 
     /**
-     * Convenience method to insert a single raw record.
+     * Persists a single key-value pair.
      */
     suspend fun putRaw(key: ByteArray, value: ByteArray) {
         writeBatchRaw(listOf(Pair(key, value)))
     }
 
     /**
-     * Marks a record for deletion by writing a tombstone.
+     * Deletes a key by writing a tombstone record (an empty byte array).
      */
     suspend fun deleteRaw(key: ByteArray) {
         writeBatchRaw(listOf(Pair(key, TOMBSTONE)))
     }
 
     /**
-     * Retrieves the raw byte value for a given key using the multi-tiered lookup algorithm.
-     *
-     * @param key The key to look up.
-     * @return The value associated with the key, or null if it doesn't exist or was deleted.
+     * Retrieves the value for a key by searching the tiered storage hierarchy.
+     * 
+     * @return The value associated with [key], or null if not found or deleted.
      */
     fun getRaw(key: ByteArray): ByteArray? {
-        // Tier 1: Search RAM (Fastest)
+        // Tier 1: MemTable lookup (O(log N))
         val ramResult = memTable.get(key)
         if (ramResult != null) {
             return if (ramResult.isEmpty()) null else ramResult
         }
 
-        // Tier 2: Search Disk Segments (Newest to Oldest)
+        // Tier 2: SSTable lookup (Newest to Oldest)
         for (i in sstReaders.indices.reversed()) {
             val diskResult = sstReaders[i].find(key)
             if (diskResult != null) {
@@ -174,141 +234,176 @@ class KoreDB(private val directory: File) {
         return null
     }
 
-    private suspend fun flushMemTable() = withContext(Dispatchers.IO) {
+    /**
+     * Flushes the current MemTable to a new SSTable segment on disk.
+     * This process involves rotating the WAL and updating the MANIFEST.
+     */
+    private suspend fun flushMemTableInternal() = withContext(Dispatchers.IO) {
         val sstFile = File(directory, "segment_${sstFileCounter.getAndIncrement()}.sst")
-        SSTable.writeFromMemTable(memTable, sstFile)
 
-        memTable.clear()
-        wal.close()
-        walFile.delete()
+        // Write the sorted MemTable to disk and register the new reader.
+        SSTable.writeFromMemTable(memTable, sstFile)
+        sstReaders.add(SSTableReader(sstFile))
+
+        // Commit the new segment list to the MANIFEST.
+        writeManifest()
+
+        // Rotate the WAL: Close the current log, rename it, and initialize a new one.
+        if (this@KoreDB::wal.isInitialized) {
+            wal.close()
+        }
+
+        val oldWalFile = File(directory, "kore.wal.old")
+        if (walFile.exists()) {
+            walFile.renameTo(oldWalFile)
+            fsyncDirectory()
+        }
 
         wal = WriteAheadLog(walFile)
+        fsyncDirectory()
 
-        val newReader = SSTableReader(sstFile)
-        sstReaders.add(newReader)
+        // Clean up the old WAL now that data is safely in the SSTable.
+        if (oldWalFile.exists()) {
+            oldWalFile.delete()
+        }
 
+        memTable.clear()
+
+        // Check if the number of segments warrants a compaction run.
         if (sstReaders.size >= COMPACTION_THRESHOLD) {
-            performCompaction()
+            if (!isCompacting) {
+                isCompacting = true
+                try {
+                    performCompaction()
+                } finally {
+                    isCompacting = false
+                }
+            }
         }
     }
 
+    /**
+     * Merges multiple SSTable segments into a single, optimized segment.
+     * This reduces disk usage by removing stale versions and tombstones.
+     */
     private fun performCompaction() {
+        println("🚧 STARTING COMPACTION...")
         val compactedFile = File(directory, "compacted_${System.currentTimeMillis()}.sst")
 
-        // Merge all current segments into a single deduplicated file
         Compactor.compact(sstReaders, compactedFile)
 
-        // Atomic switch: drop old readers and delete old files
-        sstReaders.forEach { it.file.delete() }
+        // Ensure the compacted file is fully written to disk.
+        java.io.RandomAccessFile(compactedFile, "rw").use { raf ->
+            raf.channel.force(true)
+        }
+
+        val newReader = SSTableReader(compactedFile)
+        val oldReaders = sstReaders.toList()
+
+        // Replace old readers with the new compacted reader.
         sstReaders.clear()
-        
-        // Load the new compacted segment
-        sstReaders.add(SSTableReader(compactedFile))
+        sstReaders.add(newReader)
+
+        writeManifest()
+
+        // Delete the redundant source files.
+        oldReaders.forEach { it.file.delete() }
+        println("♻️ COMPACTION COMPLETE.")
     }
 
     /**
-     * Convenience method to retrieve a UTF-8 string value by key.
+     * Convenience method to retrieve a UTF-8 string value.
      */
     fun get(key: String): String? {
         val keyBytes = key.toByteArray(Charsets.UTF_8)
-
-        // Tier 1: Search RAM (MemTable) -> Fastest
-        val ramResult = memTable.get(keyBytes)
-        if (ramResult != null) return String(ramResult, Charsets.UTF_8)
-
-        // Tier 2: Search Disk (SSTables) from Newest to Oldest
-        // We go backwards because if a key was updated, the newest value is in the latest file!
-        for (i in sstReaders.indices.reversed()) {
-            val diskResult = sstReaders[i].find(keyBytes)
-            if (diskResult != null) {
-                return String(diskResult, Charsets.UTF_8)
-            }
-        }
-
-        return null // Doesn't exist anywhere
+        val result = getRaw(keyBytes)
+        return result?.let { String(it, Charsets.UTF_8) }
     }
 
     /**
-     * Returns all active values whose keys start with the given prefix.
+     * Returns all values whose keys match the specified prefix.
      */
     fun getByPrefixRaw(prefix: ByteArray): List<ByteArray> {
         val resultMap = mutableMapOf<String, ByteArray>()
 
-        // Scan Disk (Oldest to Newest)
+        // Scan disk segments.
         for (reader in sstReaders) {
-            val entries = reader.scanByPrefix(prefix)
-            for (entry in entries) {
-                val keyStr = String(entry.first, Charsets.UTF_8)
-                if (entry.second.isEmpty()) {
-                    resultMap.remove(keyStr)
-                } else {
-                    resultMap[keyStr] = entry.second
-                }
+            reader.scanByPrefix(prefix) { keyBytes, valueBytes ->
+                val keyStr = String(keyBytes, Charsets.UTF_8)
+                if (valueBytes.isEmpty()) resultMap.remove(keyStr)
+                else resultMap[keyStr] = valueBytes
             }
         }
 
-        // Scan RAM (Newest overrides disk)
-        for (entry in memTable.getSortedEntries()) {
+        // Scan the MemTable starting from the prefix.
+        for (entry in memTable.getTailEntries(prefix)) {
             val keyBytes = entry.key
-            if (keyBytes.size >= prefix.size && keyBytes.sliceArray(prefix.indices).contentEquals(prefix)) {
-                val keyStr = String(keyBytes, Charsets.UTF_8)
-                if (entry.value.isEmpty()) {
-                    resultMap.remove(keyStr)
-                } else {
-                    resultMap[keyStr] = entry.value
+
+            var isMatch = keyBytes.size >= prefix.size
+            if (isMatch) {
+                for (i in prefix.indices) {
+                    if (keyBytes[i] != prefix[i]) { isMatch = false; break }
                 }
             }
+
+            // Alphabetical ordering allows early termination if the prefix is passed.
+            if (!isMatch) break
+
+            val keyStr = String(keyBytes, Charsets.UTF_8)
+            if (entry.value.isEmpty()) resultMap.remove(keyStr)
+            else resultMap[keyStr] = entry.value
         }
 
         return resultMap.values.toList()
     }
 
     /**
-     * Returns all active keys that start with the given prefix.
+     * Returns all keys that match the specified prefix.
      */
     fun getKeysByPrefixRaw(prefix: ByteArray): List<ByteArray> {
         val resultMap = mutableMapOf<String, ByteArray>()
 
         for (reader in sstReaders) {
-            val entries = reader.scanByPrefix(prefix)
-            for (entry in entries) {
-                val keyStr = String(entry.first, Charsets.UTF_8)
-                if (entry.second.isEmpty()) {
-                    resultMap.remove(keyStr)
-                } else {
-                    resultMap[keyStr] = entry.first
-                }
+            reader.scanByPrefix(prefix) { keyBytes, valueBytes ->
+                val keyStr = String(keyBytes, Charsets.UTF_8)
+                if (valueBytes.isEmpty()) resultMap.remove(keyStr)
+                else resultMap[keyStr] = keyBytes
             }
         }
 
-        for (entry in memTable.getSortedEntries()) {
+        for (entry in memTable.getTailEntries(prefix)) {
             val keyBytes = entry.key
-            if (keyBytes.size >= prefix.size && keyBytes.sliceArray(prefix.indices).contentEquals(prefix)) {
-                val keyStr = String(keyBytes, Charsets.UTF_8)
-                if (entry.value.isEmpty()) {
-                    resultMap.remove(keyStr)
-                } else {
-                    resultMap[keyStr] = keyBytes
+
+            var isMatch = keyBytes.size >= prefix.size
+            if (isMatch) {
+                for (i in prefix.indices) {
+                    if (keyBytes[i] != prefix[i]) { isMatch = false; break }
                 }
             }
+
+            if (!isMatch) break
+
+            val keyStr = String(keyBytes, Charsets.UTF_8)
+            if (entry.value.isEmpty()) resultMap.remove(keyStr)
+            else resultMap[keyStr] = keyBytes
         }
 
         return resultMap.values.toList()
     }
 
     /**
-     * Performs a vector similarity search across all memory and disk tiers.
+     * Performs a vector similarity search across MemTable and SSTable tiers.
      *
-     * @param prefix The collection prefix to search within.
-     * @param query The query vector.
-     * @param limit The maximum number of results to return.
-     * @return A list of matching key-value pairs sorted by similarity score.
+     * @param prefix The collection prefix to scope the search.
+     * @param query The query vector for similarity matching.
+     * @param limit Maximum number of results to return.
+     * @return A list of matching key-score pairs, sorted by similarity descending.
      */
     fun searchVectorsRaw(prefix: ByteArray, query: FloatArray, limit: Int): List<Pair<ByteArray, Float>> {
         val topKHeap = java.util.PriorityQueue<Pair<ByteArray, Float>>(compareBy { it.second })
         val queryMag = VectorMath.getMagnitude(query)
 
-        // 1. Search Disk Segments
+        // Search disk segments for matching vectors.
         for (reader in sstReaders) {
             val diskResults = reader.findTopVectors(prefix, query, limit)
             for (res in diskResults) {
@@ -319,17 +414,20 @@ class KoreDB(private val directory: File) {
             }
         }
 
-        // 2. Search RAM (MemTable)
-        for (entry in memTable.getSortedEntries()) {
+        // Search the MemTable for recent vector updates.
+        for (entry in memTable.getTailEntries(prefix)) {
             val keyBytes = entry.key
 
             var isMatch = keyBytes.size >= prefix.size
             if (isMatch) {
-                for (i in prefix.indices) if (keyBytes[i] != prefix[i]) { isMatch = false; break }
+                for (i in prefix.indices) {
+                    if (keyBytes[i] != prefix[i]) { isMatch = false; break }
+                }
             }
 
-            if (isMatch && entry.value.isNotEmpty()) { // Skip tombstones
-                val vector = VectorSerializer.fromByteArray(entry.value)
+            if (!isMatch) break
+
+            if (entry.value.isNotEmpty()) { // Skip tombstones.
                 val score = VectorMath.cosineSimilarity(
                     query, queryMag,
                     java.nio.ByteBuffer.wrap(entry.value), 0
@@ -345,14 +443,30 @@ class KoreDB(private val directory: File) {
     }
 
     /**
-     * Forces the Write-Ahead Log to sync with physical storage.
+     * Synchronizes the Write-Ahead Log to persistent storage.
      */
     fun flushHardware() {
         wal.flush()
     }
 
     /**
-     * Safely closes the database and releases all file resources.
+     * Deletes all data and resets the database state. Primarily used for testing.
+     */
+    fun nuke() {
+        wal.close()
+        sstReaders.clear()
+
+        directory.listFiles()?.forEach { it.delete() }
+
+        memTable.clear()
+        sstFileCounter.set(0)
+
+        val walFile = File(directory, "kore.wal")
+        wal = WriteAheadLog(walFile)
+    }
+
+    /**
+     * Releases all resources and closes active file handles.
      */
     fun close() {
         wal.close()
@@ -360,10 +474,13 @@ class KoreDB(private val directory: File) {
 
     companion object {
         /**
-         * A 0-byte array represents a Deleted Record (Tombstone) in the LSM-tree.
+         * Represents a deleted entry in the LSM-tree.
          */
         val TOMBSTONE = ByteArray(0)
         
+        /**
+         * The number of SSTable segments that triggers a compaction run.
+         */
         private const val COMPACTION_THRESHOLD = 3
     }
 }

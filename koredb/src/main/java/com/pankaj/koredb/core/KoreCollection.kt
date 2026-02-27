@@ -100,6 +100,37 @@ class KoreCollection<T>(
     }
 
     /**
+     * Returns document IDs matching the given prefix.
+     * Avoids deserialization cost.
+     */
+    fun getIdsByPrefix(idPrefix: String): List<String> {
+        val prefixBytes = "doc:$name:$idPrefix"
+            .toByteArray(Charsets.UTF_8)
+
+        val keys = db.getKeysByPrefixRaw(prefixBytes)
+
+        return keys.map { keyBytes ->
+            val fullKey = String(keyBytes, Charsets.UTF_8)
+            fullKey.substringAfterLast(":")
+        }
+    }
+
+    /**
+     * Retrieves all documents whose ID starts with the given prefix.
+     *
+     * This performs an efficient prefix range scan using the underlying
+     * LSM-tree sparse index and early termination.
+     */
+    fun getByIdPrefix(idPrefix: String): List<T> {
+        val prefixBytes = "doc:$name:$idPrefix"
+            .toByteArray(Charsets.UTF_8)
+
+        val rawResults = db.getByPrefixRaw(prefixBytes)
+
+        return rawResults.map { serializer.deserialize(it) }
+    }
+
+    /**
      * Retrieves all documents matching a specific index value.
      *
      * @param indexName The name of the index to query.
