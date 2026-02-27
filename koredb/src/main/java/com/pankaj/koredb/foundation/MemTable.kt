@@ -78,6 +78,14 @@ class MemTable {
     }
 
     /**
+     * Jumps directly to the closest matching key in the SkipList.
+     * $O(\log N)$ time complexity.
+     */
+    fun getTailEntries(prefix: ByteArray): Sequence<Map.Entry<ByteArray, ByteArray>> {
+        return table.tailMap(prefix).entries.asSequence()
+    }
+
+    /**
      * Clears all entries from the table and resets the size counter.
      */
     fun clear() {

@@ -17,6 +17,7 @@
 package com.pankaj.koredb.db
 
 import com.pankaj.koredb.core.KoreCollection
+import com.pankaj.koredb.graph.GraphStorage
 import com.pankaj.koredb.core.KoreVectorCollection
 import com.pankaj.koredb.core.KotlinxKoreSerializer
 import com.pankaj.koredb.engine.KoreDB
@@ -87,5 +88,17 @@ class KoreDatabase(directory: File) {
      */
     fun close() {
         engine.close()
+    }
+
+    fun graph(): GraphStorage {
+        return GraphStorage(engine) // engine is the KoreDB instance
+    }
+
+    fun deleteAllRaw() {
+        // 1. Clear the cached collection objects
+        collections.clear()
+
+        // 2. Tell the engine to wipe the disk
+        engine.nuke()
     }
 }

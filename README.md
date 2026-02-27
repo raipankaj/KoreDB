@@ -3,10 +3,10 @@
 <p align="center">
   <img src="logo.png" alt="KoreDB Logo" width="344">
   <br>
-  <b>The AI-Native, High-Performance NoSQL Database for Modern Android.</b>
+  <b>The AI-Native, High-Performance NoSQL & Graph Database for Modern Android.</b>
 </p>
 
-KoreDB is a pure Kotlin, embedded database engine built from the ground up using a **Log-Structured Merge-tree (LSM)** architecture. Unlike SQLite (designed for spinning disks in 2000), KoreDB is optimized for modern flash storage, high-concurrency Coroutines, and on-device AI applications.
+KoreDB is a pure Kotlin, embedded database engine built from the ground up using a **Log-Structured Merge-tree (LSM)** architecture. Unlike SQLite (designed for spinning disks in 2000), KoreDB is optimized for modern flash storage, high-concurrency Coroutines, on-device AI, and complex relationship mapping.
 
 ---
 
@@ -14,6 +14,7 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 *   **⚡ Blazing Performance:** LSM architecture offers $O(1)$ write performance.
 *   **🤖 AI-Native Vector Store:** Built-in high-performance vector similarity search using Cosine Similarity, optimized with SIMD-like loop unrolling.
+*   **🕸️ Built-in Graph DB:** First-class support for property graphs with bidirectional traversals and optimized relationship indices.
 *   **🏗️ Pure Kotlin:** 100% Kotlin with Zero JNI overhead. No more `sqlite3.so` bloat.
 *   **🔗 Coroutine First:** Built for non-blocking I/O and reactive UI with `Flow`.
 *   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) ensures your data survives process death or system crashes.
@@ -30,7 +31,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("io.github.raipankaj:koredb:0.0.2")
+    implementation("io.github.raipankaj:koredb:0.0.3")
 }
 ```
 
@@ -56,7 +57,7 @@ dependencies {
 }
 ```
 
-> **Note:** Kotlinx Serialization is optional. If you prefer Moshi or Gson, you can implement the `KoreSerializer<T>` interface and pass it to the collection manually.
+---
 
 ### 3. Initialize Database
 
@@ -88,11 +89,9 @@ Manage your data classes with ease using `KoreCollection<T>`.
 | `getById(id)` | Retrieves a document by its unique ID. |
 | `getAll()` | Retrieves all documents in the collection. |
 | `delete(id)` | Deletes a document (uses $O(1)$ Tombstones). |
-| `deleteAll()` | Clears the entire collection. |
 | `observeById(id)` | Returns a `Flow<T?>` that emits updates for a specific record. |
 | `observeAll()` | Returns a `Flow<List<T>>` that emits whenever the collection changes. |
 | `createIndex(name, extractor)` | Registers a secondary index for fast querying. |
-| `getByIndex(name, value)` | Queries documents using a secondary index. |
 
 ### 🤖 AI Vector Collections
 Store and search high-dimensional embeddings with `KoreVectorCollection`.
@@ -100,8 +99,18 @@ Store and search high-dimensional embeddings with `KoreVectorCollection`.
 | Operation | Description |
 | :--- | :--- |
 | `insert(id, floatArray)` | Saves a vector embedding. |
-| `insertBatch(map)` | Batch inserts multiple vectors. |
 | `search(query, limit)` | Performs Cosine Similarity search and returns top-K results. |
+
+### 🕸️ Graph Database
+Store entities and relationships with `GraphStorage`.
+
+| Operation | Description |
+| :--- | :--- |
+| `putNode(node)` | Saves a node with labels and properties. |
+| `getNode(id)` | Retrieves a node by ID. |
+| `putEdge(edge)` | Creates a bidirectional relationship. |
+| `query { ... }` | Fluent DSL for traversing the graph (Outbound/Inbound). |
+| `transaction { ... }` | Executes graph mutations atomically. |
 
 ---
 
@@ -135,6 +144,37 @@ results.forEach { (id, score) ->
 }
 ```
 
+### Graph Traversals (Kotlin DSL)
+```kotlin
+val graph = database.graph()
+
+// Find friends of friends who live in Tokyo
+val tokyoFriends = graph.query {
+    startingWith("Person", "city", "Tokyo")
+    outbound("KNOWS", hops = 2)
+}.toNodeList()
+
+// Atomic graph updates
+graph.transaction {
+    putNode(Node(id = "user1", labels = setOf("Person"), properties = mapOf("name" to "Alice")))
+    putEdge(Edge(sourceId = "user1", targetId = "user2", type = "FOLLOWS"))
+}
+```
+
+### Graph Algorithms
+```kotlin
+// Calculate PageRank to find influential nodes
+val influenceScores = GraphAlgorithms.pageRank(graph, seedNodes = allUsers, edgeType = "FOLLOWS")
+
+// Find the shortest path using Dijkstra
+val path = GraphAlgorithms.shortestPathDijkstra(
+    storage = graph, 
+    startNodeId = "userA", 
+    endNodeId = "userB", 
+    edgeType = "KNOWS"
+)
+```
+
 ---
 
 ## 🛠️ Architecture & Data Lifecycle
@@ -152,106 +192,50 @@ To find a record, KoreDB searches in this order:
 2.  **Bloom Filter:** For disk-based files, KoreDB uses a probabilistic filter to check if a key *actually* exists before opening the file, avoiding 99% of unnecessary disk I/O.
 3.  **SSTables (Disk):** If found in the filter, it performs a binary search on the disk file using a **Sparse Index** to locate the exact record.
 
-### ♻️ Background Maintenance
-*   **Flushing:** Once the MemTable reaches its size limit, it is converted into an immutable **SSTable** and written to disk.
-*   **Compaction:** Periodically, KoreDB merges multiple SSTables in the background to remove deleted records (tombstones) and maintain speed.
-
-
-# 📊 KoreDB Benchmarks
-
-Performance testing conducted on high-end mobile hardware to simulate real-world "AI-Native" workloads.
-
-### 📱 Test Environment
-* **Device:** Google Pixel (Tensor G2 Chip)
-* **Build Type:** Release (R8/Proguard enabled, no debugger attached)
-* **Dataset Size:** Up to 100,000 records
-* **Concurrency:** 8 parallel Coroutines
-* **Baseline:** Room Persistence Library (SQLite)
-
-> ⚠️ **Note:** Performance varies by workload. KoreDB is engineered for **write-heavy** and **AI-vector** workloads. SQLite remains highly efficient for complex relational joins and ordered range scans.
-
 ---
 
-## ⚡ Performance Breakdown
+## 📊 KoreDB vs Room: Real-World Benchmarks
 
-### 🔍 Negative Lookups (1,000x Non-Existent Keys)
-*Tests the efficiency of the Bloom Filter in avoiding unnecessary disk I/O.*
+Benchmarks were conducted using `KoreFurtherBenchmark.kt` on Android.
 
-| Engine | Execution Time | Speedup |
-| :--- | :--- | :--- |
-| **KoreDB** | **4 ms** | **~212x Faster** |
-| Room (SQLite) | 848 ms | - |
+### 🚀 Write & Insert Performance
+KoreDB's LSM-tree architecture shines here, appending data sequentially rather than updating B-Tree pages in place.
 
-### 🤖 AI Vector Similarity Search
-*Dataset: 25,000 vectors | 384 dimensions | 50 queries.*
-
-
-
-| Operation | KoreDB (LSM + SIMD) | Room (SQLite) | Winner |
+| Operation | KoreDB (LSM) | Room (SQLite) | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Insert** | **1,587 ms** | 1,977 ms | **KoreDB** |
-| **Search** | **6 ms** | 52,421 ms | **KoreDB (8700x)** |
+| **Single Write (1k ops)** | **539 ms** | 1,176 ms | **2.2x** |
+| **Bulk Insert (50k items)** | **538 ms** | 824 ms | **1.5x** |
+| **Graph Build (1k Nodes, 5k Edges)** | **496 ms** | 12,813 ms | **25.8x** |
+| **Random Updates** | **88 ms** | 315 ms | **3.6x** |
 
-*SQLite lacks native vector indexing and is forced to perform expensive full-table scans for similarity math.*
+### ⚡ Read & Lookup Latency
+KoreDB is optimized for key-based retrieval, using Bloom Filters to instantly negate non-existent keys.
 
-### 🧵 Parallel Reads (8 Coroutines)
-*Simulates high-concurrency UI rendering and background processing.*
+| Operation | KoreDB | Room | Speedup |
+| :--- | :--- | :--- | :--- |
+| **Cold Start (Open DB)** | **4 ms** | 66 ms | **16.5x** |
+| **Negative Lookup (Bloom Filter)** | **5 ms** | 1,182 ms | **236x** |
+| **Point Read (10k ops)** | **250 ms** | 10,215 ms | **40x** |
+| **Parallel Reads (8 Threads)** | **1,119 ms** | 7,003 ms | **6.2x** |
 
-| Engine | Execution Time | Speedup |
-| :--- | :--- | :--- |
-| **KoreDB** | **1,213 ms** | **~5.8x Faster** |
-| Room (SQLite) | 7,123 ms | - |
+### 🤖 AI & Graph Capabilities
+KoreDB provides native graph algorithms and vector search without external plugins.
 
-### 🚀 Cold Start (100,000 Records)
-*Time to initialize the engine and perform the first read after process boot.*
+| Operation | KoreDB | Room | Notes |
+| :--- | :--- | :--- | :--- |
+| **Vector Search (25k vectors)** | **31.4 s** | 49.9 s | ~1.6x Faster |
+| **Graph 2-Hop (IDs only)** | 19 ms | **3 ms** | Room's C++ SQL engine is highly optimized for joins. |
+| **Graph 2-Hop (Full Objects)** | **140 ms** | - | KoreDB avoids overhead until the final result. |
+| **PageRank (500 nodes)** | **242 ms** | - | Native Algorithm Support. |
+| **Dijkstra Shortest Path** | **143 ms** | - | Pathfinding on 1k nodes/5k edges. |
 
-| Engine | Execution Time | Speedup |
-| :--- | :--- | :--- |
-| **KoreDB** | **4 ms** | **~14.7x Faster** |
-| Room (SQLite) | 59 ms | - |
+### ⚠️ Trade-offs
+No database is perfect. Room's B-Tree architecture currently outperforms KoreDB's LSM-tree in range scans and full table iterations.
 
-### 🔄 Random Updates
-*50,000 initial records with 10,000 randomized updates.*
-
-| Engine | Execution Time | Speedup |
-| :--- | :--- | :--- |
-| **KoreDB** | **110 ms** | **~3.6x Faster** |
-| Room (SQLite) | 396 ms | - |
-
-### 📖 Prefix Scan (Range Query)
-*Retrieving a range of records based on a key prefix.*
-
-| Engine | Execution Time | Note |
-| :--- | :--- | :--- |
-| **Room (SQLite)** | **317 ms** | **Winner** |
-| KoreDB | 851 ms | B-Trees are natively optimized for range scans. |
-
----
-
-## 🧠 Architectural Summary
-
-| Category | Winner | Why? |
-| :--- | :--- | :--- |
-| **Write Throughput** | 🟢 **KoreDB** | Sequential WAL appends vs Page updates. |
-| **Point Lookups** | 🟢 **KoreDB** | Bloom Filters skip disk reads for missing keys. |
-| **Vector Search** | 🟢 **KoreDB** | Native float array indexing vs BLOB parsing. |
-| **Cold Start** | 🟢 **KoreDB** | Minimal metadata overhead; no schema verification. |
-| **Concurrent Reads** | 🟢 **KoreDB** | Lock-free reads from immutable SSTables. |
-| **Range Queries** | 🟡 **SQLite** | B-Tree structures excel at ordered scans. |
-
-
----
-*Benchmarks last updated: February 2026*
----
-
-## 📊 KoreDB vs SQLite
-
-| Operation | KoreDB                    | SQLite                   | Winner |
-| :--- |:--------------------------|:-------------------------| :--- |
-| **Bulk Write** | ⚡ Fast (Appends)          | 🐢 Slower (Page Updates) | **KoreDB** |
-| **Vector Search** | 🔥 Ultra Fast (Zero-copy) | 🐌 Slow (Blob Fetching)  | **KoreDB** |
-| **Cold Start** | 🚀 Immediate              | ⏳ Slower (Schema Init)   | **KoreDB** |
-| **Concurrency** | 🟢 0ms Read Latency       | 🟡 Lock Contention       | **KoreDB** |
+| Operation | KoreDB | Room | Why? |
+| :--- | :--- | :--- | :--- |
+| **Sequential Scan (100k items)** | 983 ms | **402 ms** | B-Trees have better locality for linear scans. |
+| **Prefix Scan** | 18.1 s | **7.9 s** | Iterating merged LSM segments is more expensive. |
 
 ---
 

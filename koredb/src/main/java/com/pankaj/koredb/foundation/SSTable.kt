@@ -24,11 +24,28 @@ import java.nio.channels.FileChannel
 /**
  * Handles the creation and formatting of Sorted String Tables (SSTables).
  *
- * An SSTable is an immutable disk-resident file containing sorted key-value pairs.
- * The format includes:
- * 1. Data Blocks: Sequential key-value pairs.
- * 2. Bloom Filter: Probabilistic index for fast membership testing.
- * 3. Footer: Metadata containing the Bloom Filter offset and a magic number for verification.
+ * An SSTable is an immutable disk-resident file containing sorted key-value pairs. 
+ * It is a fundamental component of the Log-Structured Merge-tree (LSM-tree), 
+ * providing high-throughput sequential writes and efficient range scans.
+ *
+ * ### File Format Specification (V1):
+ *
+ * 1. **Data Blocks**: 
+ *    Sequential records of key-value pairs. Each record follows the format:
+ *    - Key Size (4 bytes, Int)
+ *    - Value Size (4 bytes, Int)
+ *    - Key (Variable length bytes)
+ *    - Value (Variable length bytes)
+ *
+ * 2. **Bloom Filter**: 
+ *    A probabilistic data structure used to quickly determine if a key *might* exist 
+ *    in this segment, avoiding unnecessary disk I/O for negative lookups.
+ *
+ * 3. **Footer**: 
+ *    Fixed-size metadata at the end of the file (16 bytes) containing:
+ *    - Bloom Filter Offset (8 bytes, Long): Byte position where the filter begins.
+ *    - Version (4 bytes, Int): Format version for forward compatibility.
+ *    - Magic Number (4 bytes, Int): Constant identifying the file as a KoreDB SSTable.
  */
 class SSTable {
 
@@ -39,19 +56,28 @@ class SSTable {
         const val MAGIC_NUMBER = 0x4B4F5245
 
         /**
+         * Current version of the SSTable file format.
+         */
+        const val VERSION_V1 = 1
+
+        /**
          * Persists the contents of a [MemTable] to a file in SSTable format.
          *
+         * The [MemTable] must be sorted prior to calling this method to maintain 
+         * the invariant that SSTable keys are stored in lexicographical order.
+         *
          * @param memTable The source in-memory table to flush.
-         * @param outputFile The destination file for the SSTable.
+         * @param outputFile The destination file where the SSTable will be written.
          */
         fun writeFromMemTable(memTable: MemTable, outputFile: File) {
             val fileOutputStream = FileOutputStream(outputFile)
             val channel: FileChannel = fileOutputStream.channel
 
-            // Prepare a Bloom Filter to build as we write
+            // Initialize a Bloom Filter to build a membership index during the write pass.
+            // Parameters are tuned for 100k entries with a low false-positive rate.
             val bloomFilter = BloomFilter(100_000, 3)
 
-            // 1. Write the Data Blocks
+            // 1. Write the Data Blocks: Iterate through sorted entries and append to file.
             for (entry in memTable.getSortedEntries()) {
                 val key = entry.key
                 val value = entry.value
@@ -72,10 +98,10 @@ class SSTable {
                 }
             }
 
-            // 2. Record the position where the Bloom Filter begins
+            // 2. Capture the exact byte offset where the Bloom Filter starts.
             val bloomFilterOffset = channel.position()
 
-            // 3. Write the serialized Bloom Filter
+            // 3. Serialize and write the Bloom Filter.
             val bfBytes = bloomFilter.toByteArray()
             val bfBuffer = ByteBuffer.allocate(bfBytes.size + 8)
             bfBuffer.putInt(bloomFilter.bitSize)
@@ -87,10 +113,10 @@ class SSTable {
                 channel.write(bfBuffer)
             }
 
-            // 4. Write the Footer (12 Bytes)
-            // [Offset (8 Bytes)] [Magic Number (4 Bytes)]
-            val footerBuffer = ByteBuffer.allocate(12)
+            // 4. Write the Footer: Fixed-length metadata for file verification and indexing.
+            val footerBuffer = ByteBuffer.allocate(16)
             footerBuffer.putLong(bloomFilterOffset)
+            footerBuffer.putInt(VERSION_V1)
             footerBuffer.putInt(MAGIC_NUMBER)
 
             footerBuffer.flip()
@@ -98,6 +124,7 @@ class SSTable {
                 channel.write(footerBuffer)
             }
 
+            // Ensure all data is physically flushed to the storage device.
             channel.force(true)
             channel.close()
             fileOutputStream.close()
