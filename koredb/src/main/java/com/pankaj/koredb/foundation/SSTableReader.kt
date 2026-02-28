@@ -277,7 +277,9 @@ class SSTableReader(val file: File) {
      * This allows for thread-safe concurrent reads without modifying the main buffer's position.
      */
     fun getBufferSnapshot(): java.nio.ByteBuffer {
-        return buffer.duplicate().order(java.nio.ByteOrder.BIG_ENDIAN)
+        // Essential: Duplicate copies the position (which might be at end after indexing).
+        // We must reset it to 0 for new readers.
+        return buffer.duplicate().order(java.nio.ByteOrder.BIG_ENDIAN).position(0) as java.nio.ByteBuffer
     }
 
     /**
@@ -327,13 +329,20 @@ class SSTableReader(val file: File) {
 
             if (isMatch) {
                 val valueOffset = startPos + 8 + keySize
-                val score = VectorMath.cosineSimilarity(query, queryMag, localBuffer, valueOffset)
+                
+                // Pass vector length (valueSize / 4 bytes per float)
+                val vectorLength = valueSize / 4
+                
+                val score = VectorMath.cosineSimilarity(query, queryMag, localBuffer, valueOffset, vectorLength)
 
-                if (topKHeap.size < limit) {
-                    topKHeap.add(Pair(startPos, score))
-                } else if (score > topKHeap.peek()!!.second) {
-                    topKHeap.poll()
-                    topKHeap.add(Pair(startPos, score))
+                // Only consider valid comparisons
+                if (score > -1.5f) {
+                    if (topKHeap.size < limit) {
+                        topKHeap.add(Pair(startPos, score))
+                    } else if (score > topKHeap.peek()!!.second) {
+                        topKHeap.poll()
+                        topKHeap.add(Pair(startPos, score))
+                    }
                 }
             }
 

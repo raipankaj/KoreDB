@@ -17,6 +17,8 @@
 package com.pankaj.koredb.graph
 
 import com.pankaj.koredb.engine.KoreDB
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 
 /**
@@ -91,7 +93,8 @@ class GraphStorage(val db: KoreDB) {
      * Efficiently retrieves nodes matching a specific label and property value.
      *
      * This operation performs an O(log N) seek on the property index followed by 
-     * sequential reads for matching IDs.
+     * sequential reads for matching IDs. It also filters out stale index entries 
+     * (e.g., if a node was updated and the old index entry persists).
      *
      * @param label The label category to filter by.
      * @param propertyKey The property name to match.
@@ -105,7 +108,15 @@ class GraphStorage(val db: KoreDB) {
         return indexKeys.mapNotNull { keyBytes ->
             val keyString = String(keyBytes, Charsets.UTF_8)
             val nodeId = keyString.substringAfterLast(":")
-            getNode(nodeId)
+            val node = getNode(nodeId)
+            
+            // Validate: Ensure the node actually still has the property value.
+            // This handles stale indices from previous updates.
+            if (node != null && node.properties[propertyKey] == propertyValue) {
+                node
+            } else {
+                null
+            }
         }
     }
 

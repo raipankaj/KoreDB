@@ -111,7 +111,8 @@ class KoreCollection<T>(
 
         return keys.map { keyBytes ->
             val fullKey = String(keyBytes, Charsets.UTF_8)
-            fullKey.substringAfterLast(":")
+            // Use removePrefix to correctly extract the ID even if it contains colons
+            fullKey.removePrefix("doc:$name:")
         }
     }
 

@@ -237,8 +237,10 @@ class KoreDB(private val directory: File) {
     /**
      * Flushes the current MemTable to a new SSTable segment on disk.
      * This process involves rotating the WAL and updating the MANIFEST.
+     *
+     * (Internal visibility for testing)
      */
-    private suspend fun flushMemTableInternal() = withContext(Dispatchers.IO) {
+    internal suspend fun flushMemTableInternal() = withContext(Dispatchers.IO) {
         val sstFile = File(directory, "segment_${sstFileCounter.getAndIncrement()}.sst")
 
         // Write the sorted MemTable to disk and register the new reader.
@@ -285,8 +287,10 @@ class KoreDB(private val directory: File) {
     /**
      * Merges multiple SSTable segments into a single, optimized segment.
      * This reduces disk usage by removing stale versions and tombstones.
+     *
+     * (Internal visibility for testing)
      */
-    private fun performCompaction() {
+    internal fun performCompaction() {
         println("🚧 STARTING COMPACTION...")
         val compactedFile = File(directory, "compacted_${System.currentTimeMillis()}.sst")
 
@@ -430,11 +434,15 @@ class KoreDB(private val directory: File) {
             if (entry.value.isNotEmpty()) { // Skip tombstones.
                 val score = VectorMath.cosineSimilarity(
                     query, queryMag,
-                    java.nio.ByteBuffer.wrap(entry.value), 0
+                    java.nio.ByteBuffer.wrap(entry.value), 0,
+                    entry.value.size / 4 // Pass vector length!
                 )
-                if (topKHeap.size < limit) topKHeap.add(Pair(keyBytes, score))
-                else if (score > topKHeap.peek()!!.second) {
-                    topKHeap.poll(); topKHeap.add(Pair(keyBytes, score))
+                // Filter out bad dimensions (-2.0f)
+                if (score > -1.5f) {
+                    if (topKHeap.size < limit) topKHeap.add(Pair(keyBytes, score))
+                    else if (score > topKHeap.peek()!!.second) {
+                        topKHeap.poll(); topKHeap.add(Pair(keyBytes, score))
+                    }
                 }
             }
         }

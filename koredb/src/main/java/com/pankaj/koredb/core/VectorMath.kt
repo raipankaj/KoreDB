@@ -46,14 +46,22 @@ object VectorMath {
      * @param queryMagnitude The pre-calculated magnitude of the query vector.
      * @param buffer The buffer containing the vector to compare against.
      * @param offset The starting position of the vector in the buffer.
-     * @return The cosine similarity score, ranging from -1.0 to 1.0.
+     * @param storedVectorLength The number of float elements in the stored vector.
+     * @return The cosine similarity score (-1.0 to 1.0), or -2.0f if dimensions mismatch.
      */
     fun cosineSimilarity(
         query: FloatArray, 
         queryMagnitude: Float, 
         buffer: ByteBuffer, 
-        offset: Int
+        offset: Int,
+        storedVectorLength: Int
     ): Float {
+        // Dimension Mismatch Guard: Return a score lower than minimum possible (-1.0)
+        // to ensuring this result is effectively filtered out of Top-K results.
+        if (query.size != storedVectorLength) {
+            return -2.0f
+        }
+
         var dotProduct = 0f
         var normB = 0f
         val size = query.size

@@ -36,7 +36,10 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class KoreDatabase(directory: File) {
 
-    private val engine = KoreDB(directory)
+    // Expose engine internally for advanced use cases or tests if needed, 
+    // but typically users go through collections.
+    val engine = KoreDB(directory)
+    
     private val collections = ConcurrentHashMap<String, KoreCollection<*>>()
 
     /**
@@ -91,7 +94,15 @@ class KoreDatabase(directory: File) {
     }
 
     fun graph(): GraphStorage {
-        return GraphStorage(engine) // engine is the KoreDB instance
+        return GraphStorage(engine)
+    }
+
+    /**
+     * Advanced: Deletes a raw key from the underlying storage.
+     * Useful for debugging or manual cleanup.
+     */
+    suspend fun deleteRaw(key: ByteArray) {
+        engine.deleteRaw(key)
     }
 
     fun deleteAllRaw() {

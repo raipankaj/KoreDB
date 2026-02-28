@@ -34,6 +34,9 @@ class KotlinxKoreSerializer<T>(
     private val jsonConfig: Json = Json { ignoreUnknownKeys = true }
 ) : KoreSerializer<T> {
 
+    override val serialName: String
+        get() = kSerializer.descriptor.serialName
+
     override fun serialize(obj: T): ByteArray {
         val jsonString = jsonConfig.encodeToString(kSerializer, obj)
         return jsonString.toByteArray(Charsets.UTF_8)

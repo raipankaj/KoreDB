@@ -41,4 +41,10 @@ interface KoreSerializer<T> {
      * @return The reconstructed object.
      */
     fun deserialize(bytes: ByteArray): T
+
+    /**
+     * Returns a unique identifier for the type handled by this serializer.
+     * Used for runtime validation to ensure collection type consistency.
+     */
+    val serialName: String get() = "Unknown"
 }
