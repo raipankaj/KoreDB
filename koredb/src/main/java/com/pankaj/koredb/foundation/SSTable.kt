@@ -85,7 +85,7 @@ class SSTable {
                 bloomFilter.add(key)
 
                 val recordSize = 8 + key.size + value.size
-                val buffer = ByteBuffer.allocate(recordSize)
+                val buffer = ByteBuffer.allocate(recordSize).order(java.nio.ByteOrder.LITTLE_ENDIAN)
 
                 buffer.putInt(key.size)
                 buffer.putInt(value.size)
@@ -103,7 +103,7 @@ class SSTable {
 
             // 3. Serialize and write the Bloom Filter.
             val bfBytes = bloomFilter.toByteArray()
-            val bfBuffer = ByteBuffer.allocate(bfBytes.size + 8)
+            val bfBuffer = ByteBuffer.allocate(bfBytes.size + 8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
             bfBuffer.putInt(bloomFilter.bitSize)
             bfBuffer.putInt(bloomFilter.hashFunctions)
             bfBuffer.put(bfBytes)
@@ -114,7 +114,7 @@ class SSTable {
             }
 
             // 4. Write the Footer: Fixed-length metadata for file verification and indexing.
-            val footerBuffer = ByteBuffer.allocate(16)
+            val footerBuffer = ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
             footerBuffer.putLong(bloomFilterOffset)
             footerBuffer.putInt(VERSION_V1)
             footerBuffer.putInt(MAGIC_NUMBER)

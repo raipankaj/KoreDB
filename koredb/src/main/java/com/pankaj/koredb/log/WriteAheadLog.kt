@@ -65,21 +65,29 @@ class WriteAheadLog(private val logFile: File) {
     }
 
     /**
+     * Pooled buffer to avoid massive allocations during batch writes.
+     */
+    private var sharedBuffer: ByteBuffer? = null
+
+    /**
      * Appends a batch of key-value pairs to the log atomically.
      *
-     * This method pre-allocates a single direct [ByteBuffer] to perform a single 
-     * sequential write, maximizing I/O throughput.
+     * This method utilizes a reusable buffer to maximize throughput.
      *
      * @param batch A list of mutations to persist.
      */
     @Synchronized
     fun appendBatch(batch: List<Pair<ByteArray, ByteArray>>) {
-        // Calculate the exact size needed for the buffer to avoid reallocations.
-        // Record Begin (4) + Commit (4) = 8 bytes.
-        // Each PUT: Tag(4) + KeySize(4) + ValSize(4) + CRC(8) = 20 bytes + data.
         val estimatedSize = batch.sumOf { 20 + it.first.size + it.second.size } + 8
 
-        val buffer = ByteBuffer.allocateDirect(estimatedSize)
+        // Reuse or grow the shared buffer
+        var buffer = sharedBuffer
+        if (buffer == null || buffer.capacity() < estimatedSize) {
+            buffer = ByteBuffer.allocateDirect(maxOf(estimatedSize, 1024 * 1024))
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            sharedBuffer = buffer
+        }
+        buffer.clear()
 
         buffer.putInt(RECORD_BEGIN)
 
@@ -100,8 +108,6 @@ class WriteAheadLog(private val logFile: File) {
         }
 
         buffer.putInt(RECORD_COMMIT)
-
-        // Switch to read mode for writing to the file channel.
         buffer.flip()
 
         while (buffer.hasRemaining()) {
@@ -135,7 +141,7 @@ class WriteAheadLog(private val logFile: File) {
 
         try {
             while (channel.position() < channel.size()) {
-                val typeBuf = ByteBuffer.allocate(4)
+                val typeBuf = ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                 if (channel.read(typeBuf) < 4) break 
                 typeBuf.flip()
 
@@ -144,7 +150,7 @@ class WriteAheadLog(private val logFile: File) {
 
                     RECORD_PUT -> {
                         // Read metadata: KeySize(4) + ValueSize(4) + Checksum(8).
-                        val meta = ByteBuffer.allocate(16)
+                        val meta = ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         if (channel.read(meta) < 16) break
                         meta.flip()
 
@@ -232,14 +238,14 @@ class WriteAheadLog(private val logFile: File) {
 
                 try {
                     while (channel.position() < channel.size()) {
-                        val typeBuf = ByteBuffer.allocate(4)
+                        val typeBuf = ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                         if (channel.read(typeBuf) < 4) break
                         typeBuf.flip()
 
                         when (typeBuf.int) {
                             RECORD_BEGIN -> tempBatch.clear()
                             RECORD_PUT -> {
-                                val meta = ByteBuffer.allocate(16)
+                                val meta = ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                                 if (channel.read(meta) < 16) break
                                 meta.flip()
 

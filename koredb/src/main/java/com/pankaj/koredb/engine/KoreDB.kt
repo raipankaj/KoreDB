@@ -22,6 +22,9 @@ import com.pankaj.koredb.foundation.SSTable
 import com.pankaj.koredb.foundation.SSTableReader
 import com.pankaj.koredb.log.WriteAheadLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -403,13 +406,19 @@ class KoreDB(private val directory: File) {
      * @param limit Maximum number of results to return.
      * @return A list of matching key-score pairs, sorted by similarity descending.
      */
-    fun searchVectorsRaw(prefix: ByteArray, query: FloatArray, limit: Int): List<Pair<ByteArray, Float>> {
+    suspend fun searchVectorsRaw(prefix: ByteArray, query: FloatArray, limit: Int): List<Pair<ByteArray, Float>> = coroutineScope {
         val topKHeap = java.util.PriorityQueue<Pair<ByteArray, Float>>(compareBy { it.second })
         val queryMag = VectorMath.getMagnitude(query)
 
-        // Search disk segments for matching vectors.
-        for (reader in sstReaders) {
-            val diskResults = reader.findTopVectors(prefix, query, limit)
+        // 🚀 PARALLEL SSTABLE SCAN
+        val sstResults = sstReaders.map { reader ->
+            async(Dispatchers.Default) {
+                reader.findTopVectors(prefix, query, limit)
+            }
+        }.awaitAll()
+
+        // Aggregate results from disk segments.
+        for (diskResults in sstResults) {
             for (res in diskResults) {
                 if (topKHeap.size < limit) topKHeap.add(res)
                 else if (res.second > topKHeap.peek()!!.second) {
@@ -418,26 +427,29 @@ class KoreDB(private val directory: File) {
             }
         }
 
-        // Search the MemTable for recent vector updates.
+        // 🏎️ OPTIMIZED MEMTABLE SCAN
         for (entry in memTable.getTailEntries(prefix)) {
             val keyBytes = entry.key
-
-            var isMatch = keyBytes.size >= prefix.size
-            if (isMatch) {
-                for (i in prefix.indices) {
-                    if (keyBytes[i] != prefix[i]) { isMatch = false; break }
+            
+            // Inline Prefix Check
+            if (keyBytes.size < prefix.size) break
+            var match = true
+            for (i in prefix.indices) {
+                if (keyBytes[i] != prefix[i]) {
+                    match = false; break
                 }
             }
-
-            if (!isMatch) break
+            if (!match) break
 
             if (entry.value.isNotEmpty()) { // Skip tombstones.
-                val score = VectorMath.cosineSimilarity(
-                    query, queryMag,
-                    java.nio.ByteBuffer.wrap(entry.value), 0,
-                    entry.value.size / 4 // Pass vector length!
-                )
-                // Filter out bad dimensions (-2.0f)
+                val valBytes = entry.value
+                val buf = java.nio.ByteBuffer.wrap(valBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                val storedMag = buf.getFloat()
+                val vectorLength = (valBytes.size - 4) / 4
+
+                val dot = VectorMath.dotProduct(query, buf, 4, vectorLength)
+                val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
+
                 if (score > -1.5f) {
                     if (topKHeap.size < limit) topKHeap.add(Pair(keyBytes, score))
                     else if (score > topKHeap.peek()!!.second) {
@@ -447,7 +459,7 @@ class KoreDB(private val directory: File) {
             }
         }
 
-        return topKHeap.toList().sortedByDescending { it.second }
+        topKHeap.toList().sortedByDescending { it.second }
     }
 
     /**

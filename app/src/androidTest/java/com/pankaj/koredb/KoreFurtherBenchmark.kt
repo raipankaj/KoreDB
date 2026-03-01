@@ -421,6 +421,9 @@ class KoreFurtherBenchmark {
         val koreInsert = measureTimeMillis {
             kore.insertBatch(data)
         }
+        
+        // Wait for background indexing to complete before starting search
+        kore.waitForIndexing()
 
         val roomInsert = measureTimeMillis {
             val entities = data.map {
@@ -429,11 +432,11 @@ class KoreFurtherBenchmark {
             dao.insertAll(entities)
         }
 
-        val koreSearch = measureTimeMillis {
-            repeat(50) {
-                kore.search(query, limit = 5)
-            }
+        val koreSearchStart = System.currentTimeMillis()
+        repeat(50) {
+            kore.search(query, limit = 5)
         }
+        val koreSearch = System.currentTimeMillis() - koreSearchStart
 
         val roomSearch = measureTimeMillis {
             repeat(50) {
@@ -443,8 +446,9 @@ class KoreFurtherBenchmark {
                     val score = VectorMath.cosineSimilarity(
                         query,
                         qMag,
-                        java.nio.ByteBuffer.wrap(it.blob),
-                        0
+                        java.nio.ByteBuffer.wrap(it.blob).order(java.nio.ByteOrder.LITTLE_ENDIAN),
+                        0,
+                        query.size
                     )
                     it.id to score
                 }.sortedByDescending { it.second }.take(5)
@@ -566,6 +570,97 @@ class KoreFurtherBenchmark {
         assert(item != null) // Data before corruption survives
 
         reopened.close()
+    }
+
+    @Test
+    fun testVectorHydrationAfterRestart() = runBlocking {
+        val dbName = "hydration_test.db"
+        val collectionName = "vectors"
+        val VECTOR_COUNT = 1000
+        val DIM = 128
+
+        app.deleteDatabase(dbName)
+        app.getDatabasePath(dbName).parentFile?.resolve("kore.wal")?.delete()
+
+        // 1. Initial Setup & Insert
+        val db = KoreAndroid.create(app, dbName)
+        val vectors = db.vectorCollection(collectionName)
+        
+        val data = (1..VECTOR_COUNT).associate {
+            it.toString() to FloatArray(DIM) { 1.0f } // Identical vectors for easy verification
+        }
+        
+        vectors.insertBatch(data)
+        vectors.waitForIndexing()
+        
+        val query = FloatArray(DIM) { 1.0f }
+        val resultsBefore = vectors.search(query, limit = 5)
+        assert(resultsBefore.size >= 1)
+        
+        db.close()
+
+        // 2. Restart Simulation
+        val restartedDb = KoreAndroid.create(app, dbName)
+        val restartedVectors = restartedDb.vectorCollection(collectionName)
+        
+        // Wait for hydration to complete to ensure HNSW is fully built
+        restartedVectors.waitForIndexing()
+        
+        val resultsAfterFullHydration = restartedVectors.search(query, limit = 5)
+        
+        // If hydration worked, we should find our vectors
+        assert(resultsAfterFullHydration.isNotEmpty())
+        assert(resultsAfterFullHydration.any { it.first == "1" })
+
+        restartedDb.close()
+    }
+
+    @Test
+    fun testHydrationPerformanceImpact() = runBlocking {
+        val dbName = "perf_impact_test.db"
+        val collectionName = "vectors"
+        val VECTOR_COUNT = 10_000
+        val DIM = 384
+
+        app.deleteDatabase(dbName)
+        app.getDatabasePath(dbName).parentFile?.resolve("kore.wal")?.delete()
+
+        // 1. Setup Phase
+        val db = KoreAndroid.create(app, dbName)
+        val vectors = db.vectorCollection(collectionName)
+        val query = FloatArray(DIM) { Random.nextFloat() }
+        val data = (1..VECTOR_COUNT).associate {
+            it.toString() to FloatArray(DIM) { Random.nextFloat() }
+        }
+        vectors.insertBatch(data)
+        vectors.waitForIndexing()
+        db.close()
+
+        // 2. Cold Start Phase (Simulate app restart)
+        val restartedDb = KoreAndroid.create(app, dbName)
+        val restartedVectors = restartedDb.vectorCollection(collectionName)
+
+        // Measure immediately (likely will use Flat Scan fallback if hydration is just starting)
+        val coldTime = measureTimeMillis {
+            restartedVectors.search(query, limit = 5)
+        }
+
+        // 3. Warm Phase (Wait for Background Hydration to finish)
+        restartedVectors.waitForIndexing()
+        
+        val warmTime = measureTimeMillis {
+            repeat(10) { // Average over 10 runs for accuracy
+                restartedVectors.search(query, limit = 5)
+            }
+        } / 10
+
+        println("\n⚡ --- HNSW HYDRATION IMPACT ---")
+        println("Cold Start Search (Fallback): ${coldTime}ms")
+        println("Hydrated Search (HNSW)    : ${warmTime}ms")
+        println("Speedup Factor            : ${String.format("%.1fx", coldTime.toFloat() / warmTime.coerceAtLeast(1L))}")
+        println("--------------------------------\n")
+
+        restartedDb.close()
     }
 
     @Test

@@ -12,13 +12,13 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 ## ✨ Features
 
-*   **⚡ Blazing Performance:** LSM architecture offers $O(1)$ write performance.
-*   **🤖 AI-Native Vector Store:** Built-in high-performance vector similarity search using Cosine Similarity, optimized with SIMD-like loop unrolling.
+*   **⚡ Blazing Performance:** LSM architecture offers $O(1)$ write performance with a "Nitro" parallel serialization path.
+*   **🤖 AI-Native Vector Store:** Sub-millisecond Approximate Nearest Neighbor (ANN) search using a **Hierarchical Navigable Small World (HNSW)** index.
 *   **🕸️ Built-in Graph DB:** First-class support for property graphs with bidirectional traversals and optimized relationship indices.
 *   **🏗️ Pure Kotlin:** 100% Kotlin with Zero JNI overhead. No more `sqlite3.so` bloat.
-*   **🔗 Coroutine First:** Built for non-blocking I/O and reactive UI with `Flow`.
-*   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) ensures your data survives process death or system crashes.
-*   **🔍 Optimized Reads:** Bloom Filters and Sparse Indexing ensure fast lookups by avoiding unnecessary disk I/O.
+*   **🔗 Coroutine First:** Built for non-blocking I/O and reactive UI with `Flow`, featuring background indexing and **automatic hydration** for vectors.
+*   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) with CRC32 checksums ensures your data survives process death or system crashes.
+*   **🔍 Optimized Reads:** Bloom Filters, Sparse Indexing, and HNSW graphs ensure fast lookups by avoiding unnecessary disk I/O.
 *   **📦 Lightweight:** Minimal footprint, perfect for mobile apps.
 
 ---
@@ -109,8 +109,10 @@ Store and search high-dimensional embeddings with `KoreVectorCollection`.
 
 | Operation | Description |
 | :--- | :--- |
-| `insert(id, floatArray)` | Saves a vector embedding. |
-| `search(query, limit)` | Performs Cosine Similarity search and returns top-K results. |
+| `insert(id, floatArray)` | Saves a vector embedding. Indexing happens in the background. |
+| `insertBatch(map)` | Efficiently saves multiple vectors using parallel serialization. |
+| `search(query, limit)` | Performs O(log N) HNSW search for sub-millisecond retrieval. |
+| `waitForIndexing()` | (Experimental) Blocks until background HNSW indexing is complete. |
 
 ### 🕸️ Graph Database
 Store entities and relationships with `GraphStorage`.
@@ -143,11 +145,14 @@ notes.observeById("1").collect { note ->
 }
 ```
 
-### AI Vector Similarity Search
+### AI Vector Similarity Search (HNSW)
 ```kotlin
 val vectors = database.vectorCollection("embeddings")
 
-// Search for top 5 similar items
+// Insert (Returns immediately, indexing happens in background)
+vectors.insert("vec1", floatArrayOf(0.1f, 0.5f, 0.9f))
+
+// Search for top 5 similar items (Uses HNSW Index)
 val results = vectors.search(queryVector = floatArrayOf(0.1f, 0.5f, 0.9f), limit = 5)
 
 results.forEach { (id, score) ->
@@ -203,6 +208,12 @@ To find a record, KoreDB searches in this order:
 2.  **Bloom Filter:** For disk-based files, KoreDB uses a probabilistic filter to check if a key *actually* exists before opening the file, avoiding 99% of unnecessary disk I/O.
 3.  **SSTables (Disk):** If found in the filter, it performs a binary search on the disk file using a **Sparse Index** to locate the exact record.
 
+### 🤖 HNSW Background Hydration
+Unlike standard in-memory vector stores that require a "warm-up" period, KoreDB uses an asynchronous hydration model:
+*   **Zero-Block Startup**: The database opens instantly. HNSW reconstruction begins in a low-priority background thread.
+*   **Hybrid Search**: While hydrating, KoreDB automatically falls back to an optimized **Flat Scan** for data not yet in the graph.
+*   **Eventual Max Speed**: Once hydration completes (usually <2s for 25k vectors), searches transition to sub-millisecond HNSW navigation.
+
 ---
 
 ## 📊 KoreDB vs Room: Real-World Benchmarks
@@ -234,7 +245,8 @@ KoreDB provides native graph algorithms and vector search without external plugi
 
 | Operation | KoreDB | Room | Notes |
 | :--- | :--- | :--- | :--- |
-| **Vector Search (25k vectors)** | **31.4 s** | 49.9 s | ~1.6x Faster |
+| **Vector Insert (25k vectors)** | **799 ms** | **475 ms** | Nitro Parallel Path. |
+| **Vector Search (25k vectors)** | **47 ms** | 18.5 s | **393x Faster (HNSW Index)** |
 | **Graph 2-Hop (IDs only)** | 19 ms | **3 ms** | Room's C++ SQL engine is highly optimized for joins. |
 | **Graph 2-Hop (Full Objects)** | **140 ms** | - | KoreDB avoids overhead until the final result. |
 | **PageRank (500 nodes)** | **242 ms** | - | Native Algorithm Support. |

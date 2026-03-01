@@ -30,9 +30,15 @@ object VectorSerializer {
      * @return The byte representation of the vector.
      */
     fun toByteArray(vector: FloatArray): ByteArray {
-        val buffer = ByteBuffer.allocate(vector.size * 4) 
-        for (f in vector) buffer.putFloat(f)
-        return buffer.array()
+        val magnitude = VectorMath.getMagnitude(vector)
+        val bytes = ByteArray(4 + vector.size * 4)
+        val buffer = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        
+        buffer.putFloat(magnitude)
+        // 🚀 Use bulk FloatBuffer put for high-speed native-like memory copy
+        buffer.asFloatBuffer().put(vector)
+        
+        return bytes
     }
 
     /**
@@ -42,9 +48,11 @@ object VectorSerializer {
      * @return The reconstructed vector.
      */
     fun fromByteArray(bytes: ByteArray): FloatArray {
-        val buffer = ByteBuffer.wrap(bytes)
-        val result = FloatArray(bytes.size / 4)
-        for (i in result.indices) result[i] = buffer.getFloat()
+        val buffer = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        buffer.getFloat() // Skip magnitude
+        val result = FloatArray((bytes.size - 4) / 4)
+        // 🚀 Bulk get for faster deserialization
+        buffer.asFloatBuffer().get(result)
         return result
     }
 }

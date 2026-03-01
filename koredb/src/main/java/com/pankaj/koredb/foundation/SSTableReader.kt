@@ -59,6 +59,7 @@ class SSTableReader(val file: File) {
     init {
         val channel = RandomAccessFile(file, "r").channel
         buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
+        buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
 
         if (buffer.capacity() < 16) {
             throw IllegalStateException("Corrupt SSTable: File header/footer missing in ${file.name}")
@@ -279,7 +280,7 @@ class SSTableReader(val file: File) {
     fun getBufferSnapshot(): java.nio.ByteBuffer {
         // Essential: Duplicate copies the position (which might be at end after indexing).
         // We must reset it to 0 for new readers.
-        return buffer.duplicate().order(java.nio.ByteOrder.BIG_ENDIAN).position(0) as java.nio.ByteBuffer
+        return buffer.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN).position(0) as java.nio.ByteBuffer
     }
 
     /**
@@ -296,9 +297,9 @@ class SSTableReader(val file: File) {
     fun findTopVectors(prefix: ByteArray, query: FloatArray, limit: Int): List<Pair<ByteArray, Float>> {
         val topKHeap = PriorityQueue<Pair<Int, Float>>(compareBy { it.second })
         val queryMag = VectorMath.getMagnitude(query)
+        val prefixLen = prefix.size
 
         val localBuffer = getBufferSnapshot()
-
         val startOffset = findBlockStartOffset(prefix)
         localBuffer.position(startOffset)
 
@@ -306,36 +307,35 @@ class SSTableReader(val file: File) {
             val startPos = localBuffer.position()
             val keySize = localBuffer.getInt()
             val valueSize = localBuffer.getInt()
-
-            var isMatch = true
-            var passedPrefix = false
-            val compareLen = minOf(keySize, prefix.size)
-
-            for (i in 0 until compareLen) {
-                val bFile = localBuffer.get(startPos + 8 + i).toInt() and 0xFF
-                val bPref = prefix[i].toInt() and 0xFF
-                if (bFile != bPref) {
-                    isMatch = false
-                    if (bFile > bPref) {
-                        passedPrefix = true
+            
+            // 🏎️ OPTIMIZED PREFIX MATCHING & EARLY EXIT
+            // Use sequential get() to check prefix (ART is very fast at this)
+            var match = keySize >= prefixLen
+            if (match) {
+                for (i in 0 until prefixLen) {
+                    val bFile = localBuffer.get()
+                    if (bFile != prefix[i]) {
+                        match = false
+                        // Check if we passed the entire range (lexicographical sorting)
+                        if ((bFile.toInt() and 0xFF) > (prefix[i].toInt() and 0xFF)) {
+                             // EXIT ENTIRE DISK SCAN: Range is exceeded.
+                             return finalizeResults(topKHeap, localBuffer)
+                        }
+                        break
                     }
-                    break
                 }
             }
-
-            if (isMatch && keySize < prefix.size) isMatch = false
-
-            if (passedPrefix) break
-
-            if (isMatch) {
+            
+            if (match) {
                 val valueOffset = startPos + 8 + keySize
                 
-                // Pass vector length (valueSize / 4 bytes per float)
-                val vectorLength = valueSize / 4
+                // Read magnitude and compute dot product
+                val storedMag = localBuffer.getFloat(valueOffset)
+                val vectorLength = (valueSize - 4) / 4
                 
-                val score = VectorMath.cosineSimilarity(query, queryMag, localBuffer, valueOffset, vectorLength)
+                val dot = VectorMath.dotProduct(query, localBuffer, valueOffset + 4, vectorLength)
+                val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
 
-                // Only consider valid comparisons
                 if (score > -1.5f) {
                     if (topKHeap.size < limit) {
                         topKHeap.add(Pair(startPos, score))
@@ -346,10 +346,17 @@ class SSTableReader(val file: File) {
                 }
             }
 
+            // Move to the next record
             localBuffer.position(startPos + 8 + keySize + valueSize)
         }
 
-        // Finalize results by extracting keys from the heap.
+        return finalizeResults(topKHeap, localBuffer)
+    }
+
+    private fun finalizeResults(
+        topKHeap: PriorityQueue<Pair<Int, Float>>, 
+        localBuffer: java.nio.ByteBuffer
+    ): List<Pair<ByteArray, Float>> {
         val finalResults = mutableListOf<Pair<ByteArray, Float>>()
         while (topKHeap.isNotEmpty()) {
             val winner = topKHeap.poll()!!
@@ -361,7 +368,6 @@ class SSTableReader(val file: File) {
             localBuffer.get(keyBytes)
             finalResults.add(Pair(keyBytes, winner.second))
         }
-
         return finalResults.reversed()
     }
 }
