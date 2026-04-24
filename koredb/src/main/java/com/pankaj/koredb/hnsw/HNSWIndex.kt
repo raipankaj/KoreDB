@@ -230,4 +230,86 @@ class HNSWIndex(
     }
 
     fun size() = nodes.size
+
+    /**
+     * Returns true if the index already contains the given ID.
+     */
+    fun contains(id: String): Boolean = nodes.containsKey(id)
+
+    /**
+     * Serializes the entire HNSW graph to a file for fast cold starts.
+     */
+    fun saveToDisk(file: java.io.File) {
+        java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(file))).use { out ->
+            out.writeInt(0x484E5357) // "HNSW" magic number
+            out.writeInt(maxLevel.get())
+            
+            val entryId = entryNode.get()?.id
+            if (entryId != null) {
+                out.writeBoolean(true)
+                out.writeUTF(entryId)
+            } else {
+                out.writeBoolean(false)
+            }
+
+            out.writeInt(nodes.size)
+            for ((id, node) in nodes) {
+                out.writeUTF(id)
+                out.writeInt(node.vector.size)
+                for (f in node.vector) out.writeFloat(f)
+                out.writeFloat(node.magnitude)
+                out.writeInt(node.nodeLevel)
+
+                for (l in 0..node.nodeLevel) {
+                    val neighbors = node.neighbors[l]
+                    out.writeInt(neighbors.size)
+                    for (neighborId in neighbors) {
+                        out.writeUTF(neighborId)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Reconstructs the HNSW graph from a file.
+     */
+    fun loadFromDisk(file: java.io.File) {
+        if (!file.exists()) return
+
+        java.io.DataInputStream(java.io.BufferedInputStream(java.io.FileInputStream(file))).use { input ->
+            val magic = input.readInt()
+            if (magic != 0x484E5357) return // Invalid file
+
+            maxLevel.set(input.readInt())
+            
+            val hasEntryNode = input.readBoolean()
+            val entryId = if (hasEntryNode) input.readUTF() else null
+
+            val nodeCount = input.readInt()
+            nodes.clear()
+
+            for (i in 0 until nodeCount) {
+                val id = input.readUTF()
+                val vecSize = input.readInt()
+                val vector = FloatArray(vecSize)
+                for (v in 0 until vecSize) vector[v] = input.readFloat()
+                val magnitude = input.readFloat()
+                val level = input.readInt()
+
+                val node = HNSWNode(id, vector, magnitude, level)
+                for (l in 0..level) {
+                    val neighborCount = input.readInt()
+                    for (n in 0 until neighborCount) {
+                        node.neighbors[l].add(input.readUTF())
+                    }
+                }
+                nodes[id] = node
+            }
+
+            if (entryId != null) {
+                entryNode.set(nodes[entryId])
+            }
+        }
+    }
 }

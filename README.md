@@ -31,7 +31,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("io.github.raipankaj:koredb:0.0.5")
+    implementation("io.github.raipankaj:koredb:0.0.6")
 }
 ```
 
@@ -71,7 +71,99 @@ class MyApplication : Application() {
         database = KoreAndroid.create(this, "my_notes_db")
     }
 }
+
+---
+
+## 🛠️ Implementation Guide
+
+Follow these steps to implement KoreDB's features in your application.
+
+### 1. Define Your Data Model
+Annotate your classes with `@Serializable`.
+
+```kotlin
+@Serializable
+data class Note(val id: String, val title: String, val content: String, val isPinned: Boolean = false)
 ```
+
+### 2. CRUD Operations with Typed Collections
+Retrieve a collection and perform basic data operations.
+
+```kotlin
+val notes = database.collection<Note>("notes")
+
+// Insert or Update
+notes.insert("1", Note("1", "KoreDB Guide", "LSM-trees are fast!"))
+
+// Bulk Insert (High performance)
+val batch = mapOf("2" to Note("2", "Title 2", "Content 2"), "3" to Note("3", "Title 3", "Content 3"))
+notes.insertBatch(batch)
+
+// Efficient Lookups
+val note = notes.getById("1")
+val groupANotes = notes.getByIdPrefix("groupA_") // Scan by ID prefix
+val rangeNotes = notes.getByIdRange("100", "200") // Scan by ID range [100, 200)
+
+// Delete
+notes.delete("1")
+notes.deleteAll() // Wipe collection
+```
+
+### 3. Reactive UI with Coroutine Flows
+Observe data changes in real-time.
+
+```kotlin
+// Observe a single document
+notes.observeById("1").collect { note ->
+    println("Note updated: $note")
+}
+
+// Observe entire collection
+notes.observeAll().collect { allNotes ->
+    updateUi(allNotes)
+}
+```
+
+### 4. AI Vector Similarity Search (HNSW)
+Store embeddings and perform sub-millisecond similarity searches.
+
+```kotlin
+val vectors = database.vectorCollection("embeddings")
+
+// Insert Vector
+vectors.insert("v1", floatArrayOf(0.1f, 0.5f, 0.9f))
+
+// Search top 5 similar
+val results = vectors.search(query = floatArrayOf(0.12f, 0.48f, 0.92f), limit = 5)
+
+// Wait for background indexing (useful for tests)
+vectors.waitForIndexing()
+```
+
+### 5. Graph Database & Traversals
+Store entities and relationships with first-class graph support.
+
+```kotlin
+val graph = database.graph()
+
+// Atomic Mutations
+graph.transaction {
+    putNode(Node("u1", labels = setOf("User"), properties = mapOf("name" to "Alice")))
+    putNode(Node("u2", labels = setOf("User"), properties = mapOf("name" to "Bob")))
+    putEdge(Edge("u1", "u2", "FOLLOWS"))
+}
+
+// Powerful DSL Queries
+val friendsOfAlice = graph.query {
+    startingWith("User", "name", "Alice")
+    outbound("FOLLOWS")
+}.toNodeList()
+
+// Advanced Graph Algorithms
+val path = GraphAlgorithms.shortestPathDijkstra(graph, "u1", "u500", "FOLLOWS")
+val ranks = GraphAlgorithms.pageRank(graph, listOf("u1", "u2"), "FOLLOWS")
+```
+
 
 ---
 
@@ -98,7 +190,8 @@ Manage your data classes with ease using `KoreCollection<T>`.
 | `insert(id, doc)` | Inserts or updates a document. |
 | `insertBatch(map)` | Efficiently saves multiple documents in one transaction. |
 | `getById(id)` | Retrieves a document by its unique ID. |
-| `getAll()` | Retrieves all documents in the collection. |
+| `getByIdRange(start, end)` | Efficiently retrieves documents within an ID range [start, end). |
+| `getByIdPrefix(prefix)` | Retrieves all documents whose ID starts with the prefix. |
 | `delete(id)` | Deletes a document (uses $O(1)$ Tombstones). |
 | `observeById(id)` | Returns a `Flow<T?>` that emits updates for a specific record. |
 | `observeAll()` | Returns a `Flow<List<T>>` that emits whenever the collection changes. |
@@ -124,72 +217,6 @@ Store entities and relationships with `GraphStorage`.
 | `putEdge(edge)` | Creates a bidirectional relationship. |
 | `query { ... }` | Fluent DSL for traversing the graph (Outbound/Inbound). |
 | `transaction { ... }` | Executes graph mutations atomically. |
-
----
-
-## 💡 Usage Examples
-
-### Basic CRUD & Observation
-```kotlin
-@Serializable
-data class Note(val id: String, val title: String, val content: String)
-
-val notes = database.collection<Note>("notes")
-
-// Insert
-notes.insert("1", Note("1", "Hello", "KoreDB is fast!"))
-
-// Observe
-notes.observeById("1").collect { note ->
-    println("Note updated: $note")
-}
-```
-
-### AI Vector Similarity Search (HNSW)
-```kotlin
-val vectors = database.vectorCollection("embeddings")
-
-// Insert (Returns immediately, indexing happens in background)
-vectors.insert("vec1", floatArrayOf(0.1f, 0.5f, 0.9f))
-
-// Search for top 5 similar items (Uses HNSW Index)
-val results = vectors.search(queryVector = floatArrayOf(0.1f, 0.5f, 0.9f), limit = 5)
-
-results.forEach { (id, score) ->
-    println("Found $id with similarity score: $score")
-}
-```
-
-### Graph Traversals (Kotlin DSL)
-```kotlin
-val graph = database.graph()
-
-// Find friends of friends who live in Tokyo
-val tokyoFriends = graph.query {
-    startingWith("Person", "city", "Tokyo")
-    outbound("KNOWS", hops = 2)
-}.toNodeList()
-
-// Atomic graph updates
-graph.transaction {
-    putNode(Node(id = "user1", labels = setOf("Person"), properties = mapOf("name" to "Alice")))
-    putEdge(Edge(sourceId = "user1", targetId = "user2", type = "FOLLOWS"))
-}
-```
-
-### Graph Algorithms
-```kotlin
-// Calculate PageRank to find influential nodes
-val influenceScores = GraphAlgorithms.pageRank(graph, seedNodes = allUsers, edgeType = "FOLLOWS")
-
-// Find the shortest path using Dijkstra
-val path = GraphAlgorithms.shortestPathDijkstra(
-    storage = graph, 
-    startNodeId = "userA", 
-    endNodeId = "userB", 
-    edgeType = "KNOWS"
-)
-```
 
 ---
 

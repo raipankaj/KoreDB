@@ -12,4 +12,7 @@ interface VectorDao {
 
     @Query("SELECT * FROM vectors")
     suspend fun getAll(): List<VectorEntity>
+
+    @Query("DELETE FROM vectors")
+    suspend fun deleteAll()
 }

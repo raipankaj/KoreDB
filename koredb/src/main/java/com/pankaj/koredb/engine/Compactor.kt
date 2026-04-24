@@ -52,7 +52,7 @@ object Compactor {
         // 1. Initialize Iterators for all input files
         val queue = PriorityQueue<SSTableIterator>()
         readers.forEachIndexed { index, reader ->
-            val iterator = SSTableIterator(reader, fileIndex = index)
+            val iterator = SSTableIterator(reader, priority = index)
             if (iterator.currentKey != null) {
                 queue.add(iterator)
             }
@@ -67,9 +67,8 @@ object Compactor {
 
         while (queue.isNotEmpty()) {
             // Retrieve the iterator with the smallest key (and newest version)
-            val topIterator = queue.poll()
+            val topIterator = queue.poll()!!
             val candidateKey = topIterator.currentKey!!
-            val candidateValue = topIterator.currentValue!!
 
             // Deduplication: The PriorityQueue ensures we see the newest version of a key first.
             // Any subsequent appearances of the same key in older segments are ignored.
@@ -77,6 +76,7 @@ object Compactor {
             
             if (isNewKey) {
                 lastProcessedKey = candidateKey
+                val candidateValue = topIterator.value() ?: KoreDB.TOMBSTONE
 
                 // Tombstone Logic: If the value is empty, it represents a deletion.
                 // We omit it from the new segment to reclaim disk space.

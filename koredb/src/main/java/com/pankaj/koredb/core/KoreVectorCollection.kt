@@ -18,6 +18,9 @@ class KoreVectorCollection(
     private val indexingScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val indexingChannel = Channel<Pair<String, FloatArray>>(Channel.UNLIMITED)
 
+    // A file to persist the HNSW graph directly to disk to bypass slow hydration
+    private val indexFile = java.io.File(db.directory, "hnsw_${name}.bin")
+
     init {
         // Start the background indexing and hydration worker
         indexingScope.launch {
@@ -35,20 +38,41 @@ class KoreVectorCollection(
      * Scans the persistent storage to rebuild the HNSW index on startup.
      */
     private suspend fun hydrateFromDisk() = withContext(Dispatchers.IO) {
+        if (indexFile.exists()) {
+            try {
+                hnsw.loadFromDisk(indexFile)
+            } catch (e: Exception) {
+                // If the file is corrupted, start fresh
+                indexFile.delete()
+            }
+        }
+
         val prefix = "vec:$name:".toByteArray(Charsets.UTF_8)
         val rawEntries = db.getKeysByPrefixRaw(prefix) // Get all vector keys
         
+        var addedNew = false
+
         rawEntries.chunked(500).forEach { batchKeys ->
             batchKeys.forEach { keyBytes ->
                 val id = String(keyBytes, Charsets.UTF_8).removePrefix("vec:$name:")
-                val value = db.getRaw(keyBytes)
-                if (value != null && value.isNotEmpty()) {
-                    val vector = VectorSerializer.fromByteArray(value)
-                    hnsw.insert(id, vector, VectorMath.getMagnitude(vector))
+                
+                // Only insert if the HNSW graph doesn't already have it
+                if (!hnsw.contains(id)) {
+                    val value = db.getRaw(keyBytes)
+                    if (value != null && value.isNotEmpty()) {
+                        val vector = VectorSerializer.fromByteArray(value)
+                        hnsw.insert(id, vector, VectorMath.getMagnitude(vector))
+                        addedNew = true
+                    }
                 }
             }
             // Yield to avoid blocking other background tasks
             yield()
+        }
+
+        // Save initial hydration to disk to avoid doing this ever again
+        if (addedNew && hnsw.size() > 0) {
+            hnsw.saveToDisk(indexFile)
         }
     }
 
@@ -114,6 +138,11 @@ class KoreVectorCollection(
     suspend fun waitForIndexing() {
         while (!indexingChannel.isEmpty) {
             delay(50)
+        }
+        
+        // Save the latest state to disk
+        withContext(Dispatchers.IO) {
+            hnsw.saveToDisk(indexFile)
         }
     }
 }

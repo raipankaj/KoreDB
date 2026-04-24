@@ -17,8 +17,12 @@
 package com.pankaj.koredb.engine
 
 import com.pankaj.koredb.core.VectorMath
+import com.pankaj.koredb.foundation.ByteArrayComparator
+import com.pankaj.koredb.foundation.KoreIterator
 import com.pankaj.koredb.foundation.MemTable
+import com.pankaj.koredb.foundation.MemTableIterator
 import com.pankaj.koredb.foundation.SSTable
+import com.pankaj.koredb.foundation.SSTableIterator
 import com.pankaj.koredb.foundation.SSTableReader
 import com.pankaj.koredb.log.WriteAheadLog
 import kotlinx.coroutines.Dispatchers
@@ -29,6 +33,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.PriorityQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -48,7 +53,7 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * @property directory The root directory where database segments and logs are persisted.
  */
-class KoreDB(private val directory: File) {
+class KoreDB(val directory: File) {
 
     private var memTable = MemTable()
     private val sstFileCounter = AtomicInteger(0)
@@ -229,7 +234,13 @@ class KoreDB(private val directory: File) {
 
         // Tier 2: SSTable lookup (Newest to Oldest)
         for (i in sstReaders.indices.reversed()) {
-            val diskResult = sstReaders[i].find(key)
+            val reader = sstReaders[i]
+            
+            // Fast path: skip segments where the key is definitively out of bounds
+            if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, key) < 0) continue
+            if (reader.minKey != null && ByteArrayComparator.compare(reader.minKey!!, key) > 0) continue
+
+            val diskResult = reader.find(key)
             if (diskResult != null) {
                 return if (diskResult.isEmpty()) null else diskResult
             }
@@ -328,74 +339,303 @@ class KoreDB(private val directory: File) {
     }
 
     /**
+     * Returns all values whose keys fall within the range [startKey, endKey).
+     */
+    fun getRangeRaw(startKey: ByteArray, endKey: ByteArray): List<ByteArray> {
+        val iterators = PriorityQueue<KoreIterator>()
+
+        // 1. Initialize SSTable iterators
+        for (i in sstReaders.indices) {
+            val reader = sstReaders[i]
+            
+            // Fast path: skip segments that do not overlap with the range
+            // maxKey < startKey -> entirely before range
+            // minKey >= endKey -> entirely after range (endKey is exclusive)
+            if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, startKey) < 0) continue
+            if (reader.minKey != null && ByteArrayComparator.compare(reader.minKey!!, endKey) >= 0) continue
+
+            val offset = reader.findBlockStartOffset(startKey)
+            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = startKey, endKey = endKey)
+            if (it.currentKey != null) iterators.add(it)
+        }
+
+        // 2. Initialize MemTable iterator (highest priority)
+        val memIt = MemTableIterator(memTable.getTailEntries(startKey).iterator(), sstReaders.size, endKey)
+        if (memIt.currentKey != null) iterators.add(memIt)
+
+        val results = mutableListOf<ByteArray>()
+        var lastKey: ByteArray? = null
+
+        // 3. K-Way Merge Loop
+        while (iterators.isNotEmpty()) {
+            val top = iterators.poll()!!
+            val key = top.currentKey!!
+
+            // Check if we've already processed this key (from a newer segment)
+            if (lastKey == null || ByteArrayComparator.compare(key, lastKey) != 0) {
+                val value = top.value() ?: KoreDB.TOMBSTONE
+                if (value.isNotEmpty()) { // Skip tombstones
+                    results.add(value)
+                }
+                lastKey = key
+            }
+
+            if (top.advance()) {
+                iterators.add(top)
+            }
+        }
+
+        return results
+    }
+
+    /**
+     * Returns all key-value pairs whose keys fall within the range [startKey, endKey).
+     */
+    fun getRangeWithKeysRaw(startKey: ByteArray, endKey: ByteArray): List<Pair<ByteArray, ByteArray>> {
+        val iterators = PriorityQueue<KoreIterator>()
+
+        for (i in sstReaders.indices) {
+            val reader = sstReaders[i]
+            
+            if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, startKey) < 0) continue
+            if (reader.minKey != null && ByteArrayComparator.compare(reader.minKey!!, endKey) >= 0) continue
+
+            val offset = reader.findBlockStartOffset(startKey)
+            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = startKey, endKey = endKey)
+            if (it.currentKey != null) iterators.add(it)
+        }
+
+        val memIt = MemTableIterator(memTable.getTailEntries(startKey).iterator(), sstReaders.size, endKey)
+        if (memIt.currentKey != null) iterators.add(memIt)
+
+        val results = mutableListOf<Pair<ByteArray, ByteArray>>()
+        var lastKey: ByteArray? = null
+
+        while (iterators.isNotEmpty()) {
+            val top = iterators.poll()!!
+            val key = top.currentKey!!
+
+            if (lastKey == null || ByteArrayComparator.compare(key, lastKey) != 0) {
+                val value = top.value() ?: KoreDB.TOMBSTONE
+                if (value.isNotEmpty()) {
+                    results.add(Pair(key, value))
+                }
+                lastKey = key
+            }
+
+            if (top.advance()) {
+                iterators.add(top)
+            }
+        }
+
+        return results
+    }
+
+    /**
      * Returns all values whose keys match the specified prefix.
      */
     fun getByPrefixRaw(prefix: ByteArray): List<ByteArray> {
-        val resultMap = mutableMapOf<String, ByteArray>()
+        val endKey = prefix.copyOf()
+        var i = endKey.size - 1
+        var carry = true
+        while (i >= 0 && carry) {
+            val v = (endKey[i].toInt() and 0xFF) + 1
+            endKey[i] = v.toByte()
+            carry = v > 255
+            i--
+        }
+        
+        // If carry is true, it means prefix was something like [0xFF, 0xFF], 
+        // in which case endKey should be null (infinity).
+        val actualEndKey = if (carry) null else endKey
+        
+        val iterators = PriorityQueue<KoreIterator>()
 
-        // Scan disk segments.
-        for (reader in sstReaders) {
-            reader.scanByPrefix(prefix) { keyBytes, valueBytes ->
-                val keyStr = String(keyBytes, Charsets.UTF_8)
-                if (valueBytes.isEmpty()) resultMap.remove(keyStr)
-                else resultMap[keyStr] = valueBytes
+        // 1. Initialize SSTable iterators
+        for (i in sstReaders.indices) {
+            val reader = sstReaders[i]
+            
+            // Fast path: skip segments that do not overlap with the prefix
+            if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, prefix) < 0) continue
+            if (reader.minKey != null && actualEndKey != null && ByteArrayComparator.compare(reader.minKey!!, actualEndKey) >= 0) continue
+
+            // Prefix Bloom Filter fast rejection
+            if (!reader.mightContain(prefix)) continue
+
+            val offset = reader.findBlockStartOffset(prefix)
+            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = prefix, endKey = actualEndKey)
+            if (it.currentKey != null && it.currentKey!!.startsWith(prefix)) {
+                iterators.add(it)
             }
         }
 
-        // Scan the MemTable starting from the prefix.
-        for (entry in memTable.getTailEntries(prefix)) {
-            val keyBytes = entry.key
+        // 2. Initialize MemTable iterator
+        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), sstReaders.size, actualEndKey)
+        if (memIt.currentKey != null && memIt.currentKey!!.startsWith(prefix)) {
+            iterators.add(memIt)
+        }
 
-            var isMatch = keyBytes.size >= prefix.size
-            if (isMatch) {
-                for (i in prefix.indices) {
-                    if (keyBytes[i] != prefix[i]) { isMatch = false; break }
+        val results = mutableListOf<ByteArray>()
+        var lastKey: ByteArray? = null
+
+        while (iterators.isNotEmpty()) {
+            val top = iterators.poll()!!
+            val key = top.currentKey!!
+
+            if (!key.startsWith(prefix)) {
+                continue // Should be handled by endKey, but safety first
+            }
+
+            if (lastKey == null || ByteArrayComparator.compare(key, lastKey) != 0) {
+                val value = top.value() ?: KoreDB.TOMBSTONE
+                if (value.isNotEmpty()) {
+                    results.add(value)
                 }
+                lastKey = key
             }
 
-            // Alphabetical ordering allows early termination if the prefix is passed.
-            if (!isMatch) break
-
-            val keyStr = String(keyBytes, Charsets.UTF_8)
-            if (entry.value.isEmpty()) resultMap.remove(keyStr)
-            else resultMap[keyStr] = entry.value
+            if (top.advance() && top.currentKey!!.startsWith(prefix)) {
+                iterators.add(top)
+            }
         }
 
-        return resultMap.values.toList()
+        return results
+    }
+
+    /**
+     * Returns all key-value pairs whose keys match the specified prefix.
+     */
+    fun getByPrefixWithKeysRaw(prefix: ByteArray): List<Pair<ByteArray, ByteArray>> {
+        val endKey = prefix.copyOf()
+        var i = endKey.size - 1
+        var carry = true
+        while (i >= 0 && carry) {
+            val v = (endKey[i].toInt() and 0xFF) + 1
+            endKey[i] = v.toByte()
+            carry = v > 255
+            i--
+        }
+        val actualEndKey = if (carry) null else endKey
+
+        val iterators = PriorityQueue<KoreIterator>()
+
+        for (i in sstReaders.indices) {
+            val reader = sstReaders[i]
+            
+            if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, prefix) < 0) continue
+            if (reader.minKey != null && actualEndKey != null && ByteArrayComparator.compare(reader.minKey!!, actualEndKey) >= 0) continue
+
+            if (!reader.mightContain(prefix)) continue
+
+            val offset = reader.findBlockStartOffset(prefix)
+            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = prefix, endKey = actualEndKey)
+            if (it.currentKey != null && it.currentKey!!.startsWith(prefix)) {
+                iterators.add(it)
+            }
+        }
+
+        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), sstReaders.size, actualEndKey)
+        if (memIt.currentKey != null && memIt.currentKey!!.startsWith(prefix)) {
+            iterators.add(memIt)
+        }
+
+        val results = mutableListOf<Pair<ByteArray, ByteArray>>()
+        var lastKey: ByteArray? = null
+
+        while (iterators.isNotEmpty()) {
+            val top = iterators.poll()!!
+            val key = top.currentKey!!
+
+            if (!key.startsWith(prefix)) {
+                continue
+            }
+
+            if (lastKey == null || ByteArrayComparator.compare(key, lastKey) != 0) {
+                val value = top.value() ?: KoreDB.TOMBSTONE
+                if (value.isNotEmpty()) {
+                    results.add(Pair(key, value))
+                }
+                lastKey = key
+            }
+
+            if (top.advance() && top.currentKey!!.startsWith(prefix)) {
+                iterators.add(top)
+            }
+        }
+
+        return results
+    }
+
+    private fun ByteArray.startsWith(prefix: ByteArray): Boolean {
+        if (size < prefix.size) return false
+        for (i in prefix.indices) {
+            if (this[i] != prefix[i]) return false
+        }
+        return true
     }
 
     /**
      * Returns all keys that match the specified prefix.
      */
     fun getKeysByPrefixRaw(prefix: ByteArray): List<ByteArray> {
-        val resultMap = mutableMapOf<String, ByteArray>()
+        val endKey = prefix.copyOf()
+        var i = endKey.size - 1
+        var carry = true
+        while (i >= 0 && carry) {
+            val v = (endKey[i].toInt() and 0xFF) + 1
+            endKey[i] = v.toByte()
+            carry = v > 255
+            i--
+        }
+        val actualEndKey = if (carry) null else endKey
 
-        for (reader in sstReaders) {
-            reader.scanByPrefix(prefix) { keyBytes, valueBytes ->
-                val keyStr = String(keyBytes, Charsets.UTF_8)
-                if (valueBytes.isEmpty()) resultMap.remove(keyStr)
-                else resultMap[keyStr] = keyBytes
+        val iterators = PriorityQueue<KoreIterator>()
+
+        for (i in sstReaders.indices) {
+            val reader = sstReaders[i]
+            
+            // Fast path: skip segments that do not overlap with the prefix
+            if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, prefix) < 0) continue
+            if (reader.minKey != null && actualEndKey != null && ByteArrayComparator.compare(reader.minKey!!, actualEndKey) >= 0) continue
+
+            // Prefix Bloom Filter fast rejection
+            if (!reader.mightContain(prefix)) continue
+
+            val offset = reader.findBlockStartOffset(prefix)
+            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = prefix, endKey = actualEndKey)
+            if (it.currentKey != null && it.currentKey!!.startsWith(prefix)) {
+                iterators.add(it)
             }
         }
 
-        for (entry in memTable.getTailEntries(prefix)) {
-            val keyBytes = entry.key
+        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), sstReaders.size, actualEndKey)
+        if (memIt.currentKey != null && memIt.currentKey!!.startsWith(prefix)) {
+            iterators.add(memIt)
+        }
 
-            var isMatch = keyBytes.size >= prefix.size
-            if (isMatch) {
-                for (i in prefix.indices) {
-                    if (keyBytes[i] != prefix[i]) { isMatch = false; break }
+        val results = mutableListOf<ByteArray>()
+        var lastKey: ByteArray? = null
+
+        while (iterators.isNotEmpty()) {
+            val top = iterators.poll()!!
+            val key = top.currentKey!!
+
+            if (!key.startsWith(prefix)) continue
+
+            if (lastKey == null || ByteArrayComparator.compare(key, lastKey) != 0) {
+                val value = top.value() ?: KoreDB.TOMBSTONE
+                if (value.isNotEmpty()) {
+                    results.add(key)
                 }
+                lastKey = key
             }
 
-            if (!isMatch) break
-
-            val keyStr = String(keyBytes, Charsets.UTF_8)
-            if (entry.value.isEmpty()) resultMap.remove(keyStr)
-            else resultMap[keyStr] = keyBytes
+            if (top.advance() && top.currentKey!!.startsWith(prefix)) {
+                iterators.add(top)
+            }
         }
 
-        return resultMap.values.toList()
+        return results
     }
 
     /**

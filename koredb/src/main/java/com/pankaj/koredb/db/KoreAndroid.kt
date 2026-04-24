@@ -41,4 +41,14 @@ object KoreAndroid {
         val dbDirectory = File(context.filesDir, dbName)
         return KoreDatabase(dbDirectory)
     }
+
+    /**
+     * Completely deletes a KoreDB database from disk.
+     */
+    fun delete(context: Context, dbName: String = "kore_default.db") {
+        val dbDirectory = File(context.filesDir, dbName)
+        if (dbDirectory.exists()) {
+            dbDirectory.deleteRecursively()
+        }
+    }
 }

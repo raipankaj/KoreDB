@@ -20,78 +20,115 @@ import java.nio.ByteBuffer
 
 /**
  * An iterator for traversing the key-value pairs within a single SSTable.
- *
- * This iterator uses a snapshot of the SSTable's memory-mapped buffer to provide
- * thread-safe access. It is designed to be used with a [java.util.PriorityQueue]
- * for multi-way merging during compaction or range scans.
- *
- * @property fileIndex The sequence index of the SSTable file, used to determine
- *                     precedence when keys are identical (newer files win).
  */
 class SSTableIterator(
-    reader: SSTableReader,
-    val fileIndex: Int
-) : Comparable<SSTableIterator> {
+    private val reader: SSTableReader,
+    override val priority: Int,
+    startOffset: Int = 0,
+    private var startKey: ByteArray? = null,
+    private val endKey: ByteArray? = null
+) : KoreIterator {
 
     private val buffer: ByteBuffer = reader.getBufferSnapshot()
     private val dataEndOffset = reader.dataEndOffset
 
-    /**
-     * The key at the current iterator position.
-     */
-    var currentKey: ByteArray? = null
+    override var currentKey: ByteArray? = null
         private set
 
-    /**
-     * The value at the current iterator position.
-     */
-    var currentValue: ByteArray? = null
-        private set
+    // Store metadata for lazy and sequential value loading
+    private var valueOffset: Int = -1
+    private var valueSize: Int = -1
+    private var valueRead: Boolean = false
 
     init {
+        buffer.position(startOffset)
         advance()
+    }
+
+    override fun value(): ByteArray? {
+        if (valueOffset == -1) return null
+        if (valueSize == 0) return EMPTY_BYTE_ARRAY
+
+        // Check Block Cache to avoid disk IO and JNI crossing
+        val cachedValue = reader.blockCache.get(valueOffset)
+        if (cachedValue != null) {
+            valueRead = false // Keep buffer position unchanged since we didn't use it
+            return cachedValue
+        }
+
+        // Optimization: If we are already at the valueOffset, this is a sequential read.
+        // If not (e.g., value() called multiple times or out of order), we must jump.
+        val currentPos = buffer.position()
+        if (currentPos != valueOffset) {
+            buffer.position(valueOffset)
+        }
+
+        val valueBytes = ByteArray(valueSize)
+        buffer.get(valueBytes)
+        valueRead = true
+        
+        // Cache the result for future repeated queries
+        reader.blockCache.put(valueOffset, valueBytes)
+        
+        // No need to restore position if we are doing a range scan, 
+        // as advance() will handle the skip if valueRead is false.
+        return valueBytes
     }
 
     /**
      * Advances the iterator to the next key-value pair.
-     *
-     * @return true if a record was successfully read, false if the end of the data section is reached.
      */
-    fun advance(): Boolean {
-        if (buffer.position() >= dataEndOffset) {
-            currentKey = null
-            currentValue = null
-            return false
+    override fun advance(): Boolean {
+        // If the previous value was NOT read, we must skip it now to maintain position.
+        if (valueOffset != -1 && !valueRead) {
+            buffer.position(valueOffset + valueSize)
         }
 
-        val keySize = buffer.getInt()
-        val valueSize = buffer.getInt()
+        while (buffer.position() < dataEndOffset) {
+            val keyOffset = buffer.position()
+            val keySize = buffer.getInt()
+            val vSize = buffer.getInt()
 
-        val keyBytes = ByteArray(keySize)
-        buffer.get(keyBytes)
+            // 1. Skip keys before startKey (optimized with zero-allocation comparison)
+            if (startKey != null) {
+                val cmp = reader.compareBufferWithKey(buffer, keyOffset + 8, keySize, startKey!!)
+                if (cmp < 0) {
+                    buffer.position(keyOffset + 8 + keySize + vSize) // Skip key and value bytes
+                    continue
+                }
+                // Target range reached
+                startKey = null
+            }
 
-        val valueBytes = ByteArray(valueSize)
-        buffer.get(valueBytes)
+            // 2. Early termination if we've passed the endKey
+            // endKey is exclusive, so if currentKey >= endKey, we terminate.
+            if (endKey != null) {
+                val cmp = reader.compareBufferWithKey(buffer, keyOffset + 8, keySize, endKey)
+                if (cmp >= 0) {
+                    break
+                }
+            }
 
-        currentKey = keyBytes
-        currentValue = valueBytes
-        return true
+            // Valid key found. Now allocate it so it can be used in the PriorityQueue.
+            val keyBytes = ByteArray(keySize)
+            buffer.get(keyBytes)
+
+            currentKey = keyBytes
+            valueOffset = buffer.position()
+            valueSize = vSize
+            valueRead = false // Value is now pending
+            return true
+        }
+
+        currentKey = null
+        valueOffset = -1
+        valueSize = -1
+        valueRead = false
+        buffer.position(dataEndOffset.toInt()) 
+        return false
     }
 
-    /**
-     * Compares this iterator with another based on the [currentKey].
-     *
-     * Sorting logic:
-     * 1. Smallest key first (lexicographical).
-     * 2. If keys are equal, the newest file (highest [fileIndex]) comes first.
-     */
-    override fun compareTo(other: SSTableIterator): Int {
-        val myKey = currentKey ?: return 1
-        val otherKey = other.currentKey ?: return -1
-
-        val cmp = ByteArrayComparator.compare(myKey, otherKey)
-        if (cmp != 0) return cmp
-
-        return other.fileIndex.compareTo(this.fileIndex)
+    companion object {
+        private val EMPTY_BYTE_ARRAY = ByteArray(0)
     }
 }

@@ -10,6 +10,9 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE id = :id")
     suspend fun getById(id: String): Note?
 
+    @Query("SELECT * FROM notes WHERE id >= :startId AND id < :endId")
+    suspend fun getByIdRange(startId: String, endId: String): List<Note>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(note: Note)
 

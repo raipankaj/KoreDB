@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onStart
+import java.util.LinkedHashMap
 
 /**
  * Manages a collection of documents of type [T].
@@ -40,6 +41,14 @@ class KoreCollection<T>(
 ) {
     private val updates = MutableSharedFlow<String>(extraBufferCapacity = 100)
     private val indexExtractors = mutableMapOf<String, (T) -> String>()
+
+    // Object Cache to bypass JSON deserialization for frequent queries
+    // Size increased to 65536 to handle large prefix/range bulk reads smoothly without thrashing
+    private val documentCache = object : LinkedHashMap<String, T>(8192, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, T>): Boolean {
+            return size > 65536
+        }
+    }
 
     /**
      * Registers a secondary index for the collection.
@@ -75,6 +84,9 @@ class KoreCollection<T>(
         }
 
         db.writeBatchRaw(batch)
+        synchronized(documentCache) {
+            documentCache[id] = document
+        }
         updates.tryEmit(id)
     }
 
@@ -85,6 +97,9 @@ class KoreCollection<T>(
      */
     suspend fun delete(id: String) {
         db.deleteRaw(makeDocKey(id))
+        synchronized(documentCache) {
+            documentCache.remove(id)
+        }
         updates.tryEmit(id)
     }
 
@@ -95,8 +110,19 @@ class KoreCollection<T>(
      * @return The deserialized document, or null if not found.
      */
     fun getById(id: String): T? {
+        synchronized(documentCache) {
+            val cached = documentCache[id]
+            if (cached != null) return cached
+        }
+
         val resultBytes = db.getRaw(makeDocKey(id)) ?: return null
-        return serializer.deserialize(resultBytes)
+        val doc = serializer.deserialize(resultBytes)
+
+        synchronized(documentCache) {
+            documentCache[id] = doc
+        }
+
+        return doc
     }
 
     /**
@@ -117,6 +143,36 @@ class KoreCollection<T>(
     }
 
     /**
+     * Retrieves all documents whose ID falls within the range [startId, endId).
+     *
+     * This performs an efficient range scan using the underlying LSM-tree
+     * sparse index and early termination.
+     */
+    fun getByIdRange(startId: String, endId: String): List<T> {
+        val startKey = makeDocKey(startId)
+        val endKey = makeDocKey(endId)
+
+        val rawResults = db.getRangeWithKeysRaw(startKey, endKey)
+
+        return rawResults.map { (keyBytes, valueBytes) ->
+            val id = String(keyBytes, Charsets.UTF_8).removePrefix("doc:$name:")
+            
+            var doc: T? = null
+            synchronized(documentCache) {
+                doc = documentCache[id]
+            }
+
+            if (doc == null) {
+                doc = serializer.deserialize(valueBytes)
+                synchronized(documentCache) {
+                    documentCache[id] = doc!!
+                }
+            }
+            doc!!
+        }
+    }
+
+    /**
      * Retrieves all documents whose ID starts with the given prefix.
      *
      * This performs an efficient prefix range scan using the underlying
@@ -126,9 +182,24 @@ class KoreCollection<T>(
         val prefixBytes = "doc:$name:$idPrefix"
             .toByteArray(Charsets.UTF_8)
 
-        val rawResults = db.getByPrefixRaw(prefixBytes)
+        val rawResults = db.getByPrefixWithKeysRaw(prefixBytes)
 
-        return rawResults.map { serializer.deserialize(it) }
+        return rawResults.map { (keyBytes, valueBytes) ->
+            val id = String(keyBytes, Charsets.UTF_8).removePrefix("doc:$name:")
+            
+            var doc: T? = null
+            synchronized(documentCache) {
+                doc = documentCache[id]
+            }
+
+            if (doc == null) {
+                doc = serializer.deserialize(valueBytes)
+                synchronized(documentCache) {
+                    documentCache[id] = doc!!
+                }
+            }
+            doc!!
+        }
     }
 
     /**
@@ -168,8 +239,23 @@ class KoreCollection<T>(
      */
     fun getAll(): List<T> {
         val prefix = "doc:$name:".toByteArray(Charsets.UTF_8)
-        val rawResults = db.getByPrefixRaw(prefix)
-        return rawResults.map { serializer.deserialize(it) }
+        val rawResults = db.getByPrefixWithKeysRaw(prefix)
+        return rawResults.map { (keyBytes, valueBytes) ->
+            val id = String(keyBytes, Charsets.UTF_8).removePrefix("doc:$name:")
+            
+            var doc: T? = null
+            synchronized(documentCache) {
+                doc = documentCache[id]
+            }
+
+            if (doc == null) {
+                doc = serializer.deserialize(valueBytes)
+                synchronized(documentCache) {
+                    documentCache[id] = doc!!
+                }
+            }
+            doc!!
+        }
     }
 
     /**
@@ -207,6 +293,11 @@ class KoreCollection<T>(
         }
 
         db.writeBatchRaw(totalBatch)
+        synchronized(documentCache) {
+            documents.forEach { (id, document) ->
+                documentCache[id] = document
+            }
+        }
         updates.tryEmit("*")
     }
 
@@ -224,6 +315,9 @@ class KoreCollection<T>(
         }
 
         db.writeBatchRaw(batch)
+        synchronized(documentCache) {
+            documentCache.clear()
+        }
         updates.tryEmit("*")
     }
 }

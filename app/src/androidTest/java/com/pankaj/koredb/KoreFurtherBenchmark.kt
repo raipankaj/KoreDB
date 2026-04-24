@@ -579,8 +579,7 @@ class KoreFurtherBenchmark {
         val VECTOR_COUNT = 1000
         val DIM = 128
 
-        app.deleteDatabase(dbName)
-        app.getDatabasePath(dbName).parentFile?.resolve("kore.wal")?.delete()
+        KoreAndroid.delete(app, dbName)
 
         // 1. Initial Setup & Insert
         val db = KoreAndroid.create(app, dbName)
@@ -622,8 +621,7 @@ class KoreFurtherBenchmark {
         val VECTOR_COUNT = 10_000
         val DIM = 384
 
-        app.deleteDatabase(dbName)
-        app.getDatabasePath(dbName).parentFile?.resolve("kore.wal")?.delete()
+        KoreAndroid.delete(app, dbName)
 
         // 1. Setup Phase
         val db = KoreAndroid.create(app, dbName)

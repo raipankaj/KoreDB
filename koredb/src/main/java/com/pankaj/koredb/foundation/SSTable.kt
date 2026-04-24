@@ -83,6 +83,15 @@ class SSTable {
                 val value = entry.value
 
                 bloomFilter.add(key)
+                
+                // Prefix Bloom Filter: add structural prefixes (e.g., delimited by ':')
+                var prefixEnd = 0
+                while (prefixEnd < key.size) {
+                    if (key[prefixEnd] == ':'.code.toByte()) {
+                        bloomFilter.add(key.copyOfRange(0, prefixEnd + 1))
+                    }
+                    prefixEnd++
+                }
 
                 val recordSize = 8 + key.size + value.size
                 val buffer = ByteBuffer.allocate(recordSize).order(java.nio.ByteOrder.LITTLE_ENDIAN)
