@@ -53,9 +53,24 @@ class GraphQuery(private val storage: GraphStorage) {
      */
     fun startingWith(label: String, propertyKey: String, propertyValue: String): GraphQuery {
         val prefix = "g:idx:v_prop:$label:$propertyKey:$propertyValue:".toByteArray(Charsets.UTF_8)
-        currentIds = storage.db.getKeysByPrefixRaw(prefix)
-            .map { String(it, Charsets.UTF_8).substringAfterLast(":") }
-            .toSet()
+        val indexKeys = storage.db.getKeysByPrefixRaw(prefix)
+
+        currentIds = indexKeys.mapNotNull { keyBytes ->
+            val nodeId = String(keyBytes, Charsets.UTF_8).substringAfterLast(":")
+
+            // Validation using Reverse Pointer (Truth Oracle)
+            // This ensures starting nodes are fresh even before traversal begins.
+            val rptrKey = "g:rptr:v_prop:$label:$propertyKey:$nodeId".toByteArray(Charsets.UTF_8)
+            val currentValueBytes = storage.db.getRaw(rptrKey)
+
+            if (currentValueBytes != null) {
+                val currentValue = String(currentValueBytes, Charsets.UTF_8)
+                if (currentValue == propertyValue) {
+                    nodeId
+                } else null
+            } else null
+        }.toSet()
+
         return this
     }
 
@@ -132,12 +147,98 @@ class GraphQuery(private val storage: GraphStorage) {
     }
 
     /**
+     * Filters nodes that have a specific property key-value pair.
+     * Uses the property index for O(log N) lookup when possible.
+     */
+    fun hasProperty(key: String, value: String): GraphQuery {
+        currentIds = currentIds.filter { id ->
+            val node = storage.getNode(id)
+            node != null && node.properties[key] == value
+        }.toSet()
+        return this
+    }
+
+    /**
+     * Variable-length outbound traversal with cycle detection.
+     * Collects all reachable nodes between [minHops] and [maxHops] away.
+     *
+     * ```kotlin
+     * graph.query {
+     *     startingWith("alice")
+     *     outboundRange("KNOWS", minHops = 2, maxHops = 5)
+     * }.toNodeList()
+     * ```
+     */
+    fun outboundRange(edgeType: String, minHops: Int = 1, maxHops: Int = 5): GraphQuery {
+        require(minHops >= 0 && maxHops >= minHops)
+        val startIds = currentIds.toSet()
+        val result = mutableSetOf<String>()
+        val visited = mutableSetOf<String>()
+        visited.addAll(startIds)
+
+        var frontier = startIds
+        for (hop in 1..maxHops) {
+            val nextFrontier = mutableSetOf<String>()
+            for (id in frontier) {
+                for (targetId in storage.getOutboundTargetIds(id, edgeType)) {
+                    if (visited.add(targetId)) {
+                        nextFrontier.add(targetId)
+                        if (hop >= minHops) result.add(targetId)
+                    }
+                }
+            }
+            frontier = nextFrontier
+            if (frontier.isEmpty()) break
+        }
+
+        currentIds = result
+        return this
+    }
+
+    /**
+     * Variable-length inbound traversal with cycle detection.
+     */
+    fun inboundRange(edgeType: String, minHops: Int = 1, maxHops: Int = 5): GraphQuery {
+        require(minHops >= 0 && maxHops >= minHops)
+        val startIds = currentIds.toSet()
+        val result = mutableSetOf<String>()
+        val visited = mutableSetOf<String>()
+        visited.addAll(startIds)
+
+        var frontier = startIds
+        for (hop in 1..maxHops) {
+            val nextFrontier = mutableSetOf<String>()
+            for (id in frontier) {
+                for (sourceId in storage.getInboundSourceIds(id, edgeType)) {
+                    if (visited.add(sourceId)) {
+                        nextFrontier.add(sourceId)
+                        if (hop >= minHops) result.add(sourceId)
+                    }
+                }
+            }
+            frontier = nextFrontier
+            if (frontier.isEmpty()) break
+        }
+
+        currentIds = result
+        return this
+    }
+
+    /**
+     * Limits the result set to at most [n] node IDs.
+     */
+    fun limit(n: Int): GraphQuery {
+        currentIds = currentIds.take(n).toSet()
+        return this
+    }
+
+    /**
+     * Terminal Operation: Returns the count of matching nodes without materializing them.
+     */
+    fun count(): Int = currentIds.size
+
+    /**
      * Terminal Operation: Resolves the tracked IDs into full [Node] objects.
-     *
-     * This is typically the only stage where JSON deserialization occurs for 
-     * the result set.
-     *
-     * @return A list of [Node] objects corresponding to the final state of the traversal.
      */
     fun toNodeList(): List<Node> {
         return currentIds.mapNotNull { storage.getNode(it) }
@@ -145,11 +246,6 @@ class GraphQuery(private val storage: GraphStorage) {
 
     /**
      * Terminal Operation: Returns the raw Node IDs as strings.
-     *
-     * This is the highest-performance terminal operation, as it avoids all 
-     * node object construction and property parsing.
-     *
-     * @return A list of Node identifiers.
      */
     fun toIdList(): List<String> {
         return currentIds.toList()

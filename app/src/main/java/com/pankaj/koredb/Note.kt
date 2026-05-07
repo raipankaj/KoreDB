@@ -7,7 +7,7 @@ import kotlinx.serialization.Serializable
 
 @SuppressLint("UnsafeOptInUsageError")
 @Serializable
-@Entity(tableName = "notes")
+@Entity(tableName = "notes", indices = [androidx.room.Index(value = ["title"])])
 data class Note(
     @PrimaryKey
     val id: String,

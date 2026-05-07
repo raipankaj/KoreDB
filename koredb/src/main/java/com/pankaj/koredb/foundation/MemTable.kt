@@ -54,6 +54,28 @@ class MemTable {
     }
 
     /**
+     * High-throughput bulk insertion of multiple key-value pairs.
+     *
+     * This method is significantly faster than calling [put] in a loop because:
+     * - Size tracking is accumulated locally and applied in a single atomic update.
+     * - Reduces the overhead of individual [AtomicInteger.addAndGet] calls.
+     *
+     * @param entries The list of key-value pairs to insert.
+     */
+    fun putAll(entries: List<Pair<ByteArray, ByteArray>>) {
+        var totalDelta = 0
+        for (i in entries.indices) {
+            val entry = entries[i]
+            val previousValue = table.put(entry.first, entry.second)
+            totalDelta += entry.first.size + entry.second.size
+            if (previousValue != null) {
+                totalDelta -= previousValue.size
+            }
+        }
+        currentSizeBytes.addAndGet(totalDelta)
+    }
+
+    /**
      * Retrieves the value associated with the given key.
      *
      * @param key The key to look up.

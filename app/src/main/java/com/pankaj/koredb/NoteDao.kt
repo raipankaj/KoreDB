@@ -46,6 +46,21 @@ interface NoteDao {
     """)
     suspend fun getTwoHopNodes(startId: String, rel: String): List<String>
 
+    @Query("SELECT * FROM notes WHERE title = :title")
+    suspend fun getByTitle(title: String): List<Note>
+
     @Query("DELETE FROM edges")
     suspend fun clearEdges()
+
+    @Update
+    suspend fun update(note: Note)
+
+    @Query("SELECT COUNT(*) FROM notes")
+    suspend fun count(): Int
+
+    @Query("SELECT * FROM notes WHERE isPinned = :pinned")
+    suspend fun getByPinned(pinned: Boolean): List<Note>
+
+    @Query("SELECT COUNT(*) FROM notes WHERE title = :title")
+    suspend fun countByTitle(title: String): Int
 }

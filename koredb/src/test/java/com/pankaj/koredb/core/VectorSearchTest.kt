@@ -78,6 +78,9 @@ class VectorSearchTest {
         vectors.insert("C", C)
         vectors.insert("D", D)
 
+        // Wait for background HNSW indexing to complete
+        vectors.waitForIndexing()
+
         val results = vectors.search(A, limit = 4)
 
         // Validate top 2 are A and C (identical vectors, score 1.0)

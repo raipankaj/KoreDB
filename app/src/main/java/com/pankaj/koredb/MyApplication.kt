@@ -21,7 +21,7 @@ class MyApplication: Application() {
         roomDatabase = Room.databaseBuilder(
             applicationContext,
             AppDatabase::class.java, "room_notes_db"
-        ).build()
+        ).fallbackToDestructiveMigration().build()
     }
 
     override fun onTerminate() {

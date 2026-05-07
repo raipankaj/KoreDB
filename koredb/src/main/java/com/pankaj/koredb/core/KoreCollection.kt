@@ -17,6 +17,7 @@
 package com.pankaj.koredb.core
 
 import com.pankaj.koredb.engine.KoreDB
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
@@ -60,8 +61,28 @@ class KoreCollection<T>(
         indexExtractors[indexName] = extractor
     }
 
-    private fun makeDocKey(id: String) = "doc:$name:$id".toByteArray(Charsets.UTF_8)
-    private fun makeIndexKey(idxName: String, idxValue: String) = "idx:$name:$idxName:$idxValue".toByteArray(Charsets.UTF_8)
+    private val docPrefix = "doc:$name:".toByteArray(Charsets.UTF_8)
+    private val idxPrefix = "idx:$name:".toByteArray(Charsets.UTF_8)
+    private val rptrPrefix = "rptr:$name:".toByteArray(Charsets.UTF_8)
+
+    // Cache for index name bytes to avoid repeated UTF-8 encoding
+    private val indexNameCache = mutableMapOf<String, ByteArray>()
+
+    private fun getIndexNameBytes(name: String): ByteArray {
+        return indexNameCache.getOrPut(name) { name.toByteArray(Charsets.UTF_8) }
+    }
+
+    private fun makeDocKey(idBytes: ByteArray): ByteArray {
+        val result = ByteArray(docPrefix.size + idBytes.size)
+        System.arraycopy(docPrefix, 0, result, 0, docPrefix.size)
+        System.arraycopy(idBytes, 0, result, docPrefix.size, idBytes.size)
+        return result
+    }
+
+    /**
+     * A non-empty byte array used to indicate entry existence in secondary indices.
+     */
+    private val PRESENCE_MARKER = ByteArray(1) { 1 }
 
     /**
      * Inserts or updates a document.
@@ -69,18 +90,26 @@ class KoreCollection<T>(
      * @param id Unique identifier for the document.
      * @param document The document to store.
      */
-    suspend fun insert(id: String, document: T) {
-        val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
+    suspend fun insert(id: String, document: T) = coroutineScope {
+        val idBytes = id.toByteArray(Charsets.UTF_8)
+        val docBytes = serializer.serialize(document)
+        val docKey = makeDocKey(idBytes)
 
-        batch.add(Pair(makeDocKey(id), serializer.serialize(document)))
+        val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
+        batch.add(docKey to docBytes)
 
         indexExtractors.forEach { (idxName, extractor) ->
-            val extractedValue = extractor(document)
-            val idxKey = makeIndexKey(idxName, extractedValue)
+            val value = extractor(document)
+            val valBytes = value.toByteArray(Charsets.UTF_8)
+            val idxNameBytes = getIndexNameBytes(idxName)
 
-            val existingIds = db.getRaw(idxKey)?.let { String(it, Charsets.UTF_8) } ?: ""
-            val newList = if (existingIds.isEmpty()) id else "$existingIds,$id"
-            batch.add(Pair(idxKey, newList.toByteArray(Charsets.UTF_8)))
+            // sidx: idx:$name:$idxName:$idxValue:$id
+            val idxKey = buildKey(idxPrefix, idxNameBytes, valBytes, idBytes)
+            // rptr: rptr:$name:$idxName:$id
+            val rptrKey = buildKey(rptrPrefix, idxNameBytes, idBytes)
+
+            batch.add(idxKey to PRESENCE_MARKER)
+            batch.add(rptrKey to valBytes)
         }
 
         db.writeBatchRaw(batch)
@@ -90,13 +119,32 @@ class KoreCollection<T>(
         updates.tryEmit(id)
     }
 
+    private fun buildKey(prefix: ByteArray, vararg parts: ByteArray): ByteArray {
+        var partsSize = 0
+        for (part in parts) partsSize += part.size
+        val totalSize = prefix.size + partsSize + parts.size
+
+        val result = ByteArray(totalSize)
+        System.arraycopy(prefix, 0, result, 0, prefix.size)
+        var pos = prefix.size
+        for (part in parts) {
+            System.arraycopy(part, 0, result, pos, part.size)
+            pos += part.size
+            if (pos < totalSize) {
+                result[pos] = ':'.code.toByte()
+                pos++
+            }
+        }
+        return result
+    }
+
     /**
      * Deletes a document by its ID.
      *
      * @param id The ID of the document to delete.
      */
     suspend fun delete(id: String) {
-        db.deleteRaw(makeDocKey(id))
+        db.deleteRaw(makeDocKey(id.toByteArray(Charsets.UTF_8)))
         synchronized(documentCache) {
             documentCache.remove(id)
         }
@@ -115,7 +163,7 @@ class KoreCollection<T>(
             if (cached != null) return cached
         }
 
-        val resultBytes = db.getRaw(makeDocKey(id)) ?: return null
+        val resultBytes = db.getRaw(makeDocKey(id.toByteArray(Charsets.UTF_8))) ?: return null
         val doc = serializer.deserialize(resultBytes)
 
         synchronized(documentCache) {
@@ -130,15 +178,11 @@ class KoreCollection<T>(
      * Avoids deserialization cost.
      */
     fun getIdsByPrefix(idPrefix: String): List<String> {
-        val prefixBytes = "doc:$name:$idPrefix"
-            .toByteArray(Charsets.UTF_8)
-
+        val prefixBytes = makeDocKey(idPrefix.toByteArray(Charsets.UTF_8))
         val keys = db.getKeysByPrefixRaw(prefixBytes)
 
         return keys.map { keyBytes ->
-            val fullKey = String(keyBytes, Charsets.UTF_8)
-            // Use removePrefix to correctly extract the ID even if it contains colons
-            fullKey.removePrefix("doc:$name:")
+            String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
         }
     }
 
@@ -149,13 +193,13 @@ class KoreCollection<T>(
      * sparse index and early termination.
      */
     fun getByIdRange(startId: String, endId: String): List<T> {
-        val startKey = makeDocKey(startId)
-        val endKey = makeDocKey(endId)
+        val startKey = makeDocKey(startId.toByteArray(Charsets.UTF_8))
+        val endKey = makeDocKey(endId.toByteArray(Charsets.UTF_8))
 
         val rawResults = db.getRangeWithKeysRaw(startKey, endKey)
 
         return rawResults.map { (keyBytes, valueBytes) ->
-            val id = String(keyBytes, Charsets.UTF_8).removePrefix("doc:$name:")
+            val id = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
             
             var doc: T? = null
             synchronized(documentCache) {
@@ -179,13 +223,11 @@ class KoreCollection<T>(
      * LSM-tree sparse index and early termination.
      */
     fun getByIdPrefix(idPrefix: String): List<T> {
-        val prefixBytes = "doc:$name:$idPrefix"
-            .toByteArray(Charsets.UTF_8)
-
+        val prefixBytes = makeDocKey(idPrefix.toByteArray(Charsets.UTF_8))
         val rawResults = db.getByPrefixWithKeysRaw(prefixBytes)
 
         return rawResults.map { (keyBytes, valueBytes) ->
-            val id = String(keyBytes, Charsets.UTF_8).removePrefix("doc:$name:")
+            val id = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
             
             var doc: T? = null
             synchronized(documentCache) {
@@ -204,16 +246,39 @@ class KoreCollection<T>(
 
     /**
      * Retrieves all documents matching a specific index value.
+     * 
+     * Uses the "Reverse Pointer" strategy to filter out stale index entries 
+     * without reading full documents, keeping performance high even with 
+     * frequent updates.
      *
      * @param indexName The name of the index to query.
      * @param value The value to look for in the index.
      * @return A list of matching documents.
      */
     fun getByIndex(indexName: String, value: String): List<T> {
-        val idxKey = makeIndexKey(indexName, value)
-        val idsCsv = db.getRaw(idxKey)?.let { String(it, Charsets.UTF_8) } ?: return emptyList()
+        val idxNameBytes = getIndexNameBytes(indexName)
+        val valBytes = value.toByteArray(Charsets.UTF_8)
+        val prefix = buildKey(idxPrefix, idxNameBytes, valBytes)
+        
+        val indexKeys = db.getKeysByPrefixRaw(prefix)
 
-        return idsCsv.split(",").mapNotNull { getById(it) }
+        return indexKeys.mapNotNull { keyBytes ->
+            val id = String(keyBytes, prefix.size + 1, keyBytes.size - (prefix.size + 1), Charsets.UTF_8)
+
+            val rptrKey = buildKey(rptrPrefix, idxNameBytes, id.toByteArray(Charsets.UTF_8))
+            val currentValueBytes = db.getRaw(rptrKey)
+            
+            // If no rptr exists, the entry has never been updated → index is fresh & valid.
+            // If rptr exists but points to a different value, the entry is stale → skip.
+            if (currentValueBytes != null) {
+                val currentValue = String(currentValueBytes, Charsets.UTF_8)
+                if (currentValue != value) {
+                    return@mapNotNull null // Stale entry
+                }
+            }
+            
+            getById(id)
+        }
     }
 
     /**
@@ -238,10 +303,9 @@ class KoreCollection<T>(
      * @return A list of all documents.
      */
     fun getAll(): List<T> {
-        val prefix = "doc:$name:".toByteArray(Charsets.UTF_8)
-        val rawResults = db.getByPrefixWithKeysRaw(prefix)
+        val rawResults = db.getByPrefixWithKeysRaw(docPrefix)
         return rawResults.map { (keyBytes, valueBytes) ->
-            val id = String(keyBytes, Charsets.UTF_8).removePrefix("doc:$name:")
+            val id = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
             
             var doc: T? = null
             synchronized(documentCache) {
@@ -273,40 +337,117 @@ class KoreCollection<T>(
 
     /**
      * Performs a batch insert of multiple documents.
+     * 
+     * Architecture:
+     * 1. Serialization is parallelized across CPU cores using chunked async.
+     * 2. All serialized KV pairs are combined into a single flat list.
+     * 3. A single [KoreDB.writeBatchRaw] call writes everything atomically,
+     *    minimizing mutex acquisitions, WAL headers, and MemTable operations.
+     *
+     * For very large batches (>50K KV pairs), falls back to chunked writes
+     * to avoid excessive memory pressure.
      *
      * @param documents A map of IDs to documents.
      */
-    suspend fun insertBatch(documents: Map<String, T>) {
-        val totalBatch = mutableListOf<Pair<ByteArray, ByteArray>>()
-
-        documents.forEach { (id, document) ->
-            totalBatch.add(Pair(makeDocKey(id), serializer.serialize(document)))
-
-            indexExtractors.forEach { (idxName, extractor) ->
-                val extractedValue = extractor(document)
-                val idxKey = makeIndexKey(idxName, extractedValue)
-
-                val existingIds = db.getRaw(idxKey)?.let { String(it, Charsets.UTF_8) } ?: ""
-                val newList = if (existingIds.isEmpty()) id else "$existingIds,$id"
-                totalBatch.add(Pair(idxKey, newList.toByteArray(Charsets.UTF_8)))
+    suspend fun insertBatch(documents: Map<String, T>) = coroutineScope {
+        // Snapshot existing IDs to determine fresh vs update inserts.
+        // Fresh inserts skip rptr writes (33% fewer KV pairs).
+        val existingIds: Set<String> = synchronized(documentCache) {
+            documentCache.keys.toHashSet()
+        }
+        
+        val entriesPerDoc = 1 + indexExtractors.size * 2
+        val totalKvPairs = documents.size * entriesPerDoc
+        
+        if (totalKvPairs <= SINGLE_WRITE_THRESHOLD) {
+            // 🚀 FAST PATH: Parallel serialize → single atomic write
+            val chunks = documents.entries.chunked(5000)
+            
+            val serializedChunks = chunks.map { chunk ->
+                async(Dispatchers.Default) { serializeChunk(chunk, existingIds) }
+            }.awaitAll()
+            
+            // Combine into a single flat list for one writeBatchRaw call
+            val combined = ArrayList<Pair<ByteArray, ByteArray>>(totalKvPairs)
+            for (chunk in serializedChunks) {
+                combined.addAll(chunk)
+            }
+            
+            db.writeBatchRaw(combined)
+        } else {
+            // LARGE BATCH PATH: Chunked writes to bound memory usage
+            val chunks = documents.entries.chunked(5000)
+            for (chunk in chunks) {
+                val batch = serializeChunk(chunk, existingIds)
+                db.writeBatchRaw(batch)
             }
         }
 
-        db.writeBatchRaw(totalBatch)
+        // Update Cache & Notify
         synchronized(documentCache) {
-            documents.forEach { (id, document) ->
-                documentCache[id] = document
+            for (entry in documents) {
+                documentCache[entry.key] = entry.value
             }
         }
         updates.tryEmit("*")
+    }
+    
+    companion object {
+        /**
+         * Maximum number of KV pairs to write in a single writeBatchRaw call.
+         * Beyond this, we chunk writes to avoid excessive memory pressure.
+         * 50K pairs ≈ 5MB of data, well within the 16MB MemTable threshold.
+         */
+        private const val SINGLE_WRITE_THRESHOLD = 50_000
+    }
+
+    /**
+     * Serializes a chunk of document entries into raw key-value pairs for storage.
+     *
+     * Optimizations:
+     * - For fresh inserts (document not in [existingIds]), the reverse pointer
+     *   (rptr) is skipped. The rptr is only needed when updating, to invalidate
+     *   the previous index entry. Fresh entries have no prior index to invalidate.
+     * - This reduces KV pairs from 3 to 2 per new document (33% fewer entries).
+     *
+     * @param chunk The document entries to serialize.
+     * @param existingIds IDs of documents already in the collection (need rptr on update).
+     */
+    private fun serializeChunk(
+        chunk: List<Map.Entry<String, T>>,
+        existingIds: Set<String>
+    ): ArrayList<Pair<ByteArray, ByteArray>> {
+        val list = ArrayList<Pair<ByteArray, ByteArray>>(chunk.size * (1 + indexExtractors.size * 2))
+        for (entry in chunk) {
+            val idBytes = entry.key.toByteArray(Charsets.UTF_8)
+            val docBytes = serializer.serialize(entry.value)
+            val isUpdate = existingIds.contains(entry.key)
+            
+            // Primary Document
+            list.add(makeDocKey(idBytes) to docBytes)
+
+            // Secondary Indices
+            for ((idxName, extractor) in indexExtractors) {
+                val value = extractor(entry.value)
+                val valBytes = value.toByteArray(Charsets.UTF_8)
+                val idxNameBytes = getIndexNameBytes(idxName)
+                
+                list.add(buildKey(idxPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
+                
+                // Only write rptr for updates (fresh inserts have no stale index to invalidate)
+                if (isUpdate) {
+                    list.add(buildKey(rptrPrefix, idxNameBytes, idBytes) to valBytes)
+                }
+            }
+        }
+        return list
     }
 
     /**
      * Deletes all documents in the collection and notifies observers.
      */
     suspend fun deleteAll() {
-        val prefix = "doc:$name:".toByteArray(Charsets.UTF_8)
-        val keysToDelete = db.getKeysByPrefixRaw(prefix)
+        val keysToDelete = db.getKeysByPrefixRaw(docPrefix)
 
         if (keysToDelete.isEmpty()) return
 
@@ -319,5 +460,94 @@ class KoreCollection<T>(
             documentCache.clear()
         }
         updates.tryEmit("*")
+    }
+
+    // ========================================================================
+    // QUERY DSL
+    // ========================================================================
+
+    private val propertyExtractors = mutableMapOf<String, (T) -> String>()
+
+    /**
+     * Registers a property extractor for use in queries and aggregations.
+     *
+     * ```kotlin
+     * collection.registerProperty("price") { it.price.toString() }
+     * collection.registerProperty("category") { it.category }
+     * ```
+     */
+    fun registerProperty(name: String, extractor: (T) -> String) {
+        propertyExtractors[name] = extractor
+    }
+
+    /**
+     * Creates a query builder for this collection.
+     *
+     * ```kotlin
+     * val expensive = collection.query()
+     *     .where("price") { it.toDouble() > 100 }
+     *     .sortBy("price", descending = true) { it.toDouble() }
+     *     .limit(10)
+     *     .execute()
+     * ```
+     */
+    fun query(): KoreQuery<T> = KoreQuery(this, propertyExtractors.toMap())
+
+    /**
+     * Returns the total count of documents in the collection.
+     */
+    fun count(): Int {
+        return db.getKeysByPrefixRaw(docPrefix).size
+    }
+
+    // ========================================================================
+    // PARTIAL DOCUMENT UPDATES
+    // ========================================================================
+
+    /**
+     * Updates specific fields of a document without replacing the entire object.
+     *
+     * This reads the existing document, applies the [transform] function to produce
+     * a modified version, then persists it. This is more efficient than a full
+     * read-modify-write cycle from the application layer because it operates
+     * within a single atomic batch.
+     *
+     * ```kotlin
+     * collection.updateFields("note_1") { note ->
+     *     note.copy(title = "New Title", isPinned = true)
+     * }
+     * ```
+     *
+     * @param id The document ID to update.
+     * @param transform A function that receives the current document and returns the modified version.
+     * @return The updated document, or null if the document doesn't exist.
+     */
+    suspend fun updateFields(id: String, transform: (T) -> T): T? {
+        val existing = getById(id) ?: return null
+        val updated = transform(existing)
+
+        // Re-insert the modified document (handles index updates atomically)
+        insertBatch(mapOf(id to updated))
+
+        return updated
+    }
+
+    /**
+     * Updates a specific field for multiple documents in batch.
+     *
+     * @param ids The document IDs to update.
+     * @param transform A function applied to each existing document.
+     * @return The number of documents successfully updated.
+     */
+    suspend fun updateFieldsBatch(ids: List<String>, transform: (T) -> T): Int {
+        val updates = mutableMapOf<String, T>()
+        for (id in ids) {
+            val existing = getById(id) ?: continue
+            updates[id] = transform(existing)
+        }
+        if (updates.isNotEmpty()) {
+            insertBatch(updates)
+        }
+        return updates.size
     }
 }

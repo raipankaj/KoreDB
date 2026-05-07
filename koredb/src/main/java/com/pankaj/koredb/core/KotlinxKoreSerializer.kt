@@ -23,7 +23,8 @@ import kotlinx.serialization.json.Json
  * A [KoreSerializer] implementation that uses Kotlinx Serialization.
  *
  * This serializer converts Kotlin objects to JSON byte arrays and vice-versa.
- * It is suitable for storing data classes in KoreDB.
+ * It is optimized to minimize allocations during high-throughput batch operations
+ * by reusing internal buffers and tracking typical document sizes.
  *
  * @param T The type of object to be serialized.
  * @property kSerializer The Kotlinx [KSerializer] for type [T].

@@ -756,4 +756,74 @@ class KoreFurtherBenchmark {
         report.append("----------------------------------------------------\n\n")
         println(report.toString())
     }
+
+    @Test
+    fun benchmarkSecondaryIndexPerformance() = runBlocking {
+        val SIZE = 10_000
+        val SEARCH_OPS = 1_000
+
+        val collection = app.database.collection("secondary_test", Note.serializer())
+        val dao = app.roomDatabase.noteDao()
+
+        collection.deleteAll()
+        dao.deleteAll()
+
+        // 1. Create Index in KoreDB
+        collection.createIndex("title") { it.title }
+
+        val data = (1..SIZE).map {
+            Note(it.toString(), "Title_${it % 100}", "Body Content $it")
+        }
+
+        println("\n📈 --- SECONDARY INDEX BENCHMARK (N=$SIZE) ---")
+
+        // 2. Measure Indexed Insertion
+        val koreInsertTime = measureTimeMillis {
+            collection.insertBatch(data.associateBy { it.id })
+        }
+
+        val roomInsertTime = measureTimeMillis {
+            dao.insertAll(data)
+        }
+
+        println("INSERT (with Index) -> KoreDB: ${koreInsertTime}ms | Room: ${roomInsertTime}ms")
+
+        // 3. Measure Search Speed (Querying "Title_50")
+        val targetTitle = "Title_50"
+
+        // Warm up
+        collection.getByIndex("title", targetTitle)
+        dao.getByTitle(targetTitle)
+
+        val koreSearchTime = measureTimeMillis {
+            repeat(SEARCH_OPS) {
+                collection.getByIndex("title", targetTitle)
+            }
+        }
+
+        val roomSearchTime = measureTimeMillis {
+            repeat(SEARCH_OPS) {
+                dao.getByTitle(targetTitle)
+            }
+        }
+
+        println("SEARCH (getByIndex x $SEARCH_OPS) -> KoreDB: ${koreSearchTime}ms | Room: ${roomSearchTime}ms")
+
+        // 4. Measure Update Speed (Changing values triggers index updates)
+        val updates = (1..1000).map {
+            val id = it.toString()
+            Note(id, "UpdatedTitle_$it", "New Body")
+        }
+
+        val koreUpdateTime = measureTimeMillis {
+            collection.insertBatch(updates.associateBy { it.id })
+        }
+
+        val roomUpdateTime = measureTimeMillis {
+            dao.insertAll(updates)
+        }
+
+        println("UPDATE (triggers re-index) -> KoreDB: ${koreUpdateTime}ms | Room: ${roomUpdateTime}ms")
+        println("----------------------------------------------------\n")
+    }
 }

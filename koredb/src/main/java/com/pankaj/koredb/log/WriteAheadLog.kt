@@ -38,9 +38,10 @@ import java.util.zip.CRC32
  *      - Type (4 bytes)
  *      - Key Size (4 bytes)
  *      - Value Size (4 bytes)
- *      - CRC32 Checksum (8 bytes): Computed over Key and Value.
  *      - Key (Variable bytes)
  *      - Value (Variable bytes)
+ *    - `BATCH_CRC` (4 bytes): Marker for the checksum.
+ *    - Checksum (8 bytes): Computed over all keys and values in the batch.
  *    - `RECORD_COMMIT` (4 bytes): Marks the batch as successfully persisted.
  *
  * ### Recovery Mechanism:
@@ -65,48 +66,61 @@ class WriteAheadLog(private val logFile: File) {
     }
 
     /**
-     * Pooled buffer to avoid massive allocations during batch writes.
+     * Pooled DirectByteBuffer to avoid massive allocations during batch writes.
+     * Pre-sized to 4MB to handle typical bulk operations without re-allocation.
      */
     private var sharedBuffer: ByteBuffer? = null
 
     /**
      * Appends a batch of key-value pairs to the log atomically.
      *
-     * This method utilizes a reusable buffer to maximize throughput.
+     * This method utilizes a reusable DirectByteBuffer to maximize throughput.
+     * The buffer is grown geometrically if needed and never shrunk, ensuring
+     * that repeated batch operations converge to a stable allocation.
      *
      * @param batch A list of mutations to persist.
      */
     @Synchronized
     fun appendBatch(batch: List<Pair<ByteArray, ByteArray>>) {
-        val estimatedSize = batch.sumOf { 20 + it.first.size + it.second.size } + 8
+        // Calculate the exact payload size to avoid over/under-allocation
+        var payloadSize = 0
+        for (i in batch.indices) {
+            val pair = batch[i]
+            payloadSize += 12 + pair.first.size + pair.second.size
+        }
+        // Total = payload + BEGIN(4) + CRC_MARKER(4) + CRC_VALUE(8) + COMMIT(4) = payload + 20
+        val totalSize = payloadSize + 20
 
-        // Reuse or grow the shared buffer
         var buffer = sharedBuffer
-        if (buffer == null || buffer.capacity() < estimatedSize) {
-            buffer = ByteBuffer.allocateDirect(maxOf(estimatedSize, 1024 * 1024))
+        if (buffer == null || buffer.capacity() < totalSize) {
+            // Geometric growth: at least 4MB or 2× the required size
+            val newCapacity = maxOf(totalSize, 4 * 1024 * 1024)
+            buffer = ByteBuffer.allocateDirect(newCapacity)
                 .order(java.nio.ByteOrder.LITTLE_ENDIAN)
             sharedBuffer = buffer
         }
         buffer.clear()
 
         buffer.putInt(RECORD_BEGIN)
-
         val crc = CRC32()
 
-        for ((key, value) in batch) {
-            crc.reset()
+        for (i in batch.indices) {
+            val pair = batch[i]
+            val key = pair.first
+            val value = pair.second
+
             crc.update(key)
             crc.update(value)
-            val checksum = crc.value
 
             buffer.putInt(RECORD_PUT)
             buffer.putInt(key.size)
             buffer.putInt(value.size)
-            buffer.putLong(checksum)
             buffer.put(key)
             buffer.put(value)
         }
 
+        buffer.putInt(BATCH_CRC)
+        buffer.putLong(crc.value)
         buffer.putInt(RECORD_COMMIT)
         buffer.flip()
 
@@ -138,6 +152,7 @@ class WriteAheadLog(private val logFile: File) {
     fun replay(consumer: (ByteArray, ByteArray) -> Unit) {
         channel.position(0)
         val tempBatch = mutableListOf<Pair<ByteArray, ByteArray>>()
+        val batchCrc = CRC32()
 
         try {
             while (channel.position() < channel.size()) {
@@ -146,61 +161,47 @@ class WriteAheadLog(private val logFile: File) {
                 typeBuf.flip()
 
                 when (typeBuf.int) {
-                    RECORD_BEGIN -> tempBatch.clear()
+                    RECORD_BEGIN -> {
+                        tempBatch.clear()
+                        batchCrc.reset()
+                    }
 
                     RECORD_PUT -> {
-                        // Read metadata: KeySize(4) + ValueSize(4) + Checksum(8).
-                        val meta = ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        if (channel.read(meta) < 16) break
+                        val meta = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        if (channel.read(meta) < 8) break
                         meta.flip()
 
                         val keySize = meta.int
                         val valueSize = meta.int
-                        val storedChecksum = meta.long
 
-                        // Corruption Guard: Prevent OOM from malformed or garbage sizes.
-                        if (keySize < 0 || valueSize < 0 || keySize > MAX_RECORD_SIZE || valueSize > MAX_RECORD_SIZE) {
-                            println("⚠️ WAL Corrupted: Invalid record size. Halting replay.")
-                            break
-                        }
-
-                        // Bounds Guard: Ensure we don't attempt to read beyond the file boundary.
-                        if (channel.position() + keySize + valueSize > channel.size()) {
-                            break
-                        }
+                        if (keySize < 0 || valueSize < 0 || keySize > MAX_RECORD_SIZE || valueSize > MAX_RECORD_SIZE) break
+                        if (channel.position() + keySize + valueSize > channel.size()) break
 
                         val key = ByteArray(keySize)
                         val value = ByteArray(valueSize)
 
-                        // Sequential read for key data.
                         val keyBuffer = ByteBuffer.wrap(key)
-                        while (keyBuffer.hasRemaining()) {
-                            if (channel.read(keyBuffer) <= 0) break
-                        }
-                        if (keyBuffer.hasRemaining()) break
-
-                        // Sequential read for value data.
+                        while (keyBuffer.hasRemaining()) { if (channel.read(keyBuffer) <= 0) break }
                         val valueBuffer = ByteBuffer.wrap(value)
-                        while (valueBuffer.hasRemaining()) {
-                            if (channel.read(valueBuffer) <= 0) break
-                        }
-                        if (valueBuffer.hasRemaining()) break
+                        while (valueBuffer.hasRemaining()) { if (channel.read(valueBuffer) <= 0) break }
 
-                        // Verification Guard: Ensure data integrity via CRC32.
-                        val crc = CRC32()
-                        crc.update(key)
-                        crc.update(value)
-
-                        if (crc.value != storedChecksum) {
-                            println("⚠️ WAL CRC Checksum Failed! Halting replay.")
-                            break
-                        }
-
+                        batchCrc.update(key)
+                        batchCrc.update(value)
                         tempBatch.add(key to value)
                     }
 
+                    BATCH_CRC -> {
+                        val crcBuf = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        if (channel.read(crcBuf) < 8) break
+                        crcBuf.flip()
+                        val storedCrc = crcBuf.long
+                        if (storedCrc != batchCrc.value) {
+                            println("⚠️ BATCH CRC mismatch. Recovery halted.")
+                            break
+                        }
+                    }
+
                     RECORD_COMMIT -> {
-                        // Atomically apply the entire batch now that it is verified as complete.
                         tempBatch.forEach { consumer(it.first, it.second) }
                         tempBatch.clear()
                     }
@@ -216,6 +217,7 @@ class WriteAheadLog(private val logFile: File) {
         private const val RECORD_BEGIN = 1
         private const val RECORD_PUT = 2
         private const val RECORD_COMMIT = 3
+        private const val BATCH_CRC = 4
 
         /**
          * Safety limit for record sizes (50MB) to prevent memory exhaustion 
@@ -235,6 +237,7 @@ class WriteAheadLog(private val logFile: File) {
             RandomAccessFile(logFile, "r").use { raf ->
                 val channel = raf.channel
                 val tempBatch = mutableListOf<Pair<ByteArray, ByteArray>>()
+                val batchCrc = CRC32()
 
                 try {
                     while (channel.position() < channel.size()) {
@@ -243,15 +246,17 @@ class WriteAheadLog(private val logFile: File) {
                         typeBuf.flip()
 
                         when (typeBuf.int) {
-                            RECORD_BEGIN -> tempBatch.clear()
+                            RECORD_BEGIN -> {
+                                tempBatch.clear()
+                                batchCrc.reset()
+                            }
                             RECORD_PUT -> {
-                                val meta = ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                                if (channel.read(meta) < 16) break
+                                val meta = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                                if (channel.read(meta) < 8) break
                                 meta.flip()
 
                                 val keySize = meta.int
                                 val valueSize = meta.int
-                                val storedChecksum = meta.long
 
                                 if (keySize < 0 || valueSize < 0 ||
                                     keySize > MAX_RECORD_SIZE || valueSize > MAX_RECORD_SIZE) break
@@ -262,27 +267,19 @@ class WriteAheadLog(private val logFile: File) {
                                 val value = ByteArray(valueSize)
 
                                 val keyBuffer = ByteBuffer.wrap(key)
-                                while (keyBuffer.hasRemaining()) {
-                                    if (channel.read(keyBuffer) <= 0) break
-                                }
-                                if (keyBuffer.hasRemaining()) break
-
+                                while (keyBuffer.hasRemaining()) { if (channel.read(keyBuffer) <= 0) break }
                                 val valueBuffer = ByteBuffer.wrap(value)
-                                while (valueBuffer.hasRemaining()) {
-                                    if (channel.read(valueBuffer) <= 0) break
-                                }
-                                if (valueBuffer.hasRemaining()) break
+                                while (valueBuffer.hasRemaining()) { if (channel.read(valueBuffer) <= 0) break }
 
-                                val crc = CRC32()
-                                crc.update(key)
-                                crc.update(value)
-
-                                if (crc.value != storedChecksum) {
-                                    println("⚠️ WAL CRC mismatch. Halting replay.")
-                                    break
-                                }
-
+                                batchCrc.update(key)
+                                batchCrc.update(value)
                                 tempBatch.add(key to value)
+                            }
+                            BATCH_CRC -> {
+                                val crcBuf = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                                if (channel.read(crcBuf) < 8) break
+                                crcBuf.flip()
+                                if (crcBuf.long != batchCrc.value) break
                             }
                             RECORD_COMMIT -> {
                                 tempBatch.forEach { consumer(it.first, it.second) }

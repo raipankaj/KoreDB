@@ -44,10 +44,12 @@ object Compactor {
      *
      * @param readers A list of [SSTableReader]s for the segments to be compacted.
      * @param outputFile The destination file for the new, compacted SSTable.
+     * @param truthOracle An optional function to validate if an index entry is still fresh.
      */
     fun compact(
         readers: List<SSTableReader>,
-        outputFile: File
+        outputFile: File,
+        truthOracle: ((ByteArray) -> ByteArray?)? = null
     ) {
         // 1. Initialize Iterators for all input files
         val queue = PriorityQueue<SSTableIterator>()
@@ -59,33 +61,69 @@ object Compactor {
         }
 
         // 2. Process and Merge
-        // For simplicity, we aggregate the compacted data into a fresh MemTable 
-        // before flushing. In an extremely large-scale scenario, we would stream
-        // directly to a FileChannel.
         val tempMemTable = MemTable()
         var lastProcessedKey: ByteArray? = null
 
         while (queue.isNotEmpty()) {
-            // Retrieve the iterator with the smallest key (and newest version)
             val topIterator = queue.poll()!!
             val candidateKey = topIterator.currentKey!!
 
-            // Deduplication: The PriorityQueue ensures we see the newest version of a key first.
-            // Any subsequent appearances of the same key in older segments are ignored.
             val isNewKey = lastProcessedKey == null || ByteArrayComparator.compare(candidateKey, lastProcessedKey) != 0
             
             if (isNewKey) {
                 lastProcessedKey = candidateKey
                 val candidateValue = topIterator.value() ?: KoreDB.TOMBSTONE
 
-                // Tombstone Logic: If the value is empty, it represents a deletion.
-                // We omit it from the new segment to reclaim disk space.
                 if (candidateValue.isNotEmpty()) {
-                    tempMemTable.put(candidateKey, candidateValue)
+                    // --- INDEX-AWARE COMPACTION ---
+                    // If we have a truth oracle (the DB engine), we check if index entries are stale.
+                    var shouldDrop = false
+                    
+                    if (truthOracle != null) {
+                        val keyStr = String(candidateKey, Charsets.UTF_8)
+                        
+                        // Check Collection Indices: idx:collection:field:value:id
+                        if (keyStr.startsWith("idx:")) {
+                            val parts = keyStr.split(":")
+                            if (parts.size >= 5) {
+                                val collName = parts[1]
+                                val fieldName = parts[2]
+                                val indexValue = parts[3]
+                                val id = parts[4]
+                                
+                                val rptrKey = "rptr:$collName:$fieldName:$id".toByteArray(Charsets.UTF_8)
+                                val currentTruth = truthOracle(rptrKey)?.let { String(it, Charsets.UTF_8) }
+                                
+                                if (currentTruth != null && currentTruth != indexValue) {
+                                    shouldDrop = true
+                                }
+                            }
+                        }
+                        // Check Graph Indices: g:idx:v_prop:label:key:value:nodeId
+                        else if (keyStr.startsWith("g:idx:v_prop:")) {
+                            val parts = keyStr.split(":")
+                            if (parts.size >= 7) {
+                                val label = parts[3]
+                                val key = parts[4]
+                                val value = parts[5]
+                                val nodeId = parts[6]
+                                
+                                val rptrKey = "g:rptr:v_prop:$label:$key:$nodeId".toByteArray(Charsets.UTF_8)
+                                val currentTruth = truthOracle(rptrKey)?.let { String(it, Charsets.UTF_8) }
+                                
+                                if (currentTruth != null && currentTruth != value) {
+                                    shouldDrop = true
+                                }
+                            }
+                        }
+                    }
+
+                    if (!shouldDrop) {
+                        tempMemTable.put(candidateKey, candidateValue)
+                    }
                 }
             }
 
-            // Advance the iterator and re-insert into the queue if more data is available
             if (topIterator.advance()) {
                 queue.add(topIterator)
             }

@@ -34,11 +34,13 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * @param directory The directory where database files are stored.
  */
-class KoreDatabase(directory: File) {
+class KoreDatabase(private val directory: File) {
 
-    // Expose engine internally for advanced use cases or tests if needed, 
-    // but typically users go through collections.
-    val engine = KoreDB(directory)
+    /**
+     * The underlying storage engine. 
+     * Initialized lazily to ensure [KoreAndroid.create] is non-blocking on the UI thread.
+     */
+    val engine: KoreDB by lazy { KoreDB(directory) }
     
     private val collections = ConcurrentHashMap<String, KoreCollection<*>>()
 
@@ -77,10 +79,36 @@ class KoreDatabase(directory: File) {
      * Retrieves or creates a [KoreVectorCollection] for similarity search.
      *
      * @param name The unique name of the vector collection.
-     * @return A collection instance capable of performing vector search.
+     * @return A collection instance with default configuration.
      */
     fun vectorCollection(name: String): KoreVectorCollection {
         return KoreVectorCollection(name, engine)
+    }
+
+    /**
+     * Creates a [KoreVectorCollection] with custom configuration.
+     *
+     * Usage:
+     * ```kotlin
+     * val collection = db.vectorCollection("products") {
+     *     dimensions = 768
+     *     metric = DistanceMetric.COSINE
+     *     quantization = true
+     *     efSearch = 100
+     *     namespace = "user_123"
+     * }
+     * ```
+     *
+     * @param name The unique name of the vector collection.
+     * @param configure Configuration builder lambda.
+     * @return A configured vector collection instance.
+     */
+    fun vectorCollection(
+        name: String,
+        configure: com.pankaj.koredb.core.VectorCollectionConfig.Builder.() -> Unit
+    ): KoreVectorCollection {
+        val config = com.pankaj.koredb.core.VectorCollectionConfig.Builder().apply(configure).build()
+        return KoreVectorCollection(name, engine, config)
     }
 
     /**
@@ -95,6 +123,22 @@ class KoreDatabase(directory: File) {
 
     fun graph(): GraphStorage {
         return GraphStorage(engine)
+    }
+
+    /**
+     * Creates a unified Graph + Vector query bridge.
+     *
+     * This is KoreDB's **unique differentiator** — no other database offers
+     * combined graph traversal + vector similarity in a single query.
+     *
+     * ```kotlin
+     * val bridge = db.graphVectorBridge(vectorCollection)
+     * val results = bridge.vectorSearch(query, limit = 50)
+     *     .filterByGraph { graph.getOutboundTargetIds(it, "CATEGORY").contains("shoes") }
+     * ```
+     */
+    fun graphVectorBridge(vectorCollection: com.pankaj.koredb.core.KoreVectorCollection): com.pankaj.koredb.bridge.GraphVectorBridge {
+        return com.pankaj.koredb.bridge.GraphVectorBridge(graph(), vectorCollection)
     }
 
     /**

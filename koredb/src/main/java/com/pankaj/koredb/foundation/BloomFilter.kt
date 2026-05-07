@@ -42,7 +42,26 @@ class BloomFilter(
      * @param key The byte array representing the key to add.
      */
     fun add(key: ByteArray) {
-        val hashes = getHashes(key)
+        val hashes = getHashes(key, 0, key.size)
+        for (hash in hashes) {
+            bitSet.set(hash)
+        }
+    }
+
+    /**
+     * Adds a sub-range of a byte array to the Bloom Filter without allocation.
+     *
+     * This method hashes the bytes in [data] from [offset] to [offset]+[length]
+     * directly, avoiding the cost of a `copyOfRange` call. This is critical for
+     * prefix bloom filter construction where thousands of sub-ranges are hashed
+     * per SSTable write.
+     *
+     * @param data The source byte array.
+     * @param offset The starting position in the array.
+     * @param length The number of bytes to hash.
+     */
+    fun addRange(data: ByteArray, offset: Int, length: Int) {
+        val hashes = getHashes(data, offset, length)
         for (hash in hashes) {
             bitSet.set(hash)
         }
@@ -55,7 +74,7 @@ class BloomFilter(
      * @return true if the key might be present, false if it definitely is not.
      */
     fun mightContain(key: ByteArray): Boolean {
-        val hashes = getHashes(key)
+        val hashes = getHashes(key, 0, key.size)
         for (hash in hashes) {
             if (!bitSet.get(hash)) {
                 return false
@@ -65,17 +84,23 @@ class BloomFilter(
     }
 
     /**
-     * Generates multiple hash indices for a given key using double hashing.
+     * Generates multiple hash indices for a sub-range of bytes using double hashing.
+     *
+     * @param data The source byte array.
+     * @param offset Starting position in the array.
+     * @param length Number of bytes to hash.
      */
-    private fun getHashes(key: ByteArray): IntArray {
+    private fun getHashes(data: ByteArray, offset: Int, length: Int): IntArray {
         val result = IntArray(hashFunctions)
         var hash1 = 5381
         var hash2 = 0
 
         // DJB2-like hashing for hash1 and a simple shift-based hash for hash2
-        for (b in key) {
-            hash1 = ((hash1 shl 5) + hash1) xor b.toInt()
-            hash2 = hash2 * 31 + b.toInt()
+        val end = offset + length
+        for (i in offset until end) {
+            val b = data[i].toInt()
+            hash1 = ((hash1 shl 5) + hash1) xor b
+            hash2 = hash2 * 31 + b
         }
 
         for (i in 0 until hashFunctions) {

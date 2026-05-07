@@ -182,6 +182,9 @@ class KoreDB(val directory: File) {
      * Writes a batch of entries to the database. 
      * The operation is first logged to the WAL, then applied to the MemTable.
      *
+     * Uses [MemTable.putAll] for bulk insertion to minimize atomic counter
+     * overhead and maximize throughput for indexed batch operations.
+     *
      * @param batch A list of key-value pairs to persist.
      * @param urgent If true, forces an immediate hardware-level sync of the WAL.
      */
@@ -191,9 +194,8 @@ class KoreDB(val directory: File) {
         withContext(Dispatchers.IO) {
             wal.appendBatch(batch)
 
-            for (pair in batch) {
-                memTable.put(pair.first, pair.second)
-            }
+            // Bulk insert: single atomic size update instead of N individual updates
+            memTable.putAll(batch)
 
             if (urgent) {
                 wal.flush()
@@ -308,7 +310,11 @@ class KoreDB(val directory: File) {
         println("🚧 STARTING COMPACTION...")
         val compactedFile = File(directory, "compacted_${System.currentTimeMillis()}.sst")
 
-        Compactor.compact(sstReaders, compactedFile)
+        // Pass a "Truth Oracle" to the compactor so it can drop stale index entries.
+        Compactor.compact(sstReaders, compactedFile) { rptrKey ->
+            // Use getRaw to check the most recent value for a reverse pointer.
+            getRaw(rptrKey)
+        }
 
         // Ensure the compacted file is fully written to disk.
         java.io.RandomAccessFile(compactedFile, "rw").use { raf ->

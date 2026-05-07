@@ -266,7 +266,7 @@ class AdvancedVectorTest {
         
         assertFalse(vectors.search(floatArrayOf(1f, 1f), 1).isEmpty())
         
-        db.deleteRaw("vec:delete:d1".toByteArray())
+        vectors.delete("d1")
         
         val res = vectors.search(floatArrayOf(1f, 1f), 1)
         assertTrue("Vector should be deleted", res.isEmpty())

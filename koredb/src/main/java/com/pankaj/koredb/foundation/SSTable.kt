@@ -63,8 +63,11 @@ class SSTable {
         /**
          * Persists the contents of a [MemTable] to a file in SSTable format.
          *
-         * The [MemTable] must be sorted prior to calling this method to maintain 
-         * the invariant that SSTable keys are stored in lexicographical order.
+         * This method is heavily optimized for throughput:
+         * - A single reusable [DirectByteBuffer] is used for all record writes,
+         *   eliminating per-record heap allocations and GC pressure.
+         * - Bloom filter prefix entries are capped at [MAX_PREFIX_DEPTH] levels
+         *   and use zero-copy hashing via [BloomFilter.addRange].
          *
          * @param memTable The source in-memory table to flush.
          * @param outputFile The destination file where the SSTable will be written.
@@ -77,34 +80,59 @@ class SSTable {
             // Parameters are tuned for 100k entries with a low false-positive rate.
             val bloomFilter = BloomFilter(100_000, 3)
 
+            // --- OPTIMIZATION: Single reusable DirectByteBuffer ---
+            // Eliminates tens of thousands of per-record heap allocations.
+            // DirectByteBuffer bypasses the JVM heap for faster kernel I/O.
+            val bufferCapacity = 256 * 1024 // 256KB write buffer
+            var buffer = ByteBuffer.allocateDirect(bufferCapacity)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+
             // 1. Write the Data Blocks: Iterate through sorted entries and append to file.
             for (entry in memTable.getSortedEntries()) {
                 val key = entry.key
                 val value = entry.value
 
                 bloomFilter.add(key)
-                
-                // Prefix Bloom Filter: add structural prefixes (e.g., delimited by ':')
-                var prefixEnd = 0
-                while (prefixEnd < key.size) {
-                    if (key[prefixEnd] == ':'.code.toByte()) {
-                        bloomFilter.add(key.copyOfRange(0, prefixEnd + 1))
+
+                // --- OPTIMIZATION: Capped prefix bloom with zero-copy hashing ---
+                // Only index the first MAX_PREFIX_DEPTH colon-delimited segments.
+                // Uses addRange() to hash sub-ranges in-place without copyOfRange.
+                var colonCount = 0
+                for (i in key.indices) {
+                    if (key[i] == ':'.code.toByte()) {
+                        colonCount++
+                        bloomFilter.addRange(key, 0, i + 1)
+                        if (colonCount >= MAX_PREFIX_DEPTH) break
                     }
-                    prefixEnd++
                 }
 
                 val recordSize = 8 + key.size + value.size
-                val buffer = ByteBuffer.allocate(recordSize).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+
+                // Auto-flush: if the current record doesn't fit, write buffer to disk
+                if (buffer.remaining() < recordSize) {
+                    buffer.flip()
+                    while (buffer.hasRemaining()) {
+                        channel.write(buffer)
+                    }
+                    buffer.clear()
+
+                    // Handle oversized records that exceed the buffer capacity
+                    if (recordSize > buffer.capacity()) {
+                        buffer = ByteBuffer.allocateDirect(recordSize)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    }
+                }
 
                 buffer.putInt(key.size)
                 buffer.putInt(value.size)
                 buffer.put(key)
                 buffer.put(value)
+            }
 
-                buffer.flip()
-                while (buffer.hasRemaining()) {
-                    channel.write(buffer)
-                }
+            // Flush any remaining data in the buffer
+            buffer.flip()
+            while (buffer.hasRemaining()) {
+                channel.write(buffer)
             }
 
             // 2. Capture the exact byte offset where the Bloom Filter starts.
@@ -138,5 +166,12 @@ class SSTable {
             channel.close()
             fileOutputStream.close()
         }
+
+        /**
+         * Maximum number of colon-delimited prefix segments to index in the Bloom Filter.
+         * Capping this at 3 covers the structural prefixes (e.g., "doc:collection:" or
+         * "idx:collection:field:") while avoiding the O(K) explosion from deeply nested keys.
+         */
+        private const val MAX_PREFIX_DEPTH = 3
     }
 }
