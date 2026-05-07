@@ -69,7 +69,7 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 ```kotlin
 dependencies {
-    implementation("io.github.raipankaj:koredb:0.0.6")
+    implementation("io.github.raipankaj:koredb:0.0.7")
 }
 ```
 
