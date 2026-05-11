@@ -101,6 +101,83 @@ class GraphVectorBridge(
         return GraphFirstBuilder(graph, vectors, nodes.map { it.id })
     }
 
+    /**
+     * Executes a full GraphRAG (Graph Retrieval-Augmented Generation) query.
+     *
+     * This method combines Vector Search and Graph Traversal to retrieve the most contextually
+     * rich subgraph for an LLM prompt. It outperforms traditional RAG by ensuring the LLM gets
+     * both semantically relevant entries and structurally connected context.
+     *
+     * @param query The query vector (e.g., prompt embedding).
+     * @param initialLimit Number of "seed" nodes to find via vector similarity.
+     * @param edgeType Optional. The type of relationship to traverse for context expansion. If null, follows all outbound edges.
+     * @param maxHops How deep to traverse from the seed nodes to collect structural context.
+     * @param finalLimit The maximum number of context nodes to return to the LLM.
+     * @return A list of [BridgeResult] containing the node data and similarity score.
+     */
+    suspend fun graphRAGQuery(
+        query: FloatArray,
+        initialLimit: Int = 10,
+        edgeType: String? = null,
+        maxHops: Int = 2,
+        finalLimit: Int = 10
+    ): List<BridgeResult> {
+        // 1. Semantic Entry: Find seed nodes
+        val seedResults = vectors.search(query, initialLimit)
+        val seedNodeIds = seedResults.map { it.first }.toSet()
+
+        // 2. Structural Expansion: Traverse graph to pull in connected context
+        val expandedNodes = mutableSetOf<String>()
+        expandedNodes.addAll(seedNodeIds)
+
+        var frontier = seedNodeIds
+        for (i in 0 until maxHops) {
+            val nextFrontier = mutableSetOf<String>()
+            for (id in frontier) {
+                val targets = if (edgeType != null) {
+                    graph.getOutboundTargetIds(id, edgeType)
+                } else {
+                    graph.getAllOutboundEdges(id).map { it.targetId }
+                }
+                for (targetId in targets) {
+                    if (expandedNodes.add(targetId)) {
+                        nextFrontier.add(targetId)
+                    }
+                }
+            }
+            frontier = nextFrontier
+            if (frontier.isEmpty()) break
+        }
+
+        // 3. Semantic Reranking: Score all expanded nodes against the prompt
+        val results = mutableListOf<BridgeResult>()
+        for (id in expandedNodes) {
+            val vector = vectors.getVector(id)
+            if (vector != null) {
+                val similarity = com.pankaj.koredb.hnsw.DistanceMetric.COSINE.compute(query, vector)
+                results.add(
+                    BridgeResult(
+                        id = id,
+                        similarity = similarity,
+                        node = graph.getNode(id)
+                    )
+                )
+            } else {
+                // If a node doesn't have a vector, assign a base similarity
+                // so it's still considered but ranked lower than exact matches
+                results.add(
+                    BridgeResult(
+                        id = id,
+                        similarity = 0.0f,
+                        node = graph.getNode(id)
+                    )
+                )
+            }
+        }
+
+        return results.sortedByDescending { it.similarity }.take(finalLimit)
+    }
+
     // ========================================================================
     // VECTOR-FIRST BUILDER
     // ========================================================================

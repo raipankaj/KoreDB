@@ -458,26 +458,36 @@ File("social_graph.graphml").writeText(graphml)
 
 ---
 
-## 🌉 Unified Graph + Vector Bridge
+## 🌉 Unified Graph + Vector Bridge (GraphRAG Native)
 
-**KoreDB's killer feature** — no other database offers this.
+**KoreDB's killer feature** — no other database offers this. It gives you everything needed out-of-the-box to build **GraphRAG (Graph Retrieval-Augmented Generation)**, which drastically outperforms traditional Vector RAG by maintaining structural context.
 
 ```kotlin
 val bridge = database.graphVectorBridge(vectorCollection)
 
-// Vector-First: Find similar, then filter by graph structure
+// 🌟 Full GraphRAG Pipeline (1-liner)
+// Finds semantic seeds -> traverses graph for context -> reranks for LLM
+val graphRagContext = bridge.graphRAGQuery(
+    query = promptEmbedding,
+    initialLimit = 5,           // 1. Vector Search: Find top 5 relevant seed nodes
+    edgeType = "DEPENDS_ON",    // 2. Graph Expansion: Traverse specific relationships
+    maxHops = 2,                // 3. Graph Expansion: Pull context up to 2 levels deep
+    finalLimit = 10             // 4. Rerank: Return the 10 best contextual nodes
+)
+
+// 🔍 Vector-First: Find similar, then filter by graph structure
 val results = bridge.vectorSearch(queryEmbedding, limit = 50)
     .filterByGraph { productId ->
         graph.getOutboundTargetIds(productId, "MADE_BY")
             .any { it in userFollowedBrands }
     }
 
-// Graph-First: Traverse relationships, then rank by similarity
+// 🕸️ Graph-First: Traverse relationships, then rank by similarity
 val ranked = bridge.graphTraversal("user_123", "PURCHASED", hops = 2)
     .rerankByVector(queryEmbedding)
     .take(10)
 
-// Property-based graph start → vector rerank
+// 🏷️ Property-based graph start → vector rerank
 val results = bridge.graphQuery("Product", "category", "shoes")
     .rerankByVector(queryEmbedding)
     .take(10)

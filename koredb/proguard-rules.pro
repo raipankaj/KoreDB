@@ -1,21 +1,42 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# Preserve the public API of KoreDB
+-keep public class com.pankaj.koredb.db.KoreDatabase {
+    public <methods>;
+    public <fields>;
+}
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+-keep public class com.pankaj.koredb.db.KoreAndroid {
+    public <methods>;
+    public <fields>;
+}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+-keep public class com.pankaj.koredb.core.KoreCollection {
+    public <methods>;
+    public <fields>;
+}
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+-keep public class com.pankaj.koredb.core.KoreVectorCollection {
+    public <methods>;
+    public <fields>;
+}
+
+-keep public class com.pankaj.koredb.core.KoreSerializer {
+    public <methods>;
+    public <fields>;
+}
+
+# Preserve the Graph API if it's public
+-keep public class com.pankaj.koredb.graph.** {
+    public <methods>;
+    public <fields>;
+}
+
+# Keep serialization-related metadata if you use kotlinx.serialization
+-keepattributes *Annotation*, InnerClasses, EnclosingMethod, Signature, Exceptions
+-keepclassmembers class * {
+    @kotlinx.serialization.Serializable *;
+}
+
+# Optional: Preserve line numbers for stack traces but obfuscate source file names
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+
