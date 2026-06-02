@@ -49,13 +49,6 @@ class SSTableIterator(
         if (valueOffset == -1) return null
         if (valueSize == 0) return EMPTY_BYTE_ARRAY
 
-        // Check Block Cache to avoid disk IO and JNI crossing
-        val cachedValue = reader.blockCache.get(valueOffset)
-        if (cachedValue != null) {
-            valueRead = false // Keep buffer position unchanged since we didn't use it
-            return cachedValue
-        }
-
         // Optimization: If we are already at the valueOffset, this is a sequential read.
         // If not (e.g., value() called multiple times or out of order), we must jump.
         val currentPos = buffer.position()
@@ -66,9 +59,6 @@ class SSTableIterator(
         val valueBytes = ByteArray(valueSize)
         buffer.get(valueBytes)
         valueRead = true
-        
-        // Cache the result for future repeated queries
-        reader.blockCache.put(valueOffset, valueBytes)
         
         // No need to restore position if we are doing a range scan, 
         // as advance() will handle the skip if valueRead is false.

@@ -43,6 +43,12 @@ class CompactionTest {
         db.putRaw("C".toByteArray(), "Val3".toByteArray())
         db.flushMemTableInternal()
 
+        // Wait for background compaction to complete
+        kotlinx.coroutines.delay(100)
+        while (db.isCompacting) {
+            kotlinx.coroutines.delay(10)
+        }
+
         // Verify compaction happened. We should have 1 segment now.
         val sstFiles = testDir.listFiles { _, name -> name.endsWith(".sst") } ?: emptyArray()
         

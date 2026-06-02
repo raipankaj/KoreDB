@@ -35,8 +35,6 @@ class SSTableReader(val file: File) {
     private val buffer: MappedByteBuffer
     private val bloomFilter: BloomFilter
 
-    val blockCache = BlockCache(2048) // Caches up to 2048 records/blocks in RAM
-
     /**
      * The byte offset identifying where the data section ends and the metadata begins.
      */
@@ -230,20 +228,21 @@ class SSTableReader(val file: File) {
                     }
                 }
             }
-            
             if (match) {
                 val valueOffset = startPos + 8 + keySize
                 val storedMag = localBuffer.getFloat(valueOffset)
                 val vectorLength = (valueSize - 4) / 4
-                val dot = VectorMath.dotProduct(query, localBuffer, valueOffset + 4, vectorLength)
-                val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
+                if (query.size == vectorLength) {
+                    val dot = VectorMath.dotProduct(query, localBuffer, valueOffset + 4, vectorLength)
+                    val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
 
-                if (score > -1.5f) {
-                    if (topKHeap.size < limit) {
-                        topKHeap.add(Pair(startPos, score))
-                    } else if (score > topKHeap.peek()!!.second) {
-                        topKHeap.poll()
-                        topKHeap.add(Pair(startPos, score))
+                    if (score > -1.5f) {
+                        if (topKHeap.size < limit) {
+                            topKHeap.add(Pair(startPos, score))
+                        } else if (score > topKHeap.peek()!!.second) {
+                            topKHeap.poll()
+                            topKHeap.add(Pair(startPos, score))
+                        }
                     }
                 }
             }
@@ -270,22 +269,6 @@ class SSTableReader(val file: File) {
     }
 }
 
-/**
- * A fast, memory-aware LRU Block Cache to bypass OS page cache overhead and JNI crossings.
- */
-class BlockCache(private val capacity: Int) {
-    private val cache = object : java.util.LinkedHashMap<Int, ByteArray>(capacity, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, ByteArray>): Boolean {
-            return size > capacity
-        }
-    }
 
-    @Synchronized
-    fun get(offset: Int): ByteArray? = cache[offset]
 
-    @Synchronized
-    fun put(offset: Int, data: ByteArray) {
-        cache[offset] = data
-    }
-}
 

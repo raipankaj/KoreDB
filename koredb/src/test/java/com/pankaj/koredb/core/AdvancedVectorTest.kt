@@ -45,7 +45,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("math_0")
         val v = floatArrayOf(1f, 2f, 3f)
         vectors.insert("v", v)
-        
+        vectors.waitForIndexing()
         val results = vectors.search(v, limit = 1)
         assertEquals(1.0f, results[0].second, 0.0001f)
     }
@@ -56,7 +56,7 @@ class AdvancedVectorTest {
         val v1 = floatArrayOf(1f, 0f)
         val v2 = floatArrayOf(0f, 1f) // 90 deg
         vectors.insert("v1", v1)
-        
+        vectors.waitForIndexing()
         val results = vectors.search(v2, limit = 1)
         assertEquals(0.0f, results[0].second, 0.0001f)
     }
@@ -67,7 +67,7 @@ class AdvancedVectorTest {
         val v1 = floatArrayOf(1f, 1f)
         val v2 = floatArrayOf(-1f, -1f) // Opposite direction
         vectors.insert("v1", v1)
-        
+        vectors.waitForIndexing()
         val results = vectors.search(v2, limit = 1)
         assertEquals(-1.0f, results[0].second, 0.0001f)
     }
@@ -81,7 +81,7 @@ class AdvancedVectorTest {
         val v1 = floatArrayOf(1f, 0f)
         val v2 = floatArrayOf(0.5f, sqrt(3f) / 2)
         vectors.insert("target", v1)
-        
+        vectors.waitForIndexing()
         val results = vectors.search(v2, limit = 1)
         assertEquals(0.5f, results[0].second, 0.0001f)
     }
@@ -95,7 +95,7 @@ class AdvancedVectorTest {
         val huge = floatArrayOf(100f, 100f)
         
         vectors.insert("small", small)
-        
+        vectors.waitForIndexing()
         val results = vectors.search(huge, limit = 1)
         assertEquals(1.0f, results[0].second, 0.0001f)
     }
@@ -107,7 +107,7 @@ class AdvancedVectorTest {
         // V2 = [-1, 1] (Q2) -> Angle 90 -> Sim 0
         val vectors = db.vectorCollection("quad")
         vectors.insert("target", floatArrayOf(1f, 1f))
-        
+        vectors.waitForIndexing()
         val results = vectors.search(floatArrayOf(-1f, 1f), limit = 1)
         assertEquals(0.0f, results[0].second, 0.0001f)
     }
@@ -117,7 +117,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("1d")
         vectors.insert("pos", floatArrayOf(5f))
         vectors.insert("neg", floatArrayOf(-5f))
-        
+        vectors.waitForIndexing()
         val q = floatArrayOf(10f)
         val results = vectors.search(q, limit = 2)
         
@@ -136,6 +136,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("d128")
         val v = FloatArray(128) { if (it % 2 == 0) 1f else 0f }
         vectors.insert("v", v)
+        vectors.waitForIndexing()
         val res = vectors.search(v, 1)
         assertEquals(1.0f, res[0].second, 0.0001f)
     }
@@ -145,6 +146,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("d384")
         val v = FloatArray(384) { 0.1f }
         vectors.insert("v", v)
+        vectors.waitForIndexing()
         val res = vectors.search(v, 1)
         assertEquals(1.0f, res[0].second, 0.0001f)
     }
@@ -154,6 +156,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("d768")
         val v = FloatArray(768) { it.toFloat() }
         vectors.insert("v", v)
+        vectors.waitForIndexing()
         // Search with same vector
         val res = vectors.search(v, 1)
         assertEquals(1.0f, res[0].second, 0.0001f)
@@ -164,6 +167,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("d1536")
         val v = FloatArray(1536) { 1f }
         vectors.insert("v", v)
+        vectors.waitForIndexing()
         val res = vectors.search(v, 1)
         assertEquals(1.0f, res[0].second, 0.0001f)
     }
@@ -177,7 +181,7 @@ class AdvancedVectorTest {
         // 1e-15^2 = 1e-30 (Safe)
         val tiny = floatArrayOf(1.0e-15f, 1.0e-15f)
         vectors.insert("tiny", tiny)
-        
+        vectors.waitForIndexing()
         val res = vectors.search(tiny, 1)
         // Should still normalize correctly to 1.0
         assertEquals(1.0f, res[0].second, 0.0001f)
@@ -189,7 +193,7 @@ class AdvancedVectorTest {
         // Float max is ~3.4e38.
         val huge = floatArrayOf(1e20f, 1e20f)
         vectors.insert("huge", huge)
-        
+        vectors.waitForIndexing()
         val res = vectors.search(huge, 1)
         
         if (res.isNotEmpty()) {
@@ -203,7 +207,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("nan")
         val nanVec = floatArrayOf(Float.NaN, 1f)
         vectors.insert("nan", nanVec)
-        
+        vectors.waitForIndexing()
         // Search with clean vector
         val res = vectors.search(floatArrayOf(1f, 1f), 1)
         
@@ -223,7 +227,7 @@ class AdvancedVectorTest {
             // v0=(10,0), v1=(9,1)... v9=(1,9)
             vectors.insert("v$i", floatArrayOf(x, y))
         }
-        
+        vectors.waitForIndexing()
         val target = floatArrayOf(1f, 0f)
         val res = vectors.search(target, limit = 3)
         
@@ -246,6 +250,7 @@ class AdvancedVectorTest {
         
         // Initial: Orthogonal
         vectors.insert("u1", floatArrayOf(0f, 1f))
+        vectors.waitForIndexing()
         
         // Search for [1,0] -> Sim 0
         var res = vectors.search(floatArrayOf(1f, 0f), 1)
@@ -253,6 +258,7 @@ class AdvancedVectorTest {
         
         // Update: Identical
         vectors.insert("u1", floatArrayOf(1f, 0f))
+        vectors.waitForIndexing()
         
         // Search for [1,0] -> Sim 1
         res = vectors.search(floatArrayOf(1f, 0f), 1)
@@ -263,10 +269,12 @@ class AdvancedVectorTest {
     fun `test Delete Vector`() = runBlocking {
         val vectors = db.vectorCollection("delete")
         vectors.insert("d1", floatArrayOf(1f, 1f))
+        vectors.waitForIndexing()
         
         assertFalse(vectors.search(floatArrayOf(1f, 1f), 1).isEmpty())
         
         vectors.delete("d1")
+        vectors.waitForIndexing()
         
         val res = vectors.search(floatArrayOf(1f, 1f), 1)
         assertTrue("Vector should be deleted", res.isEmpty())
@@ -277,6 +285,7 @@ class AdvancedVectorTest {
         val vectors = db.vectorCollection("persist")
         val vec = floatArrayOf(0.123f, 0.456f)
         vectors.insert("p1", vec)
+        vectors.waitForIndexing()
         
         db.close()
         
@@ -300,6 +309,7 @@ class AdvancedVectorTest {
             "b2" to floatArrayOf(0f, 1f)
         )
         vectors.insertBatch(batch)
+        vectors.waitForIndexing()
         
         val res1 = vectors.search(floatArrayOf(1f, 0f), 1)
         assertEquals("b1", res1[0].first)

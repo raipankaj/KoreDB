@@ -142,6 +142,21 @@ class KoreDatabase(private val directory: File) {
     }
 
     /**
+     * Retrieves or creates a Key-Value cache instance.
+     * Offers the highest performance for storing raw primitives/byte arrays.
+     */
+    fun keyValue(name: String): com.pankaj.koredb.kv.KoreKeyValue {
+        return com.pankaj.koredb.kv.KoreKeyValue(name, engine)
+    }
+
+    /**
+     * Retrieves or creates a reactive Event Stream for Pub/Sub messaging.
+     */
+    fun eventStream(topicName: String): com.pankaj.koredb.stream.KoreEventStream {
+        return com.pankaj.koredb.stream.KoreEventStream(topicName, engine)
+    }
+
+    /**
      * Advanced: Deletes a raw key from the underlying storage.
      * Useful for debugging or manual cleanup.
      */

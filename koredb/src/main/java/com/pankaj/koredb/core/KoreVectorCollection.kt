@@ -160,11 +160,16 @@ class KoreVectorCollection(
      * @param metadata Optional key-value metadata for hybrid search.
      */
     suspend fun insert(id: String, vector: FloatArray, metadata: Map<String, Any>? = null) {
+        val isUpdate = hnsw.contains(id)
         db.putRaw(makeKey(id), VectorSerializer.toByteArray(vector))
         if (metadata != null) {
             db.putRaw(makeMetaKey(id), serializeMetadata(metadata))
         }
-        indexingChannel.send(IndexingTask.Insert(id, vector, metadata))
+        if (isUpdate) {
+            indexingChannel.send(IndexingTask.Update(id, vector, metadata))
+        } else {
+            indexingChannel.send(IndexingTask.Insert(id, vector, metadata))
+        }
     }
 
     /**
@@ -422,9 +427,17 @@ class KoreVectorCollection(
     // INTERNAL
     // ========================================================================
 
-    private fun makeKey(id: String) = "$keyPrefix$id".toByteArray(Charsets.UTF_8)
-    private fun makeMetaKey(id: String) = "$metaPrefix$id".toByteArray(Charsets.UTF_8)
-    private fun makeFieldKey(id: String, field: String) = "${keyPrefix}f:$field:$id".toByteArray(Charsets.UTF_8)
+    private fun escape(value: String): String {
+        return value.replace("%", "%25").replace(":", "%3A")
+    }
+
+    private fun unescape(value: String): String {
+        return value.replace("%3A", ":").replace("%25", "%")
+    }
+
+    private fun makeKey(id: String) = "$keyPrefix${escape(id)}".toByteArray(Charsets.UTF_8)
+    private fun makeMetaKey(id: String) = "$metaPrefix${escape(id)}".toByteArray(Charsets.UTF_8)
+    private fun makeFieldKey(id: String, field: String) = "${keyPrefix}f:${escape(field)}:${escape(id)}".toByteArray(Charsets.UTF_8)
 
     private suspend fun hydrateFromDisk() = withContext(Dispatchers.IO) {
         if (indexFile.exists()) {
@@ -444,7 +457,8 @@ class KoreVectorCollection(
             val fullKey = String(keyBytes, Charsets.UTF_8)
             if (fullKey.contains(":f:")) continue // Skip multi-vector field keys
             
-            val id = fullKey.removePrefix(keyPrefix)
+            val escapedId = fullKey.removePrefix(keyPrefix)
+            val id = unescape(escapedId)
             if (hnsw.contains(id)) continue
 
             val value = db.getRaw(keyBytes)
@@ -476,7 +490,8 @@ class KoreVectorCollection(
         val rawResults = db.searchVectorsRaw(prefix, query, limit)
 
         return rawResults.mapNotNull {
-            val id = String(it.first, Charsets.UTF_8).removePrefix(keyPrefix)
+            val escapedId = String(it.first, Charsets.UTF_8).removePrefix(keyPrefix)
+            val id = unescape(escapedId)
             if (!filter.isEmpty()) {
                 val meta = loadMetadataFromDb(id)
                 if (!filter.matches(meta)) return@mapNotNull null

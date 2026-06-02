@@ -31,6 +31,10 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.PriorityQueue
@@ -55,19 +59,26 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 class KoreDB(val directory: File) {
 
+    @Volatile
     private var memTable = MemTable()
+
+    @Volatile
+    private var immutableMemTable: MemTable? = null
+    
     private val sstFileCounter = AtomicInteger(0)
     private val MEMTABLE_FLUSH_THRESHOLD_BYTES = 16 * 1024 * 1024
 
     private val walFile: File
-    private lateinit var wal: WriteAheadLog
+    @Volatile
+    private var wal: WriteAheadLog
 
     private val writeMutex = kotlinx.coroutines.sync.Mutex()
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val sstReaders = mutableListOf<SSTableReader>()
 
     @Volatile
-    private var isCompacting = false
+    internal var isCompacting = false
 
     init {
         // Ensure the storage directory exists.
@@ -120,7 +131,8 @@ class KoreDB(val directory: File) {
      */
     private fun writeManifest() {
         val tempManifest = File(directory, "MANIFEST.tmp")
-        tempManifest.writeText(sstReaders.joinToString("\n") { it.file.name })
+        val readersSnapshot = synchronized(sstReaders) { sstReaders.toList() }
+        tempManifest.writeText(readersSnapshot.joinToString("\n") { it.file.name })
 
         // Force the manifest update to physical storage.
         java.io.RandomAccessFile(tempManifest, "rw").use { raf ->
@@ -153,32 +165,6 @@ class KoreDB(val directory: File) {
     }
 
     /**
-     * Replays the Write-Ahead Log to populate the MemTable during initialization.
-     */
-    private fun restoreFromWal() {
-        if (!walFile.exists()) return
-
-        try {
-            val raf = RandomAccessFile(walFile, "r")
-            while (raf.filePointer < raf.length()) {
-                val keySize = raf.readInt()
-                val valueSize = raf.readInt()
-
-                val key = ByteArray(keySize)
-                raf.readFully(key)
-
-                val value = ByteArray(valueSize)
-                raf.readFully(value)
-
-                memTable.put(key, value)
-            }
-            raf.close()
-        } catch (e: Exception) {
-            // Stop recovery at the first sign of log corruption.
-        }
-    }
-
-    /**
      * Writes a batch of entries to the database. 
      * The operation is first logged to the WAL, then applied to the MemTable.
      *
@@ -189,9 +175,14 @@ class KoreDB(val directory: File) {
      * @param urgent If true, forces an immediate hardware-level sync of the WAL.
      */
     suspend fun writeBatchRaw(batch: List<Pair<ByteArray, ByteArray>>,
-                              urgent: Boolean = false) = writeMutex.withLock {
+                               urgent: Boolean = false) = writeMutex.withLock {
 
         withContext(Dispatchers.IO) {
+            // Wait if a background flush is already in progress and the active memTable is full
+            while (immutableMemTable != null) {
+                delay(10)
+            }
+
             wal.appendBatch(batch)
 
             // Bulk insert: single atomic size update instead of N individual updates
@@ -201,9 +192,9 @@ class KoreDB(val directory: File) {
                 wal.flush()
             }
 
-            // Trigger a flush to disk if the MemTable has grown beyond its capacity.
+            // Trigger an asynchronous flush to disk if the MemTable has grown beyond its capacity.
             if (memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
-                flushMemTableInternal()
+                triggerBackgroundFlush()
             }
         }
     }
@@ -234,9 +225,24 @@ class KoreDB(val directory: File) {
             return if (ramResult.isEmpty()) null else ramResult
         }
 
+        // Tier 1.5 & Tier 2: Atomic retrieval of immutable MemTable and SSTable snapshot
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
+
+        if (imm != null) {
+            val immResult = imm.get(key)
+            if (immResult != null) {
+                return if (immResult.isEmpty()) null else immResult
+            }
+        }
+
         // Tier 2: SSTable lookup (Newest to Oldest)
-        for (i in sstReaders.indices.reversed()) {
-            val reader = sstReaders[i]
+        for (i in readersSnapshot.indices.reversed()) {
+            val reader = readersSnapshot[i]
             
             // Fast path: skip segments where the key is definitively out of bounds
             if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, key) < 0) continue
@@ -250,26 +256,25 @@ class KoreDB(val directory: File) {
         return null
     }
 
-    /**
-     * Flushes the current MemTable to a new SSTable segment on disk.
-     * This process involves rotating the WAL and updating the MANIFEST.
-     *
-     * (Internal visibility for testing)
-     */
     internal suspend fun flushMemTableInternal() = withContext(Dispatchers.IO) {
-        val sstFile = File(directory, "segment_${sstFileCounter.getAndIncrement()}.sst")
-
-        // Write the sorted MemTable to disk and register the new reader.
-        SSTable.writeFromMemTable(memTable, sstFile)
-        sstReaders.add(SSTableReader(sstFile))
-
-        // Commit the new segment list to the MANIFEST.
-        writeManifest()
-
-        // Rotate the WAL: Close the current log, rename it, and initialize a new one.
-        if (this@KoreDB::wal.isInitialized) {
-            wal.close()
+        while (immutableMemTable != null) {
+            delay(10)
         }
+        triggerBackgroundFlush()
+        while (immutableMemTable != null) {
+            delay(10)
+        }
+    }
+
+    /**
+     * Initiates a background asynchronous MemTable flush and WAL rotation.
+     */
+    private fun triggerBackgroundFlush() {
+        val oldMemTable = memTable
+        memTable = MemTable()
+        immutableMemTable = oldMemTable
+
+        wal.close()
 
         val oldWalFile = File(directory, "kore.wal.old")
         if (walFile.exists()) {
@@ -280,22 +285,29 @@ class KoreDB(val directory: File) {
         wal = WriteAheadLog(walFile)
         fsyncDirectory()
 
-        // Clean up the old WAL now that data is safely in the SSTable.
-        if (oldWalFile.exists()) {
-            oldWalFile.delete()
-        }
-
-        memTable.clear()
-
-        // Check if the number of segments warrants a compaction run.
-        if (sstReaders.size >= COMPACTION_THRESHOLD) {
-            if (!isCompacting) {
-                isCompacting = true
-                try {
-                    performCompaction()
-                } finally {
-                    isCompacting = false
+        backgroundScope.launch {
+            try {
+                val sstFile = File(directory, "segment_${sstFileCounter.getAndIncrement()}.sst")
+                SSTable.writeFromMemTable(oldMemTable, sstFile)
+                
+                val newReader = SSTableReader(sstFile)
+                synchronized(sstReaders) {
+                    sstReaders.add(newReader)
+                    immutableMemTable = null
                 }
+
+                writeManifest()
+
+                if (oldWalFile.exists()) {
+                    oldWalFile.delete()
+                }
+            } catch (e: Exception) {
+                println("❌ Background flush failed: ${e.message}")
+            } finally {
+                synchronized(sstReaders) {
+                    immutableMemTable = null
+                }
+                checkAndTriggerCompaction()
             }
         }
     }
@@ -303,16 +315,14 @@ class KoreDB(val directory: File) {
     /**
      * Merges multiple SSTable segments into a single, optimized segment.
      * This reduces disk usage by removing stale versions and tombstones.
-     *
-     * (Internal visibility for testing)
      */
     internal fun performCompaction() {
         println("🚧 STARTING COMPACTION...")
         val compactedFile = File(directory, "compacted_${System.currentTimeMillis()}.sst")
 
+        val readersSnapshot = synchronized(sstReaders) { sstReaders.toList() }
         // Pass a "Truth Oracle" to the compactor so it can drop stale index entries.
-        Compactor.compact(sstReaders, compactedFile) { rptrKey ->
-            // Use getRaw to check the most recent value for a reverse pointer.
+        Compactor.compact(readersSnapshot, compactedFile) { rptrKey ->
             getRaw(rptrKey)
         }
 
@@ -322,17 +332,40 @@ class KoreDB(val directory: File) {
         }
 
         val newReader = SSTableReader(compactedFile)
-        val oldReaders = sstReaders.toList()
 
         // Replace old readers with the new compacted reader.
-        sstReaders.clear()
-        sstReaders.add(newReader)
+        synchronized(sstReaders) {
+            val insertIndex = sstReaders.indexOfFirst { it in readersSnapshot }.coerceAtLeast(0)
+            sstReaders.removeAll(readersSnapshot)
+            sstReaders.add(insertIndex, newReader)
+        }
 
         writeManifest()
 
         // Delete the redundant source files.
-        oldReaders.forEach { it.file.delete() }
+        readersSnapshot.forEach { it.file.delete() }
         println("♻️ COMPACTION COMPLETE.")
+    }
+
+    /**
+     * Checks segment count and triggers background compaction if needed.
+     */
+    private fun checkAndTriggerCompaction() {
+        val sstCount = synchronized(sstReaders) { sstReaders.size }
+        if (sstCount >= COMPACTION_THRESHOLD) {
+            if (!isCompacting) {
+                isCompacting = true
+                backgroundScope.launch {
+                    try {
+                        performCompaction()
+                    } catch (e: Exception) {
+                        println("❌ Compaction failed: ${e.message}")
+                    } finally {
+                        isCompacting = false
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -349,14 +382,18 @@ class KoreDB(val directory: File) {
      */
     fun getRangeRaw(startKey: ByteArray, endKey: ByteArray): List<ByteArray> {
         val iterators = PriorityQueue<KoreIterator>()
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
 
         // 1. Initialize SSTable iterators
-        for (i in sstReaders.indices) {
-            val reader = sstReaders[i]
+        for (i in readersSnapshot.indices) {
+            val reader = readersSnapshot[i]
             
             // Fast path: skip segments that do not overlap with the range
-            // maxKey < startKey -> entirely before range
-            // minKey >= endKey -> entirely after range (endKey is exclusive)
             if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, startKey) < 0) continue
             if (reader.minKey != null && ByteArrayComparator.compare(reader.minKey!!, endKey) >= 0) continue
 
@@ -365,14 +402,20 @@ class KoreDB(val directory: File) {
             if (it.currentKey != null) iterators.add(it)
         }
 
-        // 2. Initialize MemTable iterator (highest priority)
-        val memIt = MemTableIterator(memTable.getTailEntries(startKey).iterator(), sstReaders.size, endKey)
+        // 2. Initialize Immutable MemTable iterator (priority: readersSnapshot.size)
+        if (imm != null) {
+            val immIt = MemTableIterator(imm.getTailEntries(startKey).iterator(), readersSnapshot.size, endKey)
+            if (immIt.currentKey != null) iterators.add(immIt)
+        }
+
+        // 3. Initialize MemTable iterator (highest priority)
+        val memIt = MemTableIterator(memTable.getTailEntries(startKey).iterator(), readersSnapshot.size + 1, endKey)
         if (memIt.currentKey != null) iterators.add(memIt)
 
         val results = mutableListOf<ByteArray>()
         var lastKey: ByteArray? = null
 
-        // 3. K-Way Merge Loop
+        // 4. K-Way Merge Loop
         while (iterators.isNotEmpty()) {
             val top = iterators.poll()!!
             val key = top.currentKey!!
@@ -399,9 +442,15 @@ class KoreDB(val directory: File) {
      */
     fun getRangeWithKeysRaw(startKey: ByteArray, endKey: ByteArray): List<Pair<ByteArray, ByteArray>> {
         val iterators = PriorityQueue<KoreIterator>()
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
 
-        for (i in sstReaders.indices) {
-            val reader = sstReaders[i]
+        for (i in readersSnapshot.indices) {
+            val reader = readersSnapshot[i]
             
             if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, startKey) < 0) continue
             if (reader.minKey != null && ByteArrayComparator.compare(reader.minKey!!, endKey) >= 0) continue
@@ -411,7 +460,12 @@ class KoreDB(val directory: File) {
             if (it.currentKey != null) iterators.add(it)
         }
 
-        val memIt = MemTableIterator(memTable.getTailEntries(startKey).iterator(), sstReaders.size, endKey)
+        if (imm != null) {
+            val immIt = MemTableIterator(imm.getTailEntries(startKey).iterator(), readersSnapshot.size, endKey)
+            if (immIt.currentKey != null) iterators.add(immIt)
+        }
+
+        val memIt = MemTableIterator(memTable.getTailEntries(startKey).iterator(), readersSnapshot.size + 1, endKey)
         if (memIt.currentKey != null) iterators.add(memIt)
 
         val results = mutableListOf<Pair<ByteArray, ByteArray>>()
@@ -456,10 +510,16 @@ class KoreDB(val directory: File) {
         val actualEndKey = if (carry) null else endKey
         
         val iterators = PriorityQueue<KoreIterator>()
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
 
         // 1. Initialize SSTable iterators
-        for (i in sstReaders.indices) {
-            val reader = sstReaders[i]
+        for (idx in readersSnapshot.indices) {
+            val reader = readersSnapshot[idx]
             
             // Fast path: skip segments that do not overlap with the prefix
             if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, prefix) < 0) continue
@@ -469,14 +529,22 @@ class KoreDB(val directory: File) {
             if (!reader.mightContain(prefix)) continue
 
             val offset = reader.findBlockStartOffset(prefix)
-            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = prefix, endKey = actualEndKey)
+            val it = SSTableIterator(reader, priority = idx, startOffset = offset, startKey = prefix, endKey = actualEndKey)
             if (it.currentKey != null && it.currentKey!!.startsWith(prefix)) {
                 iterators.add(it)
             }
         }
 
-        // 2. Initialize MemTable iterator
-        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), sstReaders.size, actualEndKey)
+        // 2. Initialize Immutable MemTable iterator
+        if (imm != null) {
+            val immIt = MemTableIterator(imm.getTailEntries(prefix).iterator(), readersSnapshot.size, actualEndKey)
+            if (immIt.currentKey != null && immIt.currentKey!!.startsWith(prefix)) {
+                iterators.add(immIt)
+            }
+        }
+
+        // 3. Initialize MemTable iterator
+        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), readersSnapshot.size + 1, actualEndKey)
         if (memIt.currentKey != null && memIt.currentKey!!.startsWith(prefix)) {
             iterators.add(memIt)
         }
@@ -524,9 +592,15 @@ class KoreDB(val directory: File) {
         val actualEndKey = if (carry) null else endKey
 
         val iterators = PriorityQueue<KoreIterator>()
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
 
-        for (i in sstReaders.indices) {
-            val reader = sstReaders[i]
+        for (idx in readersSnapshot.indices) {
+            val reader = readersSnapshot[idx]
             
             if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, prefix) < 0) continue
             if (reader.minKey != null && actualEndKey != null && ByteArrayComparator.compare(reader.minKey!!, actualEndKey) >= 0) continue
@@ -534,13 +608,20 @@ class KoreDB(val directory: File) {
             if (!reader.mightContain(prefix)) continue
 
             val offset = reader.findBlockStartOffset(prefix)
-            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = prefix, endKey = actualEndKey)
+            val it = SSTableIterator(reader, priority = idx, startOffset = offset, startKey = prefix, endKey = actualEndKey)
             if (it.currentKey != null && it.currentKey!!.startsWith(prefix)) {
                 iterators.add(it)
             }
         }
 
-        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), sstReaders.size, actualEndKey)
+        if (imm != null) {
+            val immIt = MemTableIterator(imm.getTailEntries(prefix).iterator(), readersSnapshot.size, actualEndKey)
+            if (immIt.currentKey != null && immIt.currentKey!!.startsWith(prefix)) {
+                iterators.add(immIt)
+            }
+        }
+
+        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), readersSnapshot.size + 1, actualEndKey)
         if (memIt.currentKey != null && memIt.currentKey!!.startsWith(prefix)) {
             iterators.add(memIt)
         }
@@ -596,9 +677,15 @@ class KoreDB(val directory: File) {
         val actualEndKey = if (carry) null else endKey
 
         val iterators = PriorityQueue<KoreIterator>()
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
 
-        for (i in sstReaders.indices) {
-            val reader = sstReaders[i]
+        for (idx in readersSnapshot.indices) {
+            val reader = readersSnapshot[idx]
             
             // Fast path: skip segments that do not overlap with the prefix
             if (reader.maxKey != null && ByteArrayComparator.compare(reader.maxKey!!, prefix) < 0) continue
@@ -608,13 +695,20 @@ class KoreDB(val directory: File) {
             if (!reader.mightContain(prefix)) continue
 
             val offset = reader.findBlockStartOffset(prefix)
-            val it = SSTableIterator(reader, priority = i, startOffset = offset, startKey = prefix, endKey = actualEndKey)
+            val it = SSTableIterator(reader, priority = idx, startOffset = offset, startKey = prefix, endKey = actualEndKey)
             if (it.currentKey != null && it.currentKey!!.startsWith(prefix)) {
                 iterators.add(it)
             }
         }
 
-        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), sstReaders.size, actualEndKey)
+        if (imm != null) {
+            val immIt = MemTableIterator(imm.getTailEntries(prefix).iterator(), readersSnapshot.size, actualEndKey)
+            if (immIt.currentKey != null && immIt.currentKey!!.startsWith(prefix)) {
+                iterators.add(immIt)
+            }
+        }
+
+        val memIt = MemTableIterator(memTable.getTailEntries(prefix).iterator(), readersSnapshot.size + 1, actualEndKey)
         if (memIt.currentKey != null && memIt.currentKey!!.startsWith(prefix)) {
             iterators.add(memIt)
         }
@@ -656,8 +750,15 @@ class KoreDB(val directory: File) {
         val topKHeap = java.util.PriorityQueue<Pair<ByteArray, Float>>(compareBy { it.second })
         val queryMag = VectorMath.getMagnitude(query)
 
+        val imm: MemTable?
+        val readersSnapshot: List<SSTableReader>
+        synchronized(sstReaders) {
+            imm = immutableMemTable
+            readersSnapshot = sstReaders.toList()
+        }
+
         // 🚀 PARALLEL SSTABLE SCAN
-        val sstResults = sstReaders.map { reader ->
+        val sstResults = readersSnapshot.map { reader ->
             async(Dispatchers.Default) {
                 reader.findTopVectors(prefix, query, limit)
             }
@@ -673,8 +774,26 @@ class KoreDB(val directory: File) {
             }
         }
 
-        // 🏎️ OPTIMIZED MEMTABLE SCAN
-        for (entry in memTable.getTailEntries(prefix)) {
+        // 🏎️ OPTIMIZED IMMUTABLE MEMTABLE SCAN (if any)
+        if (imm != null) {
+            scanMemTableForVectors(imm, prefix, query, queryMag, limit, topKHeap)
+        }
+
+        // 🏎️ OPTIMIZED ACTIVE MEMTABLE SCAN
+        scanMemTableForVectors(memTable, prefix, query, queryMag, limit, topKHeap)
+
+        topKHeap.toList().sortedByDescending { it.second }
+    }
+
+    private fun scanMemTableForVectors(
+        mTable: MemTable,
+        prefix: ByteArray,
+        query: FloatArray,
+        queryMag: Float,
+        limit: Int,
+        topKHeap: PriorityQueue<Pair<ByteArray, Float>>
+    ) {
+        for (entry in mTable.getTailEntries(prefix)) {
             val keyBytes = entry.key
             
             // Inline Prefix Check
@@ -692,6 +811,7 @@ class KoreDB(val directory: File) {
                 val buf = java.nio.ByteBuffer.wrap(valBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                 val storedMag = buf.getFloat()
                 val vectorLength = (valBytes.size - 4) / 4
+                if (query.size != vectorLength) continue
 
                 val dot = VectorMath.dotProduct(query, buf, 4, vectorLength)
                 val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
@@ -704,8 +824,6 @@ class KoreDB(val directory: File) {
                 }
             }
         }
-
-        topKHeap.toList().sortedByDescending { it.second }
     }
 
     /**
@@ -720,11 +838,14 @@ class KoreDB(val directory: File) {
      */
     fun nuke() {
         wal.close()
-        sstReaders.clear()
+        synchronized(sstReaders) {
+            sstReaders.clear()
+        }
 
         directory.listFiles()?.forEach { it.delete() }
 
         memTable.clear()
+        immutableMemTable = null
         sstFileCounter.set(0)
 
         val walFile = File(directory, "kore.wal")

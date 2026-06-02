@@ -49,12 +49,14 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
 }
 
-// Dokka 2.x configuration
+// Dokka 2.x configuration - using defaults
+/*
 dokka {
     dokkaSourceSets.register("main") {
         sourceRoots.from(file("src/main/java"))
     }
 }
+*/
 
 // --- Apply Maven Publishing Logic ---
 // This file is git-ignored to keep the main build script clean

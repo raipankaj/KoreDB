@@ -48,6 +48,14 @@ class GraphStorage(val db: KoreDB) {
      */
     private val PRESENCE_MARKER = ByteArray(1) { 1 }
 
+    private fun escape(value: String): String {
+        return value.replace("%", "%25").replace(":", "%3A")
+    }
+
+    private fun unescape(value: String): String {
+        return value.replace("%3A", ":").replace("%25", "%")
+    }
+
     // --- NODE OPERATIONS ---
 
     /**
@@ -58,24 +66,24 @@ class GraphStorage(val db: KoreDB) {
     suspend fun putNode(node: Node) {
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
         
-        val nodeKey = "g:v:${node.id}".toByteArray(Charsets.UTF_8)
+        val nodeKey = "g:v:${escape(node.id)}".toByteArray(Charsets.UTF_8)
         val nodeValue = json.encodeToString(node).toByteArray(Charsets.UTF_8)
         
         batch.add(Pair(nodeKey, nodeValue))
         
         for (label in node.labels) {
             // Index nodes by their labels for category-based scans.
-            val labelKey = "g:idx:v:$label:${node.id}".toByteArray(Charsets.UTF_8)
+            val labelKey = "g:idx:v:${escape(label)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
             batch.add(Pair(labelKey, PRESENCE_MARKER))
             
             // Build indices for equality-based property lookups.
             for ((key, value) in node.properties) {
                 // 1. Forward Index (sidx)
-                val propKey = "g:idx:v_prop:$label:$key:$value:${node.id}".toByteArray(Charsets.UTF_8)
+                val propKey = "g:idx:v_prop:${escape(label)}:${escape(key)}:${escape(value)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(propKey, PRESENCE_MARKER))
 
                 // 2. Reverse Pointer (Truth Oracle)
-                val rptrKey = "g:rptr:v_prop:$label:$key:${node.id}".toByteArray(Charsets.UTF_8)
+                val rptrKey = "g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(rptrKey, value.toByteArray(Charsets.UTF_8)))
             }
         }
@@ -90,7 +98,7 @@ class GraphStorage(val db: KoreDB) {
      * @return The [Node] object, or null if it does not exist.
      */
     fun getNode(id: String): Node? {
-        val bytes = db.getRaw("g:v:$id".toByteArray(Charsets.UTF_8)) ?: return null
+        val bytes = db.getRaw("g:v:${escape(id)}".toByteArray(Charsets.UTF_8)) ?: return null
         if (bytes.isEmpty()) return null
         return json.decodeFromString<Node>(String(bytes, Charsets.UTF_8))
     }
@@ -108,16 +116,16 @@ class GraphStorage(val db: KoreDB) {
      * @return A list of matching [Node] objects.
      */
     fun getNodesByProperty(label: String, propertyKey: String, propertyValue: String): List<Node> {
-        val prefix = "g:idx:v_prop:$label:$propertyKey:$propertyValue:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:idx:v_prop:${escape(label)}:${escape(propertyKey)}:${escape(propertyValue)}:".toByteArray(Charsets.UTF_8)
         
         val indexKeys = db.getKeysByPrefixRaw(prefix)
         return indexKeys.mapNotNull { keyBytes ->
             val keyString = String(keyBytes, Charsets.UTF_8)
-            val nodeId = keyString.substringAfterLast(":")
+            val nodeId = unescape(keyString.substringAfterLast(":"))
             
             // 1. Validation using Reverse Pointer (The Truth Oracle)
             // Much faster than reading the full Node JSON.
-            val rptrKey = "g:rptr:v_prop:$label:$propertyKey:$nodeId".toByteArray(Charsets.UTF_8)
+            val rptrKey = "g:rptr:v_prop:${escape(label)}:${escape(propertyKey)}:${escape(nodeId)}".toByteArray(Charsets.UTF_8)
             val currentValueBytes = db.getRaw(rptrKey)
             
             if (currentValueBytes != null) {
@@ -146,15 +154,15 @@ class GraphStorage(val db: KoreDB) {
         val edgeValue = json.encodeToString(edge).toByteArray(Charsets.UTF_8)
         
         // Write the edge in both directions to support bidirectional traversals.
-        val outKey = "g:e:out:${edge.sourceId}:${edge.type}:${edge.targetId}".toByteArray(Charsets.UTF_8)
-        val inKey  = "g:e:in:${edge.targetId}:${edge.type}:${edge.sourceId}".toByteArray(Charsets.UTF_8)
+        val outKey = "g:e:out:${escape(edge.sourceId)}:${escape(edge.type)}:${escape(edge.targetId)}".toByteArray(Charsets.UTF_8)
+        val inKey  = "g:e:in:${escape(edge.targetId)}:${escape(edge.type)}:${escape(edge.sourceId)}".toByteArray(Charsets.UTF_8)
         
         batch.add(Pair(outKey, edgeValue))
         batch.add(Pair(inKey, edgeValue))
         
         // Maintain property indices for edges to support weighted traversal queries.
         for ((key, value) in edge.properties) {
-             val propKey = "g:idx:e_prop:${edge.type}:$key:$value:${edge.sourceId}:${edge.targetId}".toByteArray(Charsets.UTF_8)
+             val propKey = "g:idx:e_prop:${escape(edge.type)}:${escape(key)}:${escape(value)}:${escape(edge.sourceId)}:${escape(edge.targetId)}".toByteArray(Charsets.UTF_8)
              batch.add(Pair(propKey, PRESENCE_MARKER))
         }
         
@@ -165,8 +173,8 @@ class GraphStorage(val db: KoreDB) {
      * Atomically removes an edge and its bidirectional index entries.
      */
     suspend fun removeEdge(sourceId: String, type: String, targetId: String) {
-        val outKey = "g:e:out:$sourceId:$type:$targetId".toByteArray(Charsets.UTF_8)
-        val inKey  = "g:e:in:$targetId:$type:$sourceId".toByteArray(Charsets.UTF_8)
+        val outKey = "g:e:out:${escape(sourceId)}:${escape(type)}:${escape(targetId)}".toByteArray(Charsets.UTF_8)
+        val inKey  = "g:e:in:${escape(targetId)}:${escape(type)}:${escape(sourceId)}".toByteArray(Charsets.UTF_8)
         
         db.writeBatchRaw(listOf(
             outKey to KoreDB.TOMBSTONE,
@@ -178,7 +186,7 @@ class GraphStorage(val db: KoreDB) {
      * Retrieves all outgoing relationships of a specific type from a node.
      */
     fun getOutboundEdges(sourceId: String, type: String): List<Edge> {
-        val prefix = "g:e:out:$sourceId:$type:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:out:${escape(sourceId)}:${escape(type)}:".toByteArray(Charsets.UTF_8)
         val rawValues = db.getByPrefixRaw(prefix)
         return rawValues.map { json.decodeFromString<Edge>(String(it, Charsets.UTF_8)) }
     }
@@ -187,7 +195,7 @@ class GraphStorage(val db: KoreDB) {
      * Retrieves all incoming relationships of a specific type to a node.
      */
     fun getInboundEdges(targetId: String, type: String): List<Edge> {
-        val prefix = "g:e:in:$targetId:$type:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:in:${escape(targetId)}:${escape(type)}:".toByteArray(Charsets.UTF_8)
         val rawValues = db.getByPrefixRaw(prefix)
         return rawValues.map { json.decodeFromString<Edge>(String(it, Charsets.UTF_8)) }
     }
@@ -221,9 +229,9 @@ class GraphStorage(val db: KoreDB) {
      * @return A list of Node IDs.
      */
     fun getOutboundTargetIds(sourceId: String, type: String): List<String> {
-        val prefix = "g:e:out:$sourceId:$type:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:out:${escape(sourceId)}:${escape(type)}:".toByteArray(Charsets.UTF_8)
         return db.getKeysByPrefixRaw(prefix).map {
-            String(it, Charsets.UTF_8).substringAfterLast(":")
+            unescape(String(it, Charsets.UTF_8).substringAfterLast(":"))
         }
     }
 
@@ -233,9 +241,9 @@ class GraphStorage(val db: KoreDB) {
      * @return A list of Node IDs.
      */
     fun getInboundSourceIds(targetId: String, type: String): List<String> {
-        val prefix = "g:e:in:$targetId:$type:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:in:${escape(targetId)}:${escape(type)}:".toByteArray(Charsets.UTF_8)
         return db.getKeysByPrefixRaw(prefix).map {
-            String(it, Charsets.UTF_8).substringAfterLast(":")
+            unescape(String(it, Charsets.UTF_8).substringAfterLast(":"))
         }
     }
 
@@ -259,7 +267,7 @@ class GraphStorage(val db: KoreDB) {
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
 
         // 1. Remove all outbound edges
-        val outPrefix = "g:e:out:$nodeId:".toByteArray(Charsets.UTF_8)
+        val outPrefix = "g:e:out:${escape(nodeId)}:".toByteArray(Charsets.UTF_8)
         val outKeys = db.getKeysByPrefixRaw(outPrefix)
         for (keyBytes in outKeys) {
             val keyStr = String(keyBytes, Charsets.UTF_8)
@@ -267,39 +275,39 @@ class GraphStorage(val db: KoreDB) {
             // Parse "g:e:out:sourceId:type:targetId" to build the corresponding in-key
             val parts = keyStr.split(":")
             if (parts.size >= 6) {
-                val type = parts[4]
-                val targetId = parts[5]
-                val inKey = "g:e:in:$targetId:$type:$nodeId".toByteArray(Charsets.UTF_8)
+                val type = parts[4] // Already escaped
+                val targetId = parts[5] // Already escaped
+                val inKey = "g:e:in:$targetId:$type:${escape(nodeId)}".toByteArray(Charsets.UTF_8)
                 batch.add(inKey to KoreDB.TOMBSTONE)
             }
         }
 
         // 2. Remove all inbound edges
-        val inPrefix = "g:e:in:$nodeId:".toByteArray(Charsets.UTF_8)
+        val inPrefix = "g:e:in:${escape(nodeId)}:".toByteArray(Charsets.UTF_8)
         val inKeys = db.getKeysByPrefixRaw(inPrefix)
         for (keyBytes in inKeys) {
             val keyStr = String(keyBytes, Charsets.UTF_8)
             batch.add(keyBytes to KoreDB.TOMBSTONE)
             val parts = keyStr.split(":")
             if (parts.size >= 6) {
-                val type = parts[4]
-                val sourceId = parts[5]
-                val outKey = "g:e:out:$sourceId:$type:$nodeId".toByteArray(Charsets.UTF_8)
+                val type = parts[4] // Already escaped
+                val sourceId = parts[5] // Already escaped
+                val outKey = "g:e:out:$sourceId:$type:${escape(nodeId)}".toByteArray(Charsets.UTF_8)
                 batch.add(outKey to KoreDB.TOMBSTONE)
             }
         }
 
         // 3. Remove label indexes and property indexes
         for (label in node.labels) {
-            batch.add("g:idx:v:$label:$nodeId".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
+            batch.add("g:idx:v:${escape(label)}:${escape(nodeId)}".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
             for ((key, value) in node.properties) {
-                batch.add("g:idx:v_prop:$label:$key:$value:$nodeId".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
-                batch.add("g:rptr:v_prop:$label:$key:$nodeId".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
+                batch.add("g:idx:v_prop:${escape(label)}:${escape(key)}:${escape(value)}:${escape(nodeId)}".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
+                batch.add("g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(nodeId)}".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
             }
         }
 
         // 4. Remove the node itself
-        batch.add("g:v:$nodeId".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
+        batch.add("g:v:${escape(nodeId)}".toByteArray(Charsets.UTF_8) to KoreDB.TOMBSTONE)
 
         db.writeBatchRaw(batch)
         return true
@@ -315,15 +323,15 @@ class GraphStorage(val db: KoreDB) {
     suspend fun putNodes(nodes: List<Node>) {
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
         for (node in nodes) {
-            val nodeKey = "g:v:${node.id}".toByteArray(Charsets.UTF_8)
+            val nodeKey = "g:v:${escape(node.id)}".toByteArray(Charsets.UTF_8)
             val nodeValue = json.encodeToString(Node.serializer(), node).toByteArray(Charsets.UTF_8)
             batch.add(nodeKey to nodeValue)
 
             for (label in node.labels) {
-                batch.add("g:idx:v:$label:${node.id}".toByteArray(Charsets.UTF_8) to PRESENCE_MARKER)
+                batch.add("g:idx:v:${escape(label)}:${escape(node.id)}".toByteArray(Charsets.UTF_8) to PRESENCE_MARKER)
                 for ((key, value) in node.properties) {
-                    batch.add("g:idx:v_prop:$label:$key:$value:${node.id}".toByteArray(Charsets.UTF_8) to PRESENCE_MARKER)
-                    batch.add("g:rptr:v_prop:$label:$key:${node.id}".toByteArray(Charsets.UTF_8) to value.toByteArray(Charsets.UTF_8))
+                    batch.add("g:idx:v_prop:${escape(label)}:${escape(key)}:${escape(value)}:${escape(node.id)}".toByteArray(Charsets.UTF_8) to PRESENCE_MARKER)
+                    batch.add("g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(node.id)}".toByteArray(Charsets.UTF_8) to value.toByteArray(Charsets.UTF_8))
                 }
             }
         }
@@ -339,10 +347,10 @@ class GraphStorage(val db: KoreDB) {
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
         for (edge in edges) {
             val edgeValue = json.encodeToString(Edge.serializer(), edge).toByteArray(Charsets.UTF_8)
-            batch.add("g:e:out:${edge.sourceId}:${edge.type}:${edge.targetId}".toByteArray(Charsets.UTF_8) to edgeValue)
-            batch.add("g:e:in:${edge.targetId}:${edge.type}:${edge.sourceId}".toByteArray(Charsets.UTF_8) to edgeValue)
+            batch.add("g:e:out:${escape(edge.sourceId)}:${escape(edge.type)}:${escape(edge.targetId)}".toByteArray(Charsets.UTF_8) to edgeValue)
+            batch.add("g:e:in:${escape(edge.targetId)}:${escape(edge.type)}:${escape(edge.sourceId)}".toByteArray(Charsets.UTF_8) to edgeValue)
             for ((key, value) in edge.properties) {
-                batch.add("g:idx:e_prop:${edge.type}:$key:$value:${edge.sourceId}:${edge.targetId}".toByteArray(Charsets.UTF_8) to PRESENCE_MARKER)
+                batch.add("g:idx:e_prop:${escape(edge.type)}:${escape(key)}:${escape(value)}:${escape(edge.sourceId)}:${escape(edge.targetId)}".toByteArray(Charsets.UTF_8) to PRESENCE_MARKER)
             }
         }
         db.writeBatchRaw(batch)
@@ -354,9 +362,9 @@ class GraphStorage(val db: KoreDB) {
      * Retrieves all nodes with a given label using the label index.
      */
     fun getNodesByLabel(label: String): List<Node> {
-        val prefix = "g:idx:v:$label:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:idx:v:${escape(label)}:".toByteArray(Charsets.UTF_8)
         return db.getKeysByPrefixRaw(prefix).mapNotNull { keyBytes ->
-            val nodeId = String(keyBytes, Charsets.UTF_8).substringAfterLast(":")
+            val nodeId = unescape(String(keyBytes, Charsets.UTF_8).substringAfterLast(":"))
             getNode(nodeId)
         }
     }
@@ -365,11 +373,10 @@ class GraphStorage(val db: KoreDB) {
      * Returns all distinct outbound edge types from a given node.
      */
     fun getOutboundEdgeTypes(nodeId: String): List<String> {
-        val prefix = "g:e:out:$nodeId:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:out:${escape(nodeId)}:".toByteArray(Charsets.UTF_8)
         return db.getKeysByPrefixRaw(prefix).map { keyBytes ->
             val keyStr = String(keyBytes, Charsets.UTF_8)
-            // g:e:out:nodeId:TYPE:targetId → extract TYPE
-            keyStr.split(":").getOrElse(4) { "" }
+            unescape(keyStr.split(":").getOrElse(4) { "" })
         }.distinct()
     }
 
@@ -377,7 +384,7 @@ class GraphStorage(val db: KoreDB) {
      * Returns all outbound edges of ANY type from a given node.
      */
     fun getAllOutboundEdges(nodeId: String): List<Edge> {
-        val prefix = "g:e:out:$nodeId:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:out:${escape(nodeId)}:".toByteArray(Charsets.UTF_8)
         val rawValues = db.getByPrefixRaw(prefix)
         return rawValues.mapNotNull { bytes ->
             if (bytes.isEmpty()) null
@@ -389,7 +396,7 @@ class GraphStorage(val db: KoreDB) {
      * Returns all inbound edges of ANY type to a given node.
      */
     fun getAllInboundEdges(nodeId: String): List<Edge> {
-        val prefix = "g:e:in:$nodeId:".toByteArray(Charsets.UTF_8)
+        val prefix = "g:e:in:${escape(nodeId)}:".toByteArray(Charsets.UTF_8)
         val rawValues = db.getByPrefixRaw(prefix)
         return rawValues.mapNotNull { bytes ->
             if (bytes.isEmpty()) null

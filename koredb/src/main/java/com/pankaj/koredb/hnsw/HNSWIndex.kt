@@ -45,17 +45,43 @@ class HNSWIndex(
     // Metadata storage for filtered search
     private val metadata = ConcurrentHashMap<String, Map<String, Any>>()
 
+    // Dynamic training buffer for quantization calibration
+    private val trainingVectors = mutableListOf<FloatArray>()
+    private val TRAINING_THRESHOLD = 100
+
     /**
      * A node in the HNSW graph containing a vector and its neighbor connections.
      */
     class HNSWNode(
         val id: String,
-        val vector: FloatArray,
+        @Volatile var vector: FloatArray?,
         val magnitude: Float,
         val nodeLevel: Int,
-        val quantizedVector: ByteArray? = null
+        @Volatile var quantizedVector: ByteArray? = null
     ) {
         val neighbors = Array(nodeLevel + 1) { ConcurrentHashMap.newKeySet<String>() }
+    }
+
+    private fun trainQuantizerIfNeeded(newVector: FloatArray) {
+        val q = quantizer ?: return
+        if (q.isTrained()) return
+        
+        synchronized(trainingVectors) {
+            if (q.isTrained()) return
+            trainingVectors.add(newVector)
+            if (trainingVectors.size >= TRAINING_THRESHOLD) {
+                q.train(trainingVectors)
+                // Quantize all existing nodes
+                for (node in nodes.values) {
+                    val rawVec = node.vector
+                    if (rawVec != null) {
+                        node.quantizedVector = q.quantize(rawVec)
+                        node.vector = null // Free memory!
+                    }
+                }
+                trainingVectors.clear()
+            }
+        }
     }
 
     // ========================================================================
@@ -76,17 +102,19 @@ class HNSWIndex(
         
         if (meta != null) metadata[id] = meta
 
+        trainQuantizerIfNeeded(vector)
+
         val level = randomLevel()
-        val quantized = quantizer?.quantize(vector)
-        val newNode = HNSWNode(id, vector, magnitude, level, quantized)
+        val quantized = if (quantizer != null && quantizer.isTrained()) quantizer.quantize(vector) else null
+        val storedVector = if (quantizer != null && quantizer.isTrained()) null else vector
+        val newNode = HNSWNode(id, storedVector, magnitude, level, quantized)
         nodes[id] = newNode
 
         val startNode = entryNode.get()
-        if (startNode == null) {
-            if (entryNode.compareAndSet(null, newNode)) {
-                maxLevel.set(level)
-                return
-            }
+        if (startNode == null || startNode.id == id) {
+            entryNode.set(newNode)
+            maxLevel.set(maxOf(level, maxLevel.get()))
+            if (startNode == null) return
         }
 
         var currNode: HNSWNode = entryNode.get()!!
@@ -115,11 +143,8 @@ class HNSWIndex(
         for (l in minOf(level, maxLevel.get()) downTo 0) {
             // Ensure entry point for this layer actually exists at this level
             if (l > currNode.nodeLevel) {
-                // If currNode doesn't have this level, find a suitable entry point or skip
-                // This shouldn't happen with correct HNSW logic but serves as a safety.
                 currNode = entryNode.get()!!
                 while (l > currNode.nodeLevel && currNode.id != newNode.id) {
-                    // This is a fallback; in practice the greedy search above finds a node for the next level
                     break 
                 }
             }
@@ -129,7 +154,6 @@ class HNSWIndex(
 
             for (candidate in neighborsToConnect) {
                 val neighborNode = nodes[candidate.first] ?: continue
-                // Bi-directional connection only at levels both nodes share
                 if (l <= newNode.nodeLevel && l <= neighborNode.nodeLevel) {
                     connect(newNode, neighborNode, l)
                     connect(neighborNode, newNode, l)
@@ -183,6 +207,12 @@ class HNSWIndex(
         filter: VectorFilter = VectorFilter.EMPTY
     ): List<Pair<String, Float>> {
         val startNode = entryNode.get() ?: return emptyList()
+        val firstNode = nodes.values.firstOrNull()
+        val indexDim = firstNode?.vector?.size ?: firstNode?.quantizedVector?.size ?: 0
+        if (indexDim > 0 && query.size != indexDim) {
+            return emptyList()
+        }
+
         val queryMag = VectorMath.getMagnitude(query)
 
         var currNode = startNode
@@ -213,7 +243,6 @@ class HNSWIndex(
         val searchEf = if (filter.isEmpty()) {
             maxOf(efSearch, limit)
         } else {
-            // Over-fetch when filtering to ensure enough matching results
             maxOf(efSearch, limit * 4)
         }
 
@@ -271,7 +300,6 @@ class HNSWIndex(
         val removed = tombstones.size
         for (deadId in tombstones) {
             val deadNode = nodes.remove(deadId) ?: continue
-            // Remove all references to the dead node from its neighbors
             for (l in 0..deadNode.nodeLevel) {
                 for (neighborId in deadNode.neighbors[l]) {
                     val neighbor = nodes[neighborId] ?: continue
@@ -333,12 +361,10 @@ class HNSWIndex(
         while (candidates.isNotEmpty()) {
             val (currId, currDist) = candidates.poll()!!
             
-            // Early termination: if best candidate is worse than worst result
             if (results.size >= ef && currDist < results.peek()!!.second) break
             
             val currNode = nodes[currId] ?: continue
             
-            // Safety check: skip neighbor exploration if this node doesn't reach this level
             if (level > currNode.nodeLevel) continue
 
             for (neighborId in currNode.neighbors[level]) {
@@ -354,7 +380,6 @@ class HNSWIndex(
                 if (results.size < ef || dist > worstResult) {
                     candidates.add(neighborId to dist)
                     
-                    // Only add to results if it passes the metadata filter
                     if (filter.matches(metadata[neighborId])) {
                         results.add(neighborId to dist)
                         if (results.size > ef) results.poll()
@@ -384,12 +409,10 @@ class HNSWIndex(
             val best = remaining.removeFirst()
             selected.add(best)
 
-            // Remove candidates that are closer to an already-selected node
-            // than to the query (diversity heuristic)
             val bestNode = nodes[best.first] ?: continue
             remaining.removeAll { candidate ->
                 val candidateNode = nodes[candidate.first] ?: return@removeAll true
-                val distToSelected = metric.compute(bestNode.vector, candidateNode.vector)
+                val distToSelected = distanceBetweenNodes(bestNode, candidateNode)
                 distToSelected > candidate.second
             }
         }
@@ -411,15 +434,50 @@ class HNSWIndex(
         val sorted = connections.mapNotNull { id ->
             if (id in tombstones) return@mapNotNull null
             val neighbor = nodes[id] ?: return@mapNotNull null
-            id to distance(node.vector, node.magnitude, neighbor)
+            id to distanceBetweenNodes(node, neighbor)
         }.sortedByDescending { it.second }
 
-        connections.clear()
-        sorted.take(maxNeighbors).forEach { connections.add(it.first) }
+        val toKeep = sorted.take(maxNeighbors).map { it.first }.toSet()
+        val toRemove = connections.filter { it !in toKeep }
+        for (id in toRemove) {
+            connections.remove(id)
+        }
     }
 
     private fun distance(v: FloatArray, mag: Float, node: HNSWNode): Float {
-        return metric.computeWithMagnitudes(v, mag, node.vector, node.magnitude)
+        val qVec = node.quantizedVector
+        val rawVec = node.vector
+        return if (qVec != null && quantizer != null) {
+            quantizer.computeDistance(v, qVec, metric)
+        } else if (rawVec != null) {
+            metric.computeWithMagnitudes(v, mag, rawVec, node.magnitude)
+        } else {
+            val decompressed = quantizer?.dequantize(qVec!!) ?: FloatArray(0)
+            metric.compute(v, decompressed)
+        }
+    }
+
+    private fun distanceBetweenNodes(n1: HNSWNode, n2: HNSWNode): Float {
+        val v1 = n1.vector
+        val v2 = n2.vector
+        val q1 = n1.quantizedVector
+        val q2 = n2.quantizedVector
+        val quant = quantizer
+
+        return when {
+            v1 != null && v2 != null -> metric.computeWithMagnitudes(v1, n1.magnitude, v2, n2.magnitude)
+            v1 != null && q2 != null && quant != null -> quant.computeDistance(v1, q2, metric)
+            v2 != null && q1 != null && quant != null -> quant.computeDistance(v2, q1, metric)
+            q1 != null && q2 != null && quant != null -> {
+                val decompressed = quant.dequantize(q1)
+                quant.computeDistance(decompressed, q2, metric)
+            }
+            else -> {
+                val raw1 = v1 ?: quant?.dequantize(q1!!) ?: FloatArray(0)
+                val raw2 = v2 ?: quant?.dequantize(q2!!) ?: FloatArray(0)
+                metric.compute(raw1, raw2)
+            }
+        }
     }
 
     private fun randomLevel(): Int {
@@ -501,8 +559,9 @@ class HNSWIndex(
             
             for ((id, node) in activeNodes) {
                 out.writeUTF(id)
-                out.writeInt(node.vector.size)
-                for (f in node.vector) out.writeFloat(f)
+                val vector = node.vector ?: quantizer?.dequantize(node.quantizedVector!!) ?: FloatArray(0)
+                out.writeInt(vector.size)
+                for (f in vector) out.writeFloat(f)
                 out.writeFloat(node.magnitude)
                 out.writeInt(node.nodeLevel)
 
@@ -546,7 +605,6 @@ class HNSWIndex(
             
             if (version >= 2) {
                 val savedMetric = input.readUTF()
-                // Validate metric matches
             }
 
             val hasEntry = input.readBoolean()
@@ -561,7 +619,6 @@ class HNSWIndex(
                     val max = FloatArray(dims) { input.readFloat() }
                     quantizer.loadCalibration(min, max)
                 } else if (hasQuantizer) {
-                    // Skip quantizer data
                     val dims = input.readInt()
                     repeat(dims * 2) { input.readFloat() }
                 }
@@ -580,7 +637,8 @@ class HNSWIndex(
                 val level = input.readInt()
 
                 val quantized = quantizer?.quantize(vector)
-                val node = HNSWNode(id, vector, magnitude, level, quantized)
+                val storedVector = if (quantizer != null && quantizer.isTrained()) null else vector
+                val node = HNSWNode(id, storedVector, magnitude, level, quantized)
                 
                 for (l in 0..level) {
                     val neighborCount = input.readInt()

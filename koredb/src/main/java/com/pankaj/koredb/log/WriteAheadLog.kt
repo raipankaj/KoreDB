@@ -143,75 +143,6 @@ class WriteAheadLog(private val logFile: File) {
         channel.close()
     }
 
-    /**
-     * Replays the log from the beginning, invoking [consumer] for each committed record.
-     *
-     * This method provides an internal mechanism for data recovery using the 
-     * already opened channel.
-     */
-    fun replay(consumer: (ByteArray, ByteArray) -> Unit) {
-        channel.position(0)
-        val tempBatch = mutableListOf<Pair<ByteArray, ByteArray>>()
-        val batchCrc = CRC32()
-
-        try {
-            while (channel.position() < channel.size()) {
-                val typeBuf = ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                if (channel.read(typeBuf) < 4) break 
-                typeBuf.flip()
-
-                when (typeBuf.int) {
-                    RECORD_BEGIN -> {
-                        tempBatch.clear()
-                        batchCrc.reset()
-                    }
-
-                    RECORD_PUT -> {
-                        val meta = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        if (channel.read(meta) < 8) break
-                        meta.flip()
-
-                        val keySize = meta.int
-                        val valueSize = meta.int
-
-                        if (keySize < 0 || valueSize < 0 || keySize > MAX_RECORD_SIZE || valueSize > MAX_RECORD_SIZE) break
-                        if (channel.position() + keySize + valueSize > channel.size()) break
-
-                        val key = ByteArray(keySize)
-                        val value = ByteArray(valueSize)
-
-                        val keyBuffer = ByteBuffer.wrap(key)
-                        while (keyBuffer.hasRemaining()) { if (channel.read(keyBuffer) <= 0) break }
-                        val valueBuffer = ByteBuffer.wrap(value)
-                        while (valueBuffer.hasRemaining()) { if (channel.read(valueBuffer) <= 0) break }
-
-                        batchCrc.update(key)
-                        batchCrc.update(value)
-                        tempBatch.add(key to value)
-                    }
-
-                    BATCH_CRC -> {
-                        val crcBuf = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        if (channel.read(crcBuf) < 8) break
-                        crcBuf.flip()
-                        val storedCrc = crcBuf.long
-                        if (storedCrc != batchCrc.value) {
-                            println("⚠️ BATCH CRC mismatch. Recovery halted.")
-                            break
-                        }
-                    }
-
-                    RECORD_COMMIT -> {
-                        tempBatch.forEach { consumer(it.first, it.second) }
-                        tempBatch.clear()
-                    }
-                    else -> break
-                }
-            }
-        } catch (e: Exception) {
-            println("⚠️ WAL recovery encountered an error; safely ignoring trailing bytes.")
-        }
-    }
 
     companion object {
         private const val RECORD_BEGIN = 1
@@ -226,7 +157,8 @@ class WriteAheadLog(private val logFile: File) {
         private const val MAX_RECORD_SIZE = 50_000_000
 
         /**
-         * Static recovery method that opens an isolated, read-only view of the log file.
+         * Static recovery method that opens an isolated, read-write view of the log file.
+         * Replays valid commits and truncates any corrupted or incomplete trailing transactions.
          *
          * @param logFile The WAL file to replay.
          * @param consumer Callback for each recovered key-value pair.
@@ -234,7 +166,8 @@ class WriteAheadLog(private val logFile: File) {
         fun replay(logFile: File, consumer: (ByteArray, ByteArray) -> Unit) {
             if (!logFile.exists()) return
 
-            RandomAccessFile(logFile, "r").use { raf ->
+            var lastValidPosition = 0L
+            RandomAccessFile(logFile, "rw").use { raf ->
                 val channel = raf.channel
                 val tempBatch = mutableListOf<Pair<ByteArray, ByteArray>>()
                 val batchCrc = CRC32()
@@ -284,12 +217,22 @@ class WriteAheadLog(private val logFile: File) {
                             RECORD_COMMIT -> {
                                 tempBatch.forEach { consumer(it.first, it.second) }
                                 tempBatch.clear()
+                                lastValidPosition = channel.position()
                             }
                             else -> break
                         }
                     }
                 } catch (e: Exception) {
                     println("⚠️ WAL trailing bytes ignored.")
+                }
+
+                if (lastValidPosition < channel.size()) {
+                    try {
+                        channel.truncate(lastValidPosition)
+                        channel.force(true)
+                    } catch (e: Exception) {
+                        println("⚠️ Failed to truncate WAL file: ${e.message}")
+                    }
                 }
             }
         }

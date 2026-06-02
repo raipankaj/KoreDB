@@ -51,6 +51,14 @@ class KoreCollection<T>(
         }
     }
 
+    private fun escape(value: String): String {
+        return value.replace("%", "%25").replace(":", "%3A")
+    }
+
+    private fun unescape(value: String): String {
+        return value.replace("%3A", ":").replace("%25", "%")
+    }
+
     /**
      * Registers a secondary index for the collection.
      *
@@ -91,7 +99,7 @@ class KoreCollection<T>(
      * @param document The document to store.
      */
     suspend fun insert(id: String, document: T) = coroutineScope {
-        val idBytes = id.toByteArray(Charsets.UTF_8)
+        val idBytes = escape(id).toByteArray(Charsets.UTF_8)
         val docBytes = serializer.serialize(document)
         val docKey = makeDocKey(idBytes)
 
@@ -100,7 +108,7 @@ class KoreCollection<T>(
 
         indexExtractors.forEach { (idxName, extractor) ->
             val value = extractor(document)
-            val valBytes = value.toByteArray(Charsets.UTF_8)
+            val valBytes = escape(value).toByteArray(Charsets.UTF_8)
             val idxNameBytes = getIndexNameBytes(idxName)
 
             // sidx: idx:$name:$idxName:$idxValue:$id
@@ -144,7 +152,7 @@ class KoreCollection<T>(
      * @param id The ID of the document to delete.
      */
     suspend fun delete(id: String) {
-        db.deleteRaw(makeDocKey(id.toByteArray(Charsets.UTF_8)))
+        db.deleteRaw(makeDocKey(escape(id).toByteArray(Charsets.UTF_8)))
         synchronized(documentCache) {
             documentCache.remove(id)
         }
@@ -163,7 +171,7 @@ class KoreCollection<T>(
             if (cached != null) return cached
         }
 
-        val resultBytes = db.getRaw(makeDocKey(id.toByteArray(Charsets.UTF_8))) ?: return null
+        val resultBytes = db.getRaw(makeDocKey(escape(id).toByteArray(Charsets.UTF_8))) ?: return null
         val doc = serializer.deserialize(resultBytes)
 
         synchronized(documentCache) {
@@ -178,11 +186,12 @@ class KoreCollection<T>(
      * Avoids deserialization cost.
      */
     fun getIdsByPrefix(idPrefix: String): List<String> {
-        val prefixBytes = makeDocKey(idPrefix.toByteArray(Charsets.UTF_8))
+        val prefixBytes = makeDocKey(escape(idPrefix).toByteArray(Charsets.UTF_8))
         val keys = db.getKeysByPrefixRaw(prefixBytes)
 
         return keys.map { keyBytes ->
-            String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            unescape(escapedId)
         }
     }
 
@@ -193,13 +202,14 @@ class KoreCollection<T>(
      * sparse index and early termination.
      */
     fun getByIdRange(startId: String, endId: String): List<T> {
-        val startKey = makeDocKey(startId.toByteArray(Charsets.UTF_8))
-        val endKey = makeDocKey(endId.toByteArray(Charsets.UTF_8))
+        val startKey = makeDocKey(escape(startId).toByteArray(Charsets.UTF_8))
+        val endKey = makeDocKey(escape(endId).toByteArray(Charsets.UTF_8))
 
         val rawResults = db.getRangeWithKeysRaw(startKey, endKey)
 
         return rawResults.map { (keyBytes, valueBytes) ->
-            val id = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val id = unescape(escapedId)
             
             var doc: T? = null
             synchronized(documentCache) {
@@ -223,11 +233,12 @@ class KoreCollection<T>(
      * LSM-tree sparse index and early termination.
      */
     fun getByIdPrefix(idPrefix: String): List<T> {
-        val prefixBytes = makeDocKey(idPrefix.toByteArray(Charsets.UTF_8))
+        val prefixBytes = makeDocKey(escape(idPrefix).toByteArray(Charsets.UTF_8))
         val rawResults = db.getByPrefixWithKeysRaw(prefixBytes)
 
         return rawResults.map { (keyBytes, valueBytes) ->
-            val id = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val id = unescape(escapedId)
             
             var doc: T? = null
             synchronized(documentCache) {
@@ -257,22 +268,24 @@ class KoreCollection<T>(
      */
     fun getByIndex(indexName: String, value: String): List<T> {
         val idxNameBytes = getIndexNameBytes(indexName)
-        val valBytes = value.toByteArray(Charsets.UTF_8)
+        val escapedValue = escape(value)
+        val valBytes = escapedValue.toByteArray(Charsets.UTF_8)
         val prefix = buildKey(idxPrefix, idxNameBytes, valBytes)
         
         val indexKeys = db.getKeysByPrefixRaw(prefix)
 
         return indexKeys.mapNotNull { keyBytes ->
-            val id = String(keyBytes, prefix.size + 1, keyBytes.size - (prefix.size + 1), Charsets.UTF_8)
+            val escapedId = String(keyBytes, prefix.size, keyBytes.size - 1 - prefix.size, Charsets.UTF_8)
+            val id = unescape(escapedId)
 
-            val rptrKey = buildKey(rptrPrefix, idxNameBytes, id.toByteArray(Charsets.UTF_8))
+            val rptrKey = buildKey(rptrPrefix, idxNameBytes, escapedId.toByteArray(Charsets.UTF_8))
             val currentValueBytes = db.getRaw(rptrKey)
             
             // If no rptr exists, the entry has never been updated → index is fresh & valid.
             // If rptr exists but points to a different value, the entry is stale → skip.
             if (currentValueBytes != null) {
                 val currentValue = String(currentValueBytes, Charsets.UTF_8)
-                if (currentValue != value) {
+                if (currentValue != escapedValue) {
                     return@mapNotNull null // Stale entry
                 }
             }
@@ -305,7 +318,8 @@ class KoreCollection<T>(
     fun getAll(): List<T> {
         val rawResults = db.getByPrefixWithKeysRaw(docPrefix)
         return rawResults.map { (keyBytes, valueBytes) ->
-            val id = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val id = unescape(escapedId)
             
             var doc: T? = null
             synchronized(documentCache) {
@@ -419,7 +433,8 @@ class KoreCollection<T>(
     ): ArrayList<Pair<ByteArray, ByteArray>> {
         val list = ArrayList<Pair<ByteArray, ByteArray>>(chunk.size * (1 + indexExtractors.size * 2))
         for (entry in chunk) {
-            val idBytes = entry.key.toByteArray(Charsets.UTF_8)
+            val escapedId = escape(entry.key)
+            val idBytes = escapedId.toByteArray(Charsets.UTF_8)
             val docBytes = serializer.serialize(entry.value)
             val isUpdate = existingIds.contains(entry.key)
             
@@ -429,7 +444,7 @@ class KoreCollection<T>(
             // Secondary Indices
             for ((idxName, extractor) in indexExtractors) {
                 val value = extractor(entry.value)
-                val valBytes = value.toByteArray(Charsets.UTF_8)
+                val valBytes = escape(value).toByteArray(Charsets.UTF_8)
                 val idxNameBytes = getIndexNameBytes(idxName)
                 
                 list.add(buildKey(idxPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
