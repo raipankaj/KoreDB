@@ -37,7 +37,7 @@ object VectorMath {
     }
 
     /**
-     * Optimized dot product that leverages sequential ByteBuffer reads.
+     * Optimized dot product that leverages sequential ByteBuffer reads with 8-lane unrolling.
      */
     fun dotProduct(
         query: FloatArray,
@@ -47,14 +47,16 @@ object VectorMath {
     ): Float {
         var dot = 0f
         var i = 0
-        // Use absolute indexing (getFloat(index)) to avoid internal position state updates.
-        // This is significantly faster in tight loops on the Android Runtime (ART).
-        while (i <= size - 4) {
+        while (i <= size - 8) {
             dot += (query[i] * buffer.getFloat(offset + (i * 4))) +
                    (query[i + 1] * buffer.getFloat(offset + (i + 1) * 4)) +
                    (query[i + 2] * buffer.getFloat(offset + (i + 2) * 4)) +
-                   (query[i + 3] * buffer.getFloat(offset + (i + 3) * 4))
-            i += 4
+                   (query[i + 3] * buffer.getFloat(offset + (i + 3) * 4)) +
+                   (query[i + 4] * buffer.getFloat(offset + (i + 4) * 4)) +
+                   (query[i + 5] * buffer.getFloat(offset + (i + 5) * 4)) +
+                   (query[i + 6] * buffer.getFloat(offset + (i + 6) * 4)) +
+                   (query[i + 7] * buffer.getFloat(offset + (i + 7) * 4))
+            i += 8
         }
         while (i < size) {
             dot += query[i] * buffer.getFloat(offset + (i * 4))
@@ -66,7 +68,7 @@ object VectorMath {
     /** 
      * Calculates the Cosine Similarity between a query vector and a vector stored in a [ByteBuffer].
      *
-     * This implementation uses loop unrolling to optimize for SIMD instructions (like ARM NEON)
+     * This implementation uses 8-lane loop unrolling to optimize for SIMD instructions
      * and performs calculations directly on the buffer to avoid unnecessary allocations.
      *
      * @param query The query vector.
@@ -91,20 +93,25 @@ object VectorMath {
         var normB = 0f
         val size = query.size
 
-        // Set position to avoid indexed lookups (faster on some JVMs)
         buffer.position(offset)
         
         var i = 0
-        // Unroll loop by 4 for SIMD vectorization
-        while (i <= size - 4) {
+        // Unroll loop by 8 for SIMD vectorization
+        while (i <= size - 8) {
             val q0 = query[i];     val b0 = buffer.getFloat()
             val q1 = query[i+1];   val b1 = buffer.getFloat()
             val q2 = query[i+2];   val b2 = buffer.getFloat()
             val q3 = query[i+3];   val b3 = buffer.getFloat()
+            val q4 = query[i+4];   val b4 = buffer.getFloat()
+            val q5 = query[i+5];   val b5 = buffer.getFloat()
+            val q6 = query[i+6];   val b6 = buffer.getFloat()
+            val q7 = query[i+7];   val b7 = buffer.getFloat()
 
-            dotProduct += (q0 * b0) + (q1 * b1) + (q2 * b2) + (q3 * b3)
-            normB += (b0 * b0) + (b1 * b1) + (b2 * b2) + (b3 * b3)
-            i += 4
+            dotProduct += (q0 * b0) + (q1 * b1) + (q2 * b2) + (q3 * b3) +
+                          (q4 * b4) + (q5 * b5) + (q6 * b6) + (q7 * b7)
+            normB += (b0 * b0) + (b1 * b1) + (b2 * b2) + (b3 * b3) +
+                     (b4 * b4) + (b5 * b5) + (b6 * b6) + (b7 * b7)
+            i += 8
         }
 
         // Process remaining elements

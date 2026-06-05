@@ -31,6 +31,8 @@ import java.util.PriorityQueue
  * efficient prefix scans, and high-throughput vector similarity searches.
  */
 class SSTableReader(val file: File) {
+    
+    var level: Int = 0
 
     private val buffer: MappedByteBuffer
     private val bloomFilter: BloomFilter

@@ -1,5 +1,6 @@
 package com.pankaj.koredb.engine
 
+import com.pankaj.koredb.log.WriteAheadLog
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.*
@@ -100,5 +101,49 @@ class WalRecoveryTest {
         val reopenedDb = KoreDB(testDir)
         assertArrayEquals("Safe data should be recovered", "data".toByteArray(), reopenedDb.getRaw("safe".toByteArray()))
         reopenedDb.close()
+    }
+
+    /**
+     * Simulates a crash during a background flush where the WAL was rotated to kore.wal.old,
+     * some new writes were written to kore.wal, but the flush didn't finish and manifest was not updated.
+     * Reopening the database should replay BOTH kore.wal.old and kore.wal.
+     */
+    @Test
+    fun `test Recovery from Crash During Flush`() = runBlocking {
+        // 1. Write some data to the initial WAL (this will end up in kore.wal.old on rotation)
+        val kOld = "oldKey".toByteArray()
+        val vOld = "oldValue".toByteArray()
+        db.putRaw(kOld, vOld)
+        db.close()
+
+        // 2. Manually simulate the start of a flush:
+        // Rename kore.wal to kore.wal.old
+        val walFile = File(testDir, "kore.wal")
+        val oldWalFile = File(testDir, "kore.wal.old")
+        assertTrue(walFile.exists())
+        assertTrue(walFile.renameTo(oldWalFile))
+
+        // 3. Create a new active WAL manually and write new data to it (avoiding KoreDB initialization recovery)
+        val tempWal = WriteAheadLog(walFile)
+        val kNew = "newKey".toByteArray()
+        val vNew = "newValue".toByteArray()
+        tempWal.appendBatch(listOf(Pair(kNew, vNew)))
+        tempWal.close()
+
+        // At this point:
+        // - kore.wal.old has kOld -> vOld
+        // - kore.wal has kNew -> vNew
+        assertTrue(oldWalFile.exists())
+        assertTrue(walFile.exists())
+
+        // 4. Reopen database. It must replay both files.
+        val recoveredDb = KoreDB(testDir)
+        assertArrayEquals("Old WAL data should be recovered", vOld, recoveredDb.getRaw(kOld))
+        assertArrayEquals("New WAL data should be recovered", vNew, recoveredDb.getRaw(kNew))
+        
+        // The old WAL file should have been deleted after recovery
+        assertFalse("kore.wal.old should be cleaned up", oldWalFile.exists())
+        
+        recoveredDb.close()
     }
 }

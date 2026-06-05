@@ -86,6 +86,18 @@ class KoreVectorCollection(
     // Multi-vector: separate HNSW index per vector field
     private val fieldIndices = java.util.concurrent.ConcurrentHashMap<String, HNSWIndex>()
 
+    private var mmapHnsw: MmapHNSWIndex? = null
+
+    private fun ensureMutableHnsw() {
+        if (mmapHnsw != null && hnsw.size() == 0) {
+            try {
+                hnsw.loadFromDisk(indexFile)
+            } catch (_: Exception) {}
+            mmapHnsw?.close()
+            mmapHnsw = null
+        }
+    }
+
     // Background worker for non-blocking HNSW construction
     private val indexingScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val indexingChannel = Channel<IndexingTask>(Channel.UNLIMITED)
@@ -119,28 +131,34 @@ class KoreVectorCollection(
     init {
         indexingScope.launch {
             hydrateFromDisk()
-            for (task in indexingChannel) {
-                when (task) {
-                    is IndexingTask.Insert -> {
-                        hnsw.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
-                    }
-                    is IndexingTask.InsertField -> {
-                        val fieldIndex = fieldIndices.getOrPut(task.field) {
-                            HNSWIndex(
-                                maxNeighbors = config.maxConnections,
-                                efConstruction = config.efConstruction,
-                                efSearch = config.efSearch,
-                                metric = config.metric
-                            )
+            val numWorkers = maxOf(2, Runtime.getRuntime().availableProcessors())
+            val jobs = List(numWorkers) {
+                launch(Dispatchers.Default) {
+                    for (task in indexingChannel) {
+                        ensureMutableHnsw()
+                        when (task) {
+                            is IndexingTask.Insert -> {
+                                hnsw.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
+                            }
+                            is IndexingTask.InsertField -> {
+                                val fieldIndex = fieldIndices.getOrPut(task.field) {
+                                    HNSWIndex(
+                                        maxNeighbors = config.maxConnections,
+                                        efConstruction = config.efConstruction,
+                                        efSearch = config.efSearch,
+                                        metric = config.metric
+                                    )
+                                }
+                                fieldIndex.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
+                            }
+                            is IndexingTask.Delete -> {
+                                hnsw.delete(task.id)
+                                fieldIndices.values.forEach { it.delete(task.id) }
+                            }
+                            is IndexingTask.Update -> {
+                                hnsw.update(task.id, task.vector, task.meta)
+                            }
                         }
-                        fieldIndex.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
-                    }
-                    is IndexingTask.Delete -> {
-                        hnsw.delete(task.id)
-                        fieldIndices.values.forEach { it.delete(task.id) }
-                    }
-                    is IndexingTask.Update -> {
-                        hnsw.update(task.id, task.vector, task.meta)
                     }
                 }
             }
@@ -160,7 +178,7 @@ class KoreVectorCollection(
      * @param metadata Optional key-value metadata for hybrid search.
      */
     suspend fun insert(id: String, vector: FloatArray, metadata: Map<String, Any>? = null) {
-        val isUpdate = hnsw.contains(id)
+        val isUpdate = mmapHnsw?.contains(id) ?: hnsw.contains(id)
         db.putRaw(makeKey(id), VectorSerializer.toByteArray(vector))
         if (metadata != null) {
             db.putRaw(makeMetaKey(id), serializeMetadata(metadata))
@@ -272,6 +290,10 @@ class KoreVectorCollection(
         }
 
         // Use HNSW for indexed search
+        val mmap = mmapHnsw
+        if (mmap != null) {
+            return mmap.search(query, limit, filter)
+        }
         if (hnsw.size() > 0) {
             return hnsw.search(query, limit, filter)
         }
@@ -381,18 +403,24 @@ class KoreVectorCollection(
     /**
      * Returns index health statistics.
      */
-    fun stats(): HNSWIndex.IndexStats = hnsw.stats()
+    fun stats(): HNSWIndex.IndexStats {
+        ensureMutableHnsw()
+        return hnsw.stats()
+    }
 
     /**
      * Compacts the HNSW index by removing deleted nodes.
      * Call during idle time for best performance.
      */
-    fun compactIndex(): Int = hnsw.compact()
+    fun compactIndex(): Int {
+        ensureMutableHnsw()
+        return hnsw.compact()
+    }
 
     /**
      * Returns the total number of indexed vectors.
      */
-    fun size(): Int = hnsw.size()
+    fun size(): Int = mmapHnsw?.size() ?: hnsw.size()
 
     /**
      * Waits for all background indexing tasks to complete and saves to disk.
@@ -406,7 +434,9 @@ class KoreVectorCollection(
         delay(100)
         
         withContext(Dispatchers.IO) {
-            hnsw.saveToDisk(indexFile)
+            if (hnsw.size() > 0) {
+                hnsw.saveToDisk(indexFile)
+            }
             // Save field indices
             for ((field, index) in fieldIndices) {
                 val fieldFile = java.io.File(db.directory, "hnsw_${name}_${field}.bin")
@@ -421,6 +451,7 @@ class KoreVectorCollection(
     fun close() {
         indexingChannel.close()
         indexingScope.cancel()
+        mmapHnsw?.close()
     }
 
     // ========================================================================
@@ -442,9 +473,13 @@ class KoreVectorCollection(
     private suspend fun hydrateFromDisk() = withContext(Dispatchers.IO) {
         if (indexFile.exists()) {
             try {
-                hnsw.loadFromDisk(indexFile)
+                mmapHnsw = MmapHNSWIndex(indexFile)
             } catch (e: Exception) {
-                indexFile.delete()
+                try {
+                    hnsw.loadFromDisk(indexFile)
+                } catch (ex: Exception) {
+                    indexFile.delete()
+                }
             }
         }
 
@@ -459,10 +494,12 @@ class KoreVectorCollection(
             
             val escapedId = fullKey.removePrefix(keyPrefix)
             val id = unescape(escapedId)
-            if (hnsw.contains(id)) continue
+            val exists = mmapHnsw?.contains(id) ?: hnsw.contains(id)
+            if (exists) continue
 
             val value = db.getRaw(keyBytes)
             if (value != null && value.isNotEmpty() && !value.contentEquals(KoreDB.TOMBSTONE)) {
+                ensureMutableHnsw()
                 val vector = VectorSerializer.fromByteArray(value)
                 val meta = loadMetadataFromDb(id)
                 hnsw.insert(id, vector, VectorMath.getMagnitude(vector), meta)

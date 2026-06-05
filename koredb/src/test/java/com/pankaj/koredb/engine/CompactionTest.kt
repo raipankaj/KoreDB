@@ -39,8 +39,12 @@ class CompactionTest {
         db.putRaw("B".toByteArray(), "Val2".toByteArray())
         db.flushMemTableInternal()
 
-        // Segment 3 -> This triggers Auto-Compaction!
+        // Segment 3
         db.putRaw("C".toByteArray(), "Val3".toByteArray())
+        db.flushMemTableInternal()
+
+        // Segment 4 -> This triggers Auto-Compaction under Leveled Compaction (L0 threshold is 4)!
+        db.putRaw("D".toByteArray(), "Val4".toByteArray())
         db.flushMemTableInternal()
 
         // Wait for background compaction to complete
@@ -59,6 +63,7 @@ class CompactionTest {
         assertEquals("Val1", String(db.getRaw("A".toByteArray())!!))
         assertEquals("Val2", String(db.getRaw("B".toByteArray())!!))
         assertEquals("Val3", String(db.getRaw("C".toByteArray())!!))
+        assertEquals("Val4", String(db.getRaw("D".toByteArray())!!))
     }
 
     @Test

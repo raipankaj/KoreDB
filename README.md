@@ -33,8 +33,9 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 ### 🤖 Vector Engine
 *   **🧠 HNSW Index:** Sub-millisecond Approximate Nearest Neighbor search with RNG pruning heuristic.
 *   **🧬 Hybrid Search:** Pre-filtered HNSW traversal with 10 metadata operators (`eq`, `gt`, `lt`, `inList`, `contains`...).
-*   **📐 4 Distance Metrics:** Cosine, Euclidean, Inner Product, Manhattan — all SIMD-friendly with 4x loop unrolling.
+*   **📐 4 Distance Metrics:** Cosine, Euclidean, Inner Product, Manhattan — all SIMD-friendly with 8-lane loop unrolling.
 *   **📦 Scalar Quantization (SQ8):** 4x memory reduction with <1% recall loss.
+*   **💾 Memory-Mapped (mmap) Indexing:** Near-zero memory footprint during read/search operations via direct file-to-buffer mapping.
 *   **🗑️ Delete & Update:** Soft-delete with tombstones + background compaction.
 *   **📚 Multi-Vector:** Store multiple named vector fields per document.
 *   **🏗️ Namespace Isolation:** Logical multi-tenancy with separate key prefixes and index files.
@@ -57,7 +58,8 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 ### 🏗️ Core Engine
 *   **🏗️ Pure Kotlin:** 100% Kotlin with Zero JNI overhead. No `sqlite3.so` bloat.
 *   **🔗 Coroutine First:** Non-blocking I/O with `Flow`, background indexing and automatic hydration.
-*   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) with CRC32 checksums.
+*   **⚡ Concurrent Group Commits:** Batching write pipeline that reduces disk sync overhead under heavy concurrent workloads.
+*   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) with CRC32 checksums and crash replay recovery.
 *   **🔍 Optimized Reads:** Bloom Filters, Sparse Indexing, Object Cache (65K entries).
 *   **📦 Lightweight:** Minimal footprint, perfect for mobile apps.
 
@@ -531,49 +533,48 @@ KoreDB follows the classic LSM-Tree pattern used by **Bigtable**, **Cassandra**,
 
 ## 📊 KoreDB vs Room: Real-World Benchmarks
 
-*(Benchmarks conducted on an Android device comparing KoreDB's LSM/HNSW/Graph engines against a standard Room/SQLite implementation)*
+*(Benchmarks conducted on a connected **Pixel 7 Pro** device running `ComprehensiveBenchmark` comparing KoreDB's LSM/HNSW/Graph engines against a standard Room/SQLite implementation)*
 
-### 📦 Pillar 1: Document Collection (5,000 Documents)
-| Operation | KoreDB (LSM) | Room (SQLite) | Speedup |
-| :--- | :--- | :--- | :--- |
-| **Bulk Insert** | **94 ms** | 91 ms | 1x |
-| **Point Read (x1000)** | **1 ms** | 677 ms | **677x** |
-| **Index Lookup (x100)** | **140 ms** | 81 ms | 0.6x |
-| **Delete (x500)** | **122 ms** | 1,080 ms | **8.8x** |
-| **Query+Filter (x50)** | **375 ms** | 338 ms | 0.9x |
-| **Aggregation (Count+Sum)** | **191 ms** | N/A | Native |
-| **Partial Update (x500)** | **904 ms** | 1,406 ms | **1.5x** |
+### 🎯 Point Operations (5,000 Operations, 1-by-1)
+| Operation | KoreDB (LSM) | Room (SQLite) | Winner | Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **Single Writes** | **6,288 ms** | 19,525 ms | 🏆 KoreDB | **3.11x** |
+| **Single Reads** | **60 ms** | 3,935 ms | 🏆 KoreDB | **65.58x** |
+| **Negative Lookups** | **70 ms** | 4,246 ms | 🏆 KoreDB | **60.66x** |
 
-### 🤖 Pillar 2: Vector Engine (5,000 Vectors, 128-dim)
-| Operation | KoreDB | Room | Speedup |
-| :--- | :--- | :--- | :--- |
-| **Insert** | **152 ms** | 349 ms | **2.3x** |
-| **Search (top-10 × 50)** | **69 ms** | 3,011 ms | **43.6x** |
-| **Hybrid Search (× 50)** | **156 ms** | 814 ms | **5.2x** |
-| **Delete (× 500)** | **24 ms** | 1,180 ms | **49x** |
-| **Update (× 500)** | **255 ms** | 639 ms | **2.5x** |
-| **Metadata Update (× 1000)** | **508 ms** | 5,712 ms | **11.2x** |
-| **SQ8 Quantized Search** | **47 ms** | N/A | 4x less RAM |
+### 🚀 Massive Bulk Operations (50,000 Records / 10,000 Updates)
+| Operation | KoreDB (LSM) | Room (SQLite) | Winner | Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **Bulk Insert (50K)** | **408 ms** | 804 ms | 🏆 KoreDB | **1.97x** |
+| **Random Updates (10K)** | **113 ms** | 260 ms | 🏆 KoreDB | **2.30x** |
 
-### 🕸️ Pillar 3: Graph Engine (500 Nodes, 2500 Edges)
-| Operation | KoreDB | Room | Notes |
-| :--- | :--- | :--- | :--- |
-| **Node Lookup (x50)** | **1 ms** | N/A | |
-| **Edge Query (x20)** | **2 ms** | N/A | |
-| **Batch Edge Insert** | **136 ms** | 15,691 ms | **115x** |
-| **1-Hop Traversal (x20)** | **0 ms** | N/A | |
-| **2-4 Hop Path (x10)** | **7 ms** | N/A | |
-| **Dijkstra Shortest Path** | **218 ms** | N/A | |
-| **A* Pathfinding** | **225 ms** | N/A | |
-| **PageRank** | **372 ms** | N/A | |
-| **Community Detection** | **43 ms** | N/A | |
-| **Cascading Delete (x50)** | **52 ms** | 120 ms | Room lacks edge cascade |
+### 🤖 Vector Similarity (15,000 Vectors, 384-dim)
+| Operation | KoreDB (HNSW) | Room (Flat Scan) | Winner | Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **Vector Insert** | **462 ms** | 3,086 ms | 🏆 KoreDB | **6.68x** |
+| **Vector Search (50 queries)** | **179 ms** | 43,234 ms | 🏆 KoreDB | **241.53x** |
+| **HNSW Hydration** | **148 ms** | N/A | KoreDB | Loads instantly from disk |
 
-### ⚠️ Trade-offs
-| Operation | KoreDB | Room | Why? |
-| :--- | :--- | :--- | :--- |
-| **Sequential Scan (100k items)** | 983 ms | **402 ms** | B-Trees have better locality for linear scans. |
-| **Prefix Scan** | 18.1 s | **7.9 s** | Iterating merged LSM segments is more expensive. |
+### 🕸️ Graph & Relational Traversal (2,000 Nodes, 10,000 Edges)
+| Operation | KoreDB (Graph) | Room (SQLite Join) | Winner | Speedup / Note |
+| :--- | :---: | :---: | :---: | :--- |
+| **Graph Build** | **432 ms** | 31,167 ms | 🏆 KoreDB | **72.15x** |
+| **2-Hop Traversal (100x)** | 211 ms | **74 ms** | 🏆 Room | **0.35x** (Relational Join) |
+| **PageRank (5iter, 500 nodes)** | **268 ms** | N/A | KoreDB | Native Graph Engine |
+| **Dijkstra Shortest Path** | **189 ms** | N/A | KoreDB | Native Graph Engine |
+
+### 📖 Prefix & Range Queries (50,000 Records)
+| Operation | KoreDB (LSM) | Room (SQLite) | Winner | Speedup |
+| :--- | :---: | :---: | :---: | :---: |
+| **Prefix Scan (50x)** | **3,587 ms** | 3,682 ms | 🏆 KoreDB | **1.03x** |
+| **Range Query (500 items, 50x)** | **90 ms** | 202 ms | 🏆 KoreDB | **2.24x** |
+| **Large Range (50KB/rec, 5x)** | **220 ms** | 1,542 ms | 🏆 KoreDB | **7.01x** |
+
+### ⚠️ Performance Trade-offs
+| Operation | KoreDB (LSM) | Room (SQLite B-Tree) | Winner | Why? |
+| :--- | :---: | :---: | :---: | :--- |
+| **Full Sequential Scan** | 180 ms | **168 ms** | 🏆 Room | B-Trees have better data locality for linear disk scans. |
+| **2-Hop Traversal (100x)** | 211 ms | **74 ms** | 🏆 Room | SQLite's optimizer is highly mature for direct indices joins. |
 
 ---
 

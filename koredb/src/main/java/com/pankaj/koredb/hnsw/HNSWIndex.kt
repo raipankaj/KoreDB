@@ -112,9 +112,14 @@ class HNSWIndex(
 
         val startNode = entryNode.get()
         if (startNode == null || startNode.id == id) {
-            entryNode.set(newNode)
-            maxLevel.set(maxOf(level, maxLevel.get()))
-            if (startNode == null) return
+            synchronized(entryNode) {
+                val currentStart = entryNode.get()
+                if (currentStart == null || currentStart.id == id) {
+                    entryNode.set(newNode)
+                    maxLevel.set(maxOf(level, maxLevel.get()))
+                    if (currentStart == null) return
+                }
+            }
         }
 
         var currNode: HNSWNode = entryNode.get()!!
@@ -170,7 +175,12 @@ class HNSWIndex(
         }
 
         if (level > maxLevel.get()) {
-            entryNode.set(newNode); maxLevel.set(level)
+            synchronized(maxLevel) {
+                if (level > maxLevel.get()) {
+                    entryNode.set(newNode)
+                    maxLevel.set(level)
+                }
+            }
         }
     }
 
@@ -422,7 +432,9 @@ class HNSWIndex(
 
     private fun connect(source: HNSWNode, target: HNSWNode, level: Int) {
         if (level <= source.nodeLevel) {
-            source.neighbors[level].add(target.id)
+            synchronized(source) {
+                source.neighbors[level].add(target.id)
+            }
         }
     }
 
@@ -431,16 +443,19 @@ class HNSWIndex(
         val connections = node.neighbors[level]
         if (connections.size <= maxNeighbors) return
 
-        val sorted = connections.mapNotNull { id ->
-            if (id in tombstones) return@mapNotNull null
-            val neighbor = nodes[id] ?: return@mapNotNull null
-            id to distanceBetweenNodes(node, neighbor)
-        }.sortedByDescending { it.second }
+        synchronized(node) {
+            if (connections.size <= maxNeighbors) return
+            val sorted = connections.mapNotNull { id ->
+                if (id in tombstones) return@mapNotNull null
+                val neighbor = nodes[id] ?: return@mapNotNull null
+                id to distanceBetweenNodes(node, neighbor)
+            }.sortedByDescending { it.second }
 
-        val toKeep = sorted.take(maxNeighbors).map { it.first }.toSet()
-        val toRemove = connections.filter { it !in toKeep }
-        for (id in toRemove) {
-            connections.remove(id)
+            val toKeep = sorted.take(maxNeighbors).map { it.first }.toSet()
+            val toRemove = connections.filter { it !in toKeep }
+            for (id in toRemove) {
+                connections.remove(id)
+            }
         }
     }
 
@@ -533,19 +548,56 @@ class HNSWIndex(
     // PERSISTENCE
     // ========================================================================
 
+    private class CountingOutputStream(private val out: java.io.OutputStream) : java.io.OutputStream() {
+        var bytesWritten: Long = 0L
+            private set
+
+        override fun write(b: Int) {
+            out.write(b)
+            bytesWritten++
+        }
+
+        override fun write(b: ByteArray) {
+            out.write(b)
+            bytesWritten += b.size
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            bytesWritten += len
+        }
+
+        override fun flush() {
+            out.flush()
+        }
+
+        override fun close() {
+            out.close()
+        }
+    }
+
     fun saveToDisk(file: java.io.File) {
-        java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(file), 256 * 1024)).use { out ->
-            out.writeInt(0x484E5357) // "HNSW" magic
-            out.writeInt(2)          // Format version 2
+        val activeNodes = nodes.entries.filter { it.key !in tombstones }.map { it.value }
+        val nodeCount = activeNodes.size
+        val nodeIdToIdx = activeNodes.mapIndexed { idx, node -> node.id to idx }.toMap()
+
+        val rawOut = java.io.FileOutputStream(file)
+        val bufferedOut = java.io.BufferedOutputStream(rawOut, 256 * 1024)
+        val countingOut = CountingOutputStream(bufferedOut)
+        val out = java.io.DataOutputStream(countingOut)
+
+        out.use {
+            out.writeInt(0x4D484E53) // "MHNS" magic
+            out.writeInt(3)          // Format version 3
             out.writeInt(maxLevel.get())
             out.writeUTF(metric.name)
 
             val entryId = entryNode.get()?.id
-            out.writeBoolean(entryId != null)
+            out.writeByte(if (entryId != null) 1 else 0)
             if (entryId != null) out.writeUTF(entryId)
 
             // Write quantizer calibration if present
-            out.writeBoolean(quantizer != null)
+            out.writeByte(if (quantizer != null) 1 else 0)
             if (quantizer != null) {
                 val (min, max) = quantizer.getCalibration()
                 out.writeInt(min.size)
@@ -553,27 +605,40 @@ class HNSWIndex(
                 for (f in max) out.writeFloat(f)
             }
 
-            // Write active nodes (skip tombstoned)
-            val activeNodes = nodes.entries.filter { it.key !in tombstones }
-            out.writeInt(activeNodes.size)
-            
-            for ((id, node) in activeNodes) {
-                out.writeUTF(id)
+            out.writeInt(nodeCount)
+
+            // 1. Write String ID Index block
+            for (node in activeNodes) {
+                out.writeUTF(node.id)
+            }
+
+            // 2. Write Node Records Block
+            val offsets = LongArray(nodeCount)
+            for (i in 0 until nodeCount) {
+                val node = activeNodes[i]
+                out.flush()
+                offsets[i] = countingOut.bytesWritten
+
+                out.writeUTF(node.id)
                 val vector = node.vector ?: quantizer?.dequantize(node.quantizedVector!!) ?: FloatArray(0)
-                out.writeInt(vector.size)
-                for (f in vector) out.writeFloat(f)
                 out.writeFloat(node.magnitude)
                 out.writeInt(node.nodeLevel)
+                out.writeInt(vector.size)
+                for (f in vector) out.writeFloat(f)
 
+                // Write neighbors
                 for (l in 0..node.nodeLevel) {
                     val neighbors = node.neighbors[l].filter { it !in tombstones }
                     out.writeInt(neighbors.size)
-                    for (nId in neighbors) out.writeUTF(nId)
+                    for (nId in neighbors) {
+                        val nIdx = nodeIdToIdx[nId] ?: -1
+                        out.writeInt(nIdx)
+                    }
                 }
 
                 // Write metadata
-                val meta = metadata[id]
-                out.writeBoolean(meta != null)
+                val meta = metadata[node.id]
+                out.writeByte(if (meta != null) 1 else 0)
                 if (meta != null) {
                     out.writeInt(meta.size)
                     for ((key, value) in meta) {
@@ -584,12 +649,23 @@ class HNSWIndex(
                             is Long    -> { out.writeByte(3); out.writeLong(value) }
                             is Float   -> { out.writeByte(4); out.writeFloat(value) }
                             is Double  -> { out.writeByte(5); out.writeDouble(value) }
-                            is Boolean -> { out.writeByte(6); out.writeBoolean(value) }
+                            is Boolean -> { out.writeByte(6); out.writeByte(if (value) 1 else 0) }
                             else       -> { out.writeByte(1); out.writeUTF(value.toString()) }
                         }
                     }
                 }
             }
+
+            // 3. Write Node Offset Table at the end
+            out.flush()
+            val offsetTableStart = countingOut.bytesWritten
+            for (offset in offsets) {
+                out.writeLong(offset)
+            }
+
+            // Write offsetTableStart pointer and footer magic
+            out.writeLong(offsetTableStart)
+            out.writeInt(0x4D484E53) // "MHNS" footer magic
         }
     }
 
@@ -598,54 +674,52 @@ class HNSWIndex(
 
         java.io.DataInputStream(java.io.BufferedInputStream(java.io.FileInputStream(file), 256 * 1024)).use { input ->
             val magic = input.readInt()
-            if (magic != 0x484E5357) return
-
-            val version = input.readInt()
-            maxLevel.set(input.readInt())
-            
-            if (version >= 2) {
-                val savedMetric = input.readUTF()
-            }
-
-            val hasEntry = input.readBoolean()
-            val entryId = if (hasEntry) input.readUTF() else null
-
-            // Read quantizer calibration
-            if (version >= 2) {
-                val hasQuantizer = input.readBoolean()
-                if (hasQuantizer && quantizer != null) {
-                    val dims = input.readInt()
-                    val min = FloatArray(dims) { input.readFloat() }
-                    val max = FloatArray(dims) { input.readFloat() }
-                    quantizer.loadCalibration(min, max)
-                } else if (hasQuantizer) {
-                    val dims = input.readInt()
-                    repeat(dims * 2) { input.readFloat() }
-                }
-            }
-
-            val nodeCount = input.readInt()
-            nodes.clear()
-            metadata.clear()
-            tombstones.clear()
-
-            for (i in 0 until nodeCount) {
-                val id = input.readUTF()
-                val vecSize = input.readInt()
-                val vector = FloatArray(vecSize) { input.readFloat() }
-                val magnitude = input.readFloat()
-                val level = input.readInt()
-
-                val quantized = quantizer?.quantize(vector)
-                val storedVector = if (quantizer != null && quantizer.isTrained()) null else vector
-                val node = HNSWNode(id, storedVector, magnitude, level, quantized)
+            if (magic == 0x484E5357) {
+                // Handle legacy version 2
+                val version = input.readInt()
+                maxLevel.set(input.readInt())
                 
-                for (l in 0..level) {
-                    val neighborCount = input.readInt()
-                    repeat(neighborCount) { node.neighbors[l].add(input.readUTF()) }
+                if (version >= 2) {
+                    val savedMetric = input.readUTF()
                 }
+
+                val hasEntry = input.readBoolean()
+                val entryId = if (hasEntry) input.readUTF() else null
 
                 if (version >= 2) {
+                    val hasQuantizer = input.readBoolean()
+                    if (hasQuantizer && quantizer != null) {
+                        val dims = input.readInt()
+                        val min = FloatArray(dims) { input.readFloat() }
+                        val max = FloatArray(dims) { input.readFloat() }
+                        quantizer.loadCalibration(min, max)
+                    } else if (hasQuantizer) {
+                        val dims = input.readInt()
+                        repeat(dims * 2) { input.readFloat() }
+                    }
+                }
+
+                val nodeCount = input.readInt()
+                nodes.clear()
+                metadata.clear()
+                tombstones.clear()
+
+                for (i in 0 until nodeCount) {
+                    val id = input.readUTF()
+                    val vecSize = input.readInt()
+                    val vector = FloatArray(vecSize) { input.readFloat() }
+                    val magnitude = input.readFloat()
+                    val level = input.readInt()
+
+                    val quantized = quantizer?.quantize(vector)
+                    val storedVector = if (quantizer != null && quantizer.isTrained()) null else vector
+                    val node = HNSWNode(id, storedVector, magnitude, level, quantized)
+                    
+                    for (l in 0..level) {
+                        val neighborCount = input.readInt()
+                        repeat(neighborCount) { node.neighbors[l].add(input.readUTF()) }
+                    }
+
                     val hasMeta = input.readBoolean()
                     if (hasMeta) {
                         val metaSize = input.readInt()
@@ -666,9 +740,105 @@ class HNSWIndex(
                         }
                         metadata[id] = meta
                     }
+
+                    nodes[id] = node
+                }
+
+                if (entryId != null) {
+                    entryNode.set(nodes[entryId])
+                }
+                return
+            }
+
+            if (magic != 0x4D484E53) return // Unknown magic
+
+            val version = input.readInt()
+            if (version != 3) return
+            maxLevel.set(input.readInt())
+            
+            val savedMetric = input.readUTF()
+
+            val hasEntry = input.readByte() == 1.toByte()
+            val entryId = if (hasEntry) input.readUTF() else null
+
+            val hasQuantizer = input.readByte() == 1.toByte()
+            if (hasQuantizer && quantizer != null) {
+                val dims = input.readInt()
+                val min = FloatArray(dims) { input.readFloat() }
+                val max = FloatArray(dims) { input.readFloat() }
+                quantizer.loadCalibration(min, max)
+            } else if (hasQuantizer) {
+                val dims = input.readInt()
+                repeat(dims * 2) { input.readFloat() }
+            }
+
+            val nodeCount = input.readInt()
+            nodes.clear()
+            metadata.clear()
+            tombstones.clear()
+
+            // 1. Read String ID Index
+            val idxToNodeId = Array(nodeCount) { "" }
+            for (i in 0 until nodeCount) {
+                idxToNodeId[i] = input.readUTF()
+            }
+
+            // 2. Read Node Records Block
+            val tempNeighbors = Array(nodeCount) { ArrayList<IntArray>() }
+
+            for (i in 0 until nodeCount) {
+                val id = input.readUTF()
+                val magnitude = input.readFloat()
+                val level = input.readInt()
+                val vecSize = input.readInt()
+                val vector = FloatArray(vecSize) { input.readFloat() }
+
+                val quantized = quantizer?.quantize(vector)
+                val storedVector = if (quantizer != null && quantizer.isTrained()) null else vector
+                val node = HNSWNode(id, storedVector, magnitude, level, quantized)
+
+                for (l in 0..level) {
+                    val neighborCount = input.readInt()
+                    val neighborIndices = IntArray(neighborCount) { input.readInt() }
+                    tempNeighbors[i].add(neighborIndices)
+                }
+
+                val hasMeta = input.readByte() == 1.toByte()
+                if (hasMeta) {
+                    val metaSize = input.readInt()
+                    val meta = HashMap<String, Any>(metaSize)
+                    repeat(metaSize) {
+                        val key = input.readUTF()
+                        val type = input.readByte().toInt()
+                        val value: Any = when (type) {
+                            1 -> input.readUTF()
+                            2 -> input.readInt()
+                            3 -> input.readLong()
+                            4 -> input.readFloat()
+                            5 -> input.readDouble()
+                            6 -> input.readByte() == 1.toByte()
+                            else -> input.readUTF()
+                        }
+                        meta[key] = value
+                    }
+                    metadata[id] = meta
                 }
 
                 nodes[id] = node
+            }
+
+            // Link neighbors
+            for (i in 0 until nodeCount) {
+                val nodeId = idxToNodeId[i]
+                val node = nodes[nodeId] ?: continue
+                for (l in 0..node.nodeLevel) {
+                    val neighborsList = tempNeighbors[i][l]
+                    for (nIdx in neighborsList) {
+                        if (nIdx >= 0 && nIdx < nodeCount) {
+                            node.neighbors[l].add(idxToNodeId[nIdx])
+                        }
+                    }
+                }
             }
 
             if (entryId != null) {
@@ -677,3 +847,4 @@ class HNSWIndex(
         }
     }
 }
+
