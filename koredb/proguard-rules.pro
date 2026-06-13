@@ -66,6 +66,18 @@
     public <fields>;
 }
 
+# Preserve the Stream API
+-keep public class com.pankaj.koredb.stream.** {
+    public <methods>;
+    public <fields>;
+}
+
+# Preserve the Key-Value Cache API
+-keep public class com.pankaj.koredb.kv.** {
+    public <methods>;
+    public <fields>;
+}
+
 # Keep serialization-related metadata if you use kotlinx.serialization
 -keepattributes *Annotation*, InnerClasses, EnclosingMethod, Signature, Exceptions
 -keepclassmembers class * {
