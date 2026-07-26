@@ -59,6 +59,10 @@ class GraphTransaction(private val db: KoreDB) {
             for ((key, value) in node.properties) {
                 val propKey = "g:idx:v_prop:$label:$key:$value:${node.id}".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(propKey, PRESENCE_MARKER))
+
+                // 2. Reverse Pointer (Truth Oracle)
+                val rptrKey = "g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+                batch.add(Pair(rptrKey, value.toByteArray(Charsets.UTF_8)))
             }
         }
     }
