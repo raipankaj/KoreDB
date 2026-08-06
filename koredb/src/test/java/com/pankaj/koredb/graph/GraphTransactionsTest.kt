@@ -35,12 +35,12 @@ class GraphTransactionsTest {
 
         // A -> B
         graph.transaction {
-            putNode(Node("A", labels = setOf("Label"),properties = mapOf("a" to "a")))
-            putNode(Node("B", labels = setOf("Label"),properties = mapOf("b" to "b")))
+            putNode(Node("A", labels = setOf("Label"), properties = mapOf("a" to "a")))
+            putNode(Node("B", labels = setOf("Label"), properties = mapOf("b" to "b")))
             putEdge(Edge("A", "B", "LINK"))
         }
         val destNodes = graph.query()
-            .startingWith("Label", "a","a")
+            .startingWith("Label", "a", "a")
             .outbound("LINK")
             .toNodeList()
 
