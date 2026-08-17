@@ -72,7 +72,11 @@ class SSTable {
          * @param memTable The source in-memory table to flush.
          * @param outputFile The destination file where the SSTable will be written.
          */
-        fun writeFromMemTable(memTable: MemTable, outputFile: File) {
+        fun writeFromMemTable(
+            memTable: MemTable,
+            outputFile: File,
+            compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
+        ) {
             val fileOutputStream = FileOutputStream(outputFile)
             val channel: FileChannel = fileOutputStream.channel
 
@@ -90,7 +94,8 @@ class SSTable {
             // 1. Write the Data Blocks: Iterate through sorted entries and append to file.
             for (entry in memTable.getSortedEntries()) {
                 val key = entry.key
-                val value = entry.value
+                val rawValue = entry.value
+                val value = if (rawValue.isNotEmpty()) compressionCodec.compress(rawValue) else rawValue
 
                 bloomFilter.add(key)
 
@@ -150,10 +155,11 @@ class SSTable {
                 channel.write(bfBuffer)
             }
 
-            // 4. Write the Footer: Fixed-length metadata for file verification and indexing.
+            // 4. Write the Footer: Fixed-length metadata (16 bytes) with encoded codec identifier
             val footerBuffer = ByteBuffer.allocate(16).order(java.nio.ByteOrder.LITTLE_ENDIAN)
             footerBuffer.putLong(bloomFilterOffset)
-            footerBuffer.putInt(VERSION_V1)
+            val versionAndCodec = ((compressionCodec.type.toInt() and 0xFF) shl 24) or (VERSION_V1 and 0x00FFFFFF)
+            footerBuffer.putInt(versionAndCodec)
             footerBuffer.putInt(MAGIC_NUMBER)
 
             footerBuffer.flip()

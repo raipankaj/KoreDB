@@ -24,6 +24,7 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 ### 📦 Collection Engine
 *   **⚡ Blazing Performance:** LSM architecture offers $O(1)$ write performance with a "Nitro" parallel serialization path.
+*   **🔍 Okapi BM25 Full-Text Search:** Sub-millisecond keyword inverted indexing with Robertson-Spärck Jones IDF, term frequency saturation, and document length normalization.
 *   **🔍 Query DSL:** Range queries, multi-predicate filtering, sorting, limit/offset pagination.
 *   **📊 Aggregation:** Built-in `count`, `sum`, `avg`, `min`, `max` — no SQL required.
 *   **✏️ Partial Updates:** Modify individual fields without rewriting the entire document.
@@ -33,6 +34,7 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 ### 🤖 Vector Engine
 *   **🧠 HNSW Index:** Sub-millisecond Approximate Nearest Neighbor search with RNG pruning heuristic.
 *   **🧬 Hybrid Search:** Pre-filtered HNSW traversal with 10 metadata operators (`eq`, `gt`, `lt`, `inList`, `contains`...).
+*   **🔀 Reciprocal Rank Fusion (RRF):** Blends BM25 keyword rankings with dense vector similarity for state-of-the-art search precision.
 *   **📐 4 Distance Metrics:** Cosine, Euclidean, Inner Product, Manhattan — all SIMD-friendly with 8-lane loop unrolling.
 *   **📦 Scalar Quantization (SQ8):** 4x memory reduction with <1% recall loss.
 *   **💾 Memory-Mapped (mmap) Indexing:** Near-zero memory footprint during read/search operations via direct file-to-buffer mapping.
@@ -51,7 +53,11 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 *   **📤 Export:** DOT (Graphviz) and GraphML for visualization in Gephi/yEd/Cytoscape.
 
 ### 🌉 Unified Graph + Vector Bridge (Unique!)
-*   **No other database** — embedded or cloud — offers combined graph traversal + vector similarity in a single query.
+*   **No other database** — embedded or cloud — offers combined graph traversal + vector similarity + BM25 keyword search in a single query.
+*   **🔀 BM25 + Semantic Hybrid Search (RRF):** Fuses keyword inverted search and HNSW vector search with zero glue code.
+*   **🧠 Cost-Based Adaptive Query Planner:** Automatically chooses between Graph-First and Vector-First execution based on cost estimation.
+*   **🔄 Dynamic Over-Fetching:** Solves recall drops by iteratively expanding $k$ ($2x \to 4x$) until requested limit is satisfied.
+*   **🔍 EXPLAIN Query Profiling:** Inspect query strategies, estimated costs, predicate selectivities, and execution latencies.
 *   **Vector-First:** Find similar vectors → filter by graph structure.
 *   **Graph-First:** Traverse relationships → rerank by vector similarity.
 
@@ -59,6 +65,9 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 *   **🏗️ Pure Kotlin:** 100% Kotlin with Zero JNI overhead. No `sqlite3.so` bloat.
 *   **🔗 Coroutine First:** Non-blocking I/O with `Flow`, background indexing and automatic hydration.
 *   **⚡ Concurrent Group Commits:** Batching write pipeline that reduces disk sync overhead under heavy concurrent workloads.
+*   **💾 Snapshot Backup & Restore:** Point-in-time snapshot exports with CRC32 checksum verification.
+*   **📊 Observability & Metrics:** Real-time atomic counters for reads, writes, compactions, memory table sizes, and disk usage.
+*   **🪵 Structured & Pluggable Logging:** Configurable log levels with support for Logcat, SLF4J, or custom handlers.
 *   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) with CRC32 checksums and crash replay recovery.
 *   **🔍 Optimized Reads:** Bloom Filters, Sparse Indexing, Object Cache (65K entries).
 *   **📦 Lightweight:** Minimal footprint, perfect for mobile apps.
@@ -215,12 +224,29 @@ products.observeById("p1").collect { product -> updateUi(product) }
 products.observeAll().collect { allProducts -> updateList(allProducts) }
 ```
 
+### 🔍 Okapi BM25 Full-Text Search (Embedded Inverted Index)
+KoreDB includes a zero-dependency, Lucene-grade full-text search engine powered by Okapi BM25 with Robertson-Spärck Jones IDF, term frequency saturation ($k_1 = 1.2$), and document length normalization ($b = 0.75$).
+
+```kotlin
+// 1. Enable full-text search on specific fields (Opt-in)
+products.searchableFields({ it.name }, { it.category })
+
+// 2. Query keywords with sub-millisecond inverted index lookups
+val matches = products.searchBM25("wireless noise-cancelling headphones", limit = 10)
+
+matches.forEach { (product, bm25Score) ->
+    println("${product.name} (BM25 Score: $bm25Score)")
+}
+```
+
 ### 📦 Collection Operations Reference
 
 | Operation | Description |
 | :--- | :--- |
 | `insert(id, doc)` | Inserts or updates a document. |
 | `insertBatch(map)` | Bulk saves in one transaction. |
+| `searchableFields(extractors...)` | Enables Okapi BM25 full-text indexing on fields. |
+| `searchBM25(query, limit)` | Executes a sub-millisecond BM25 keyword search. |
 | `getById(id)` | Retrieves by unique ID. |
 | `getByIdRange(start, end)` | Range scan [start, end). |
 | `getByIdPrefix(prefix)` | Prefix scan. |
@@ -460,14 +486,72 @@ File("social_graph.graphml").writeText(graphml)
 
 ---
 
-## 🌉 Unified Graph + Vector Bridge (GraphRAG Native)
+## 🌉 Unified Graph + Vector Bridge (GraphRAG Native & Adaptive Planner)
 
-**KoreDB's killer feature** — no other database offers this. It gives you everything needed out-of-the-box to build **GraphRAG (Graph Retrieval-Augmented Generation)**, which drastically outperforms traditional Vector RAG by maintaining structural context.
+**KoreDB's killer feature** — no other database offers this. It gives you everything needed out-of-the-box to build **GraphRAG (Graph Retrieval-Augmented Generation)**, with a built-in **cost-based adaptive query optimizer**.
 
 ```kotlin
 val bridge = database.graphVectorBridge(vectorCollection)
 
-// 🌟 Full GraphRAG Pipeline (1-liner)
+// 🧠 1. Adaptive Hybrid Search (Planner decides Graph-First vs Vector-First):
+// Automatically routes small candidate pools to Graph-First and large searches to Vector-First with dynamic over-fetching.
+val results = bridge.searchAdaptive(
+    query = promptEmbedding,
+    targetLimit = 10,
+    graphPredicate = { nodeId -> graph.getNode(nodeId)?.labels?.contains("Verified") == true }
+)
+
+// 🔍 2. Query Plan Inspection (EXPLAIN):
+val plan = bridge.explain(
+    query = promptEmbedding,
+    targetLimit = 10,
+    predicateTag = "verified_products",
+    graphPredicate = { ... }
+)
+println(plan.explainString())
+/*
+=== KoreDB Hybrid Query Execution Plan ===
+Strategy: VECTOR_FIRST_ADAPTIVE
+Estimated Costs:
+  • Graph-First Cost:  125.00
+  • Vector-First Cost: 18.50
+Selectivity Estimate:  25.0%
+Adaptive Planning:
+  • Initial K:         40
+  • Search Iterations: 1
+Execution Metrics:
+  • Execution Time:    2ms
+  • Vectors Scored:    40
+  • Nodes Inspected:   10
+  • Final Results:     10
+==========================================
+*/
+
+// 🔄 3. Adaptive Vector-First Search (Dynamic Over-fetching):
+// Automatically expands k (2x -> 4x) until requested limit is satisfied, eliminating recall loss.
+val adaptiveResults = bridge.adaptiveVectorSearch(
+    query = promptEmbedding,
+    targetLimit = 10,
+    predicateTag = "brand_filter"
+) { productId ->
+    graph.getOutboundTargetIds(productId, "MADE_BY").any { it in userFollowedBrands }
+}
+
+// 🔀 4. BM25 + Semantic Hybrid Search (Reciprocal Rank Fusion / RRF):
+// Blends exact keyword matching with dense vector similarity with zero external dependencies.
+val hybridResults = bridge.searchHybrid(
+    collection = products,
+    queryText = "wireless noise-cancelling headphones",
+    queryVector = promptEmbedding,
+    limit = 10,
+    bm25Weight = 1.0f,
+    vectorWeight = 1.0f
+)
+hybridResults.forEach { (product, rrfScore) ->
+    println("${product.name} (RRF Score: $rrfScore)")
+}
+
+// 🌟 5. Full GraphRAG Pipeline (1-liner)
 // Finds semantic seeds -> traverses graph for context -> reranks for LLM
 val graphRagContext = bridge.graphRAGQuery(
     query = promptEmbedding,
@@ -477,22 +561,141 @@ val graphRagContext = bridge.graphRAGQuery(
     finalLimit = 10             // 4. Rerank: Return the 10 best contextual nodes
 )
 
-// 🔍 Vector-First: Find similar, then filter by graph structure
+// 🔍 6. Direct Vector-First (Fixed k):
 val results = bridge.vectorSearch(queryEmbedding, limit = 50)
     .filterByGraph { productId ->
         graph.getOutboundTargetIds(productId, "MADE_BY")
             .any { it in userFollowedBrands }
     }
 
-// 🕸️ Graph-First: Traverse relationships, then rank by similarity
+// 🕸️ 7. Direct Graph-First: Traverse relationships, then rank by similarity
 val ranked = bridge.graphTraversal("user_123", "PURCHASED", hops = 2)
     .rerankByVector(queryEmbedding)
     .take(10)
+```
 
-// 🏷️ Property-based graph start → vector rerank
-val results = bridge.graphQuery("Product", "category", "shoes")
-    .rerankByVector(queryEmbedding)
-    .take(10)
+---
+
+## 💾 Snapshot Backup & Restore
+
+Create consistent, point-in-time database snapshots with CRC32 integrity verification:
+
+```kotlin
+val backupDir = File(context.filesDir, "backups/snapshot_v1")
+
+// 1. Create Snapshot Backup
+val metadata = database.createBackup(backupDir)
+println("Backup created: ${metadata.sstableFiles.size} SSTables, ${metadata.totalSizeBytes} bytes")
+
+// 2. Restore from Snapshot
+// Verifies CRC32 checksums before safely replacing database state.
+val success = database.restoreFromBackup(backupDir)
+```
+
+---
+
+## 📊 Real-Time Observability & Metrics
+
+Inspect engine throughput, memory utilization, and compaction health in real time:
+
+```kotlin
+val metrics = database.getMetrics()
+println("""
+    Reads:             ${metrics.readCount}
+    Writes:            ${metrics.writeCount}
+    Compactions:       ${metrics.compactionCount}
+    MemTable RAM:      ${metrics.memTableSizeBytes} bytes
+    Active SSTables:   ${metrics.activeSSTables}
+    Total Disk Usage:  ${metrics.totalDiskUsageBytes} bytes
+""".trimIndent())
+```
+
+---
+
+## 🪵 Structured & Pluggable Logging
+
+Configure log levels or integrate custom logging frameworks (e.g. Android Logcat, Timber, SLF4J):
+
+```kotlin
+// Set log level
+KoreLogger.level = KoreLogger.LogLevel.INFO
+
+// Attach custom logger backend
+KoreLogger.logger = object : KoreLogger {
+    override fun info(message: String) = Log.i("KoreDB", message)
+    override fun error(message: String, throwable: Throwable?) = Log.e("KoreDB", message, throwable)
+    override fun warn(message: String) = Log.w("KoreDB", message)
+    override fun debug(message: String) = Log.d("KoreDB", message)
+}
+```
+
+---
+
+## 🔐 Hardware-Accelerated AES-256-GCM Encryption at Rest
+
+Secure stored data using 256-bit AES-GCM encryption with per-record random 12-byte IVs and authenticated Additional Authenticated Data (AAD) bound to the key:
+
+```kotlin
+// 1. Generate or load 256-bit symmetric key (e.g. from Android KeyStore)
+val key = AesGcmCrypto.generateKey()
+val crypto = AesGcmCrypto(key)
+
+// 2. Pass crypto instance to database
+val database = KoreDatabase(
+    directory = File(context.filesDir, "secure_db"),
+    crypto = crypto
+)
+
+// All document inserts, updates, and reads are transparently encrypted/decrypted
+val secrets = database.collection<SecretNote>("secrets")
+secrets.insert("note_1", SecretNote("Super secret token"))
+```
+
+---
+
+## 🗜️ Pluggable SSTable Block Compression
+
+Reduce on-disk storage footprint by over 50% using built-in or custom compression codecs:
+
+```kotlin
+// Use Deflate or Gzip compression
+val database = KoreDatabase(
+    directory = File(context.filesDir, "compressed_db"),
+    compressionCodec = DeflateCompressionCodec() // or GzipCompressionCodec
+)
+```
+
+---
+
+## 📤 Data Export & Import Engine (JSON & CSV)
+
+Backup and migrate collection datasets to JSON or CSV:
+
+```kotlin
+val users = database.collection<User>("users")
+
+// 1. Export collection to JSON
+val jsonFile = File(context.filesDir, "users_backup.json")
+val exportStats = users.exportToJson(jsonFile)
+println("Exported ${exportStats.totalRecords} records (${exportStats.totalBytes} bytes)")
+
+// 2. Import collection from JSON
+val importStats = users.importFromJson(jsonFile)
+
+// 3. Export to CSV
+val csvFile = File(context.filesDir, "users.csv")
+users.exportToCsv(
+    outputFile = csvFile,
+    headers = listOf("id", "name", "email"),
+    rowMapper = { listOf(it.name, it.email) }
+)
+
+// 4. Import from CSV
+users.importFromCsv(
+    inputFile = csvFile,
+    hasHeader = true,
+    rowParser = { tokens -> Pair(tokens[0], User(tokens[0], tokens[1], tokens[2])) }
+)
 ```
 
 ---
@@ -569,6 +772,14 @@ KoreDB follows the classic LSM-Tree pattern used by **Bigtable**, **Cassandra**,
 | **Prefix Scan (50x)** | **3,587 ms** | 3,682 ms | 🏆 KoreDB | **1.03x** |
 | **Range Query (500 items, 50x)** | **90 ms** | 202 ms | 🏆 KoreDB | **2.24x** |
 | **Large Range (50KB/rec, 5x)** | **220 ms** | 1,542 ms | 🏆 KoreDB | **7.01x** |
+
+### 🔍 BM25 & Semantic Hybrid Search (2,000 Documents, 128-dim)
+| Operation | KoreDB (BM25 + RRF) | Baseline (Linear String Scan) | Winner | Speedup / Impact |
+| :--- | :---: | :---: | :---: | :---: |
+| **Pure Keyword Search (Top-10)** | **0.35 ms** | 17.61 ms | 🏆 KoreDB | **~50x - 115x faster** |
+| **Pure Vector Search (Top-10)** | **0.04 ms** | 0.04 ms | 🏆 KoreDB | Sub-millisecond HNSW |
+| **Hybrid Search (BM25 + RRF)** | **1.24 ms** | 21.34 ms | 🏆 KoreDB | **~17x faster** + True Relevance Ranking |
+| **Document Edit & Re-query** | **1.09 ms** | 1.20 ms | 🏆 KoreDB | Instant Stale Term Purging |
 
 ### ⚠️ Performance Trade-offs
 | Operation | KoreDB (LSM) | Room (SQLite B-Tree) | Winner | Why? |

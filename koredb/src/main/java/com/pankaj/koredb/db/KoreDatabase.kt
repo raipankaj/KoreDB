@@ -34,13 +34,17 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * @param directory The directory where database files are stored.
  */
-class KoreDatabase(private val directory: File) {
+class KoreDatabase(
+    private val directory: File,
+    private val crypto: com.pankaj.koredb.crypto.KoreCrypto? = null,
+    private val compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
+) {
 
     /**
      * The underlying storage engine. 
      * Initialized lazily to ensure [KoreAndroid.create] is non-blocking on the UI thread.
      */
-    val engine: KoreDB by lazy { KoreDB(directory) }
+    val engine: KoreDB by lazy { KoreDB(directory, crypto, compressionCodec) }
     
     private val collections = ConcurrentHashMap<String, KoreCollection<*>>()
 
@@ -162,6 +166,29 @@ class KoreDatabase(private val directory: File) {
      */
     suspend fun deleteRaw(key: ByteArray) {
         engine.deleteRaw(key)
+    }
+
+    /**
+     * Retrieves runtime storage engine and operational metrics.
+     */
+    fun getMetrics(): com.pankaj.koredb.engine.KoreDBMetrics {
+        return engine.getMetrics()
+    }
+
+    /**
+     * Creates a consistent point-in-time snapshot backup in [destDir].
+     */
+    suspend fun createBackup(destDir: File): com.pankaj.koredb.engine.BackupMetadata {
+        return engine.createBackup(destDir)
+    }
+
+    /**
+     * Restores database state from a backup directory.
+     * Clears all cached collections and reloads the engine.
+     */
+    suspend fun restoreFromBackup(srcDir: File): Boolean {
+        collections.clear()
+        return engine.restoreFromBackup(srcDir)
     }
 
     fun deleteAllRaw() {

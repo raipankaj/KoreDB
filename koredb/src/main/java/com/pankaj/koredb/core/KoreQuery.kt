@@ -92,32 +92,36 @@ class KoreQuery<T>(
     fun offset(n: Int): KoreQuery<T> { offsetCount = n; return this }
 
     /**
-     * Executes the query and returns matching documents.
+     * Executes the query and returns matching documents with early-termination streaming.
      */
     fun execute(): List<T> {
-        var results: List<T> = collection.getAll()
+        var seq = collection.asSequence()
 
-        // Apply filters
+        // Apply filters lazily
         for (filter in filters) {
-            results = results.filter(filter)
+            seq = seq.filter(filter)
         }
 
         // Apply sort
         val key = sortKey
         if (key != null) {
             @Suppress("UNCHECKED_CAST")
-            results = if (sortDescending) {
-                results.sortedByDescending { key(it) as Comparable<Any> }
+            val list = if (sortDescending) {
+                seq.toList().sortedByDescending { key(it) as Comparable<Any> }
             } else {
-                results.sortedBy { key(it) as Comparable<Any> }
+                seq.toList().sortedBy { key(it) as Comparable<Any> }
             }
+            var resultList = list
+            if (offsetCount > 0) resultList = resultList.drop(offsetCount)
+            if (limitCount != null) resultList = resultList.take(limitCount!!)
+            return resultList
         }
 
-        // Apply offset + limit
-        if (offsetCount > 0) results = results.drop(offsetCount)
-        if (limitCount != null) results = results.take(limitCount!!)
+        // Apply offset + limit lazily without collecting entire dataset
+        if (offsetCount > 0) seq = seq.drop(offsetCount)
+        if (limitCount != null) seq = seq.take(limitCount!!)
 
-        return results
+        return seq.toList()
     }
 
     /**
@@ -127,17 +131,17 @@ class KoreQuery<T>(
         val builder = AggregationBuilder<T>(propertyExtractors)
         builder.block()
 
-        var data = collection.getAll()
-        for (filter in filters) data = data.filter(filter)
+        var seq = collection.asSequence()
+        for (filter in filters) seq = seq.filter(filter)
 
-        return builder.compute(data)
+        return builder.compute(seq.toList())
     }
 
     /** Returns the count of matching documents. */
     fun count(): Int {
-        var data: List<T> = collection.getAll()
-        for (filter in filters) data = data.filter(filter)
-        return data.size
+        var seq = collection.asSequence()
+        for (filter in filters) seq = seq.filter(filter)
+        return seq.count()
     }
 }
 

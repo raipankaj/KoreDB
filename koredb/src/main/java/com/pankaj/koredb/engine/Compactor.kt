@@ -36,6 +36,17 @@ import java.util.PriorityQueue
  */
 object Compactor {
 
+    private val IDX_PREFIX_BYTES = "idx:".toByteArray(Charsets.UTF_8)
+    private val GRAPH_IDX_PREFIX_BYTES = "g:idx:v_prop:".toByteArray(Charsets.UTF_8)
+
+    private fun startsWith(array: ByteArray, prefix: ByteArray): Boolean {
+        if (array.size < prefix.size) return false
+        for (i in prefix.indices) {
+            if (array[i] != prefix[i]) return false
+        }
+        return true
+    }
+
     /**
      * Merges multiple SSTables into a single, clean SSTable.
      *
@@ -49,7 +60,8 @@ object Compactor {
     fun compact(
         readers: List<SSTableReader>,
         outputFile: File,
-        truthOracle: ((ByteArray) -> ByteArray?)? = null
+        truthOracle: ((ByteArray) -> ByteArray?)? = null,
+        compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
     ) {
         // 1. Initialize Iterators for all input files
         val queue = PriorityQueue<SSTableIterator>()
@@ -76,14 +88,12 @@ object Compactor {
 
                 if (candidateValue.isNotEmpty()) {
                     // --- INDEX-AWARE COMPACTION ---
-                    // If we have a truth oracle (the DB engine), we check if index entries are stale.
+                    // Fast binary prefix check to avoid allocating strings on non-index keys
                     var shouldDrop = false
                     
                     if (truthOracle != null) {
-                        val keyStr = String(candidateKey, Charsets.UTF_8)
-                        
-                        // Check Collection Indices: idx:collection:field:value:id
-                        if (keyStr.startsWith("idx:")) {
+                        if (startsWith(candidateKey, IDX_PREFIX_BYTES)) {
+                            val keyStr = String(candidateKey, Charsets.UTF_8)
                             val parts = keyStr.split(":")
                             if (parts.size >= 5) {
                                 val collName = parts[1]
@@ -98,9 +108,8 @@ object Compactor {
                                     shouldDrop = true
                                 }
                             }
-                        }
-                        // Check Graph Indices: g:idx:v_prop:label:key:value:nodeId
-                        else if (keyStr.startsWith("g:idx:v_prop:")) {
+                        } else if (startsWith(candidateKey, GRAPH_IDX_PREFIX_BYTES)) {
+                            val keyStr = String(candidateKey, Charsets.UTF_8)
                             val parts = keyStr.split(":")
                             if (parts.size >= 7) {
                                 val label = parts[3]
@@ -130,6 +139,6 @@ object Compactor {
         }
 
         // 3. Persist the merged, deduplicated data to disk
-        SSTable.writeFromMemTable(tempMemTable, outputFile)
+        SSTable.writeFromMemTable(tempMemTable, outputFile, compressionCodec)
     }
 }

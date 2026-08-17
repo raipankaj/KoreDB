@@ -16,6 +16,9 @@
 
 package com.pankaj.koredb.hnsw
 
+import kotlin.math.abs
+import kotlin.math.sqrt
+
 /**
  * Scalar Quantizer that compresses 32-bit float vectors into 8-bit unsigned integers.
  *
@@ -25,11 +28,7 @@ package com.pankaj.koredb.hnsw
  * ### How it works:
  * 1. Training: Scans a set of vectors to compute per-dimension min/max bounds.
  * 2. Quantization: Maps each float to [0, 255] within the learned bounds.
- * 3. Distance: Computes approximate distances directly on quantized vectors.
- *
- * ### Memory savings for 768-dim vectors:
- * - FP32: 768 × 4 = 3,072 bytes per vector
- * - SQ8:  768 × 1 = 768 bytes per vector (+ 6KB calibration overhead shared)
+ * 3. Distance: Computes approximate distances directly on quantized vectors without heap allocation.
  *
  * @param dimensions The dimensionality of the vectors to quantize.
  */
@@ -48,9 +47,6 @@ class ScalarQuantizer(val dimensions: Int) {
     
     /**
      * Trains the quantizer on a representative sample of vectors.
-     *
-     * Call this with a subset of your data before quantizing. The quantizer
-     * learns the min/max range for each dimension and pre-computes scale factors.
      *
      * @param vectors A representative sample (at least 100 vectors recommended).
      */
@@ -106,8 +102,8 @@ class ScalarQuantizer(val dimensions: Int) {
     }
     
     /**
-     * Computes approximate distance between a full-precision query and a quantized vector.
-     * Uses on-the-fly dequantization to avoid materializing the full vector.
+     * High-performance on-the-fly distance calculation directly against SQ8 quantized bytes.
+     * Eliminates FloatArray heap allocations on every graph hop.
      *
      * @param query The FP32 query vector.
      * @param quantized The SQ8 quantized vector.
@@ -115,9 +111,47 @@ class ScalarQuantizer(val dimensions: Int) {
      * @return The approximate similarity score.
      */
     fun computeDistance(query: FloatArray, quantized: ByteArray, metric: DistanceMetric): Float {
-        // Fast path: dequantize + compute in one pass for cosine
-        val reconstructed = dequantize(quantized)
-        return metric.compute(query, reconstructed)
+        return when (metric) {
+            DistanceMetric.COSINE -> {
+                var dot = 0f
+                var normB = 0f
+                var normA = 0f
+                for (d in 0 until dimensions) {
+                    val q = query[d]
+                    val recon = (quantized[d].toInt() and 0xFF) * inverseScales[d] + minBounds[d]
+                    dot += q * recon
+                    normA += q * q
+                    normB += recon * recon
+                }
+                val div = sqrt(normA) * sqrt(normB)
+                if (div == 0f) 0f else dot / div
+            }
+            DistanceMetric.EUCLIDEAN -> {
+                var sumSq = 0f
+                for (d in 0 until dimensions) {
+                    val recon = (quantized[d].toInt() and 0xFF) * inverseScales[d] + minBounds[d]
+                    val diff = query[d] - recon
+                    sumSq += diff * diff
+                }
+                sqrt(sumSq)
+            }
+            DistanceMetric.INNER_PRODUCT -> {
+                var dot = 0f
+                for (d in 0 until dimensions) {
+                    val recon = (quantized[d].toInt() and 0xFF) * inverseScales[d] + minBounds[d]
+                    dot += query[d] * recon
+                }
+                dot
+            }
+            DistanceMetric.MANHATTAN -> {
+                var sum = 0f
+                for (d in 0 until dimensions) {
+                    val recon = (quantized[d].toInt() and 0xFF) * inverseScales[d] + minBounds[d]
+                    sum += abs(query[d] - recon)
+                }
+                sum
+            }
+        }
     }
     
     /**

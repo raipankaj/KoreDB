@@ -104,6 +104,25 @@ class GraphStorage(val db: KoreDB) {
     }
 
     /**
+     * Retrieves multiple [Node]s in a batch.
+     *
+     * @param ids The IDs of the nodes to fetch.
+     * @return A map of node ID to [Node] for all nodes that exist.
+     */
+    fun getNodes(ids: Collection<String>): Map<String, Node> {
+        if (ids.isEmpty()) return emptyMap()
+        val result = HashMap<String, Node>(ids.size)
+        val uniqueIds = if (ids is Set) ids else ids.toSet()
+        for (id in uniqueIds) {
+            val node = getNode(id)
+            if (node != null) {
+                result[id] = node
+            }
+        }
+        return result
+    }
+
+    /**
      * Efficiently retrieves nodes matching a specific label and property value.
      *
      * This operation performs an O(log N) seek on the property index followed by 

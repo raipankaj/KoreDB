@@ -104,7 +104,8 @@ class KoreEventStream(
     }
 
     /**
-     * Retrieves historical events chronologically.
+     * Retrieves historical events chronologically in a single O(N) pass.
+     * LSM-tree keys with zero-padded timestamps are naturally sorted.
      */
     fun getHistory(): List<Event> {
         val rawPairs = engine.getByPrefixWithKeysRaw(prefix)
@@ -124,6 +125,6 @@ class KoreEventStream(
             } catch (e: Exception) {
                 null
             }
-        }.sortedBy { it.timestamp }
+        }
     }
 }

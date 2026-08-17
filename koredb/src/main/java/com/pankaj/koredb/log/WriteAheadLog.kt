@@ -173,23 +173,25 @@ class WriteAheadLog(private val logFile: File) {
                 val batchCrc = CRC32()
 
                 try {
-                    while (channel.position() < channel.size()) {
-                        val typeBuf = ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                        if (channel.read(typeBuf) < 4) break
-                        typeBuf.flip()
+                    val headerBuf = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
 
-                        when (typeBuf.int) {
+                    while (channel.position() < channel.size()) {
+                        headerBuf.clear().limit(4)
+                        if (channel.read(headerBuf) < 4) break
+                        headerBuf.flip()
+
+                        when (headerBuf.int) {
                             RECORD_BEGIN -> {
                                 tempBatch.clear()
                                 batchCrc.reset()
                             }
                             RECORD_PUT -> {
-                                val meta = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                                if (channel.read(meta) < 8) break
-                                meta.flip()
+                                headerBuf.clear().limit(8)
+                                if (channel.read(headerBuf) < 8) break
+                                headerBuf.flip()
 
-                                val keySize = meta.int
-                                val valueSize = meta.int
+                                val keySize = headerBuf.int
+                                val valueSize = headerBuf.int
 
                                 if (keySize < 0 || valueSize < 0 ||
                                     keySize > MAX_RECORD_SIZE || valueSize > MAX_RECORD_SIZE) break
@@ -209,10 +211,10 @@ class WriteAheadLog(private val logFile: File) {
                                 tempBatch.add(key to value)
                             }
                             BATCH_CRC -> {
-                                val crcBuf = ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                                if (channel.read(crcBuf) < 8) break
-                                crcBuf.flip()
-                                if (crcBuf.long != batchCrc.value) break
+                                headerBuf.clear().limit(8)
+                                if (channel.read(headerBuf) < 8) break
+                                headerBuf.flip()
+                                if (headerBuf.long != batchCrc.value) break
                             }
                             RECORD_COMMIT -> {
                                 tempBatch.forEach { consumer(it.first, it.second) }

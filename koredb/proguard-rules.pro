@@ -78,6 +78,30 @@
     public <fields>;
 }
 
+# Preserve the Crypto API
+-keep public class com.pankaj.koredb.crypto.** {
+    public <methods>;
+    public <fields>;
+}
+
+# Preserve the Compression API
+-keep public class com.pankaj.koredb.compression.** {
+    public <methods>;
+    public <fields>;
+}
+
+# Preserve the FTS API
+-keep public class com.pankaj.koredb.fts.** {
+    public <methods>;
+    public <fields>;
+}
+
+# Preserve the Exporter API
+-keep public class com.pankaj.koredb.exporter.** {
+    public <methods>;
+    public <fields>;
+}
+
 # Keep serialization-related metadata if you use kotlinx.serialization
 -keepattributes *Annotation*, InnerClasses, EnclosingMethod, Signature, Exceptions
 -keepclassmembers class * {

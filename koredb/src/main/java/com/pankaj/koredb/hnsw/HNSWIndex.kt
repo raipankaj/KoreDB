@@ -416,7 +416,7 @@ class HNSWIndex(
         val remaining = candidates.sortedByDescending { it.second }.toMutableList()
 
         while (selected.size < maxCount && remaining.isNotEmpty()) {
-            val best = remaining.removeFirst()
+            val best = remaining.removeAt(0)
             selected.add(best)
 
             val bestNode = nodes[best.first] ?: continue

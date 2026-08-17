@@ -88,6 +88,9 @@ object VectorMath {
         if (query.size != storedVectorLength) {
             return -2.0f
         }
+        if (queryMagnitude == 0f) {
+            return 0f
+        }
 
         var dotProduct = 0f
         var normB = 0f

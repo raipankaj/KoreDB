@@ -38,10 +38,12 @@ import java.util.LinkedHashMap
 class KoreCollection<T>(
     val name: String,
     private val db: KoreDB,
-    private val serializer: KoreSerializer<T>
+    val serializer: KoreSerializer<T>
 ) {
     private val updates = MutableSharedFlow<String>(extraBufferCapacity = 100)
     private val indexExtractors = mutableMapOf<String, (T) -> String>()
+    private val searchableExtractors = mutableListOf<(T) -> String>()
+    val ftsIndex: com.pankaj.koredb.fts.FtsIndex = com.pankaj.koredb.fts.FtsIndex(name, db)
 
     // Object Cache to bypass JSON deserialization for frequent queries
     // Size increased to 65536 to handle large prefix/range bulk reads smoothly without thrashing
@@ -67,6 +69,17 @@ class KoreCollection<T>(
      */
     fun createIndex(indexName: String, extractor: (T) -> String) {
         indexExtractors[indexName] = extractor
+    }
+
+    /**
+     * Registers text field extractors for Okapi BM25 Full-Text Search indexing.
+     *
+     * ```kotlin
+     * collection.searchableFields({ it.title }, { it.content })
+     * ```
+     */
+    fun searchableFields(vararg extractors: (T) -> String) {
+        searchableExtractors.addAll(extractors)
     }
 
     private val docPrefix = "doc:$name:".toByteArray(Charsets.UTF_8)
@@ -105,6 +118,12 @@ class KoreCollection<T>(
 
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
         batch.add(docKey to docBytes)
+
+        // Index for Full-Text Search if configured
+        if (searchableExtractors.isNotEmpty()) {
+            val combinedText = searchableExtractors.joinToString(" ") { it(document) }
+            ftsIndex.indexDocument(id, combinedText, batch)
+        }
 
         indexExtractors.forEach { (idxName, extractor) ->
             val value = extractor(document)
@@ -152,7 +171,26 @@ class KoreCollection<T>(
      * @param id The ID of the document to delete.
      */
     suspend fun delete(id: String) {
-        db.deleteRaw(makeDocKey(escape(id).toByteArray(Charsets.UTF_8)))
+        val idBytes = escape(id).toByteArray(Charsets.UTF_8)
+        val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
+        batch.add(makeDocKey(idBytes) to KoreDB.TOMBSTONE)
+
+        if (searchableExtractors.isNotEmpty()) {
+            ftsIndex.removeDocument(id, batch)
+        }
+
+        indexExtractors.forEach { (idxName, _) ->
+            val idxNameBytes = getIndexNameBytes(idxName)
+            val rptrKey = buildKey(rptrPrefix, idxNameBytes, idBytes)
+            val oldValBytes = db.getRaw(rptrKey)
+            if (oldValBytes != null) {
+                val idxKey = buildKey(idxPrefix, idxNameBytes, oldValBytes, idBytes)
+                batch.add(idxKey to KoreDB.TOMBSTONE)
+                batch.add(rptrKey to KoreDB.TOMBSTONE)
+            }
+        }
+
+        db.writeBatchRaw(batch)
         synchronized(documentCache) {
             documentCache.remove(id)
         }
@@ -311,13 +349,12 @@ class KoreCollection<T>(
     }
 
     /**
-     * Retrieves all documents in the collection.
-     *
-     * @return A list of all documents.
+     * Retrieves all documents in the collection as a lazy [Sequence].
+     * Avoids eager deserialization of all documents when combined with limit or filters.
      */
-    fun getAll(): List<T> {
+    fun asSequence(): Sequence<T> = sequence {
         val rawResults = db.getByPrefixWithKeysRaw(docPrefix)
-        return rawResults.map { (keyBytes, valueBytes) ->
+        for ((keyBytes, valueBytes) in rawResults) {
             val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
             val id = unescape(escapedId)
             
@@ -332,8 +369,43 @@ class KoreCollection<T>(
                     documentCache[id] = doc!!
                 }
             }
-            doc!!
+            yield(doc!!)
         }
+    }
+
+    /**
+     * Retrieves all documents in the collection.
+     *
+     * @return A list of all documents.
+     */
+    fun getAll(): List<T> {
+        return getAllWithIds().values.toList()
+    }
+
+    /**
+     * Retrieves all documents in the collection as a map of ID to document.
+     */
+    fun getAllWithIds(): Map<String, T> {
+        val rawResults = db.getByPrefixWithKeysRaw(docPrefix)
+        val map = LinkedHashMap<String, T>()
+        for ((keyBytes, valueBytes) in rawResults) {
+            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val id = unescape(escapedId)
+            
+            var doc: T? = null
+            synchronized(documentCache) {
+                doc = documentCache[id]
+            }
+
+            if (doc == null) {
+                doc = serializer.deserialize(valueBytes)
+                synchronized(documentCache) {
+                    documentCache[id] = doc!!
+                }
+            }
+            map[id] = doc!!
+        }
+        return map
     }
 
     /**
@@ -441,6 +513,12 @@ class KoreCollection<T>(
             // Primary Document
             list.add(makeDocKey(idBytes) to docBytes)
 
+            // Full-Text Search Indexing
+            if (searchableExtractors.isNotEmpty()) {
+                val combinedText = searchableExtractors.joinToString(" ") { it(entry.value) }
+                ftsIndex.indexDocument(entry.key, combinedText, list)
+            }
+
             // Secondary Indices
             for ((idxName, extractor) in indexExtractors) {
                 val value = extractor(entry.value)
@@ -459,18 +537,39 @@ class KoreCollection<T>(
     }
 
     /**
+     * Executes an Okapi BM25 Full-Text Search query across registered searchable fields.
+     *
+     * @param query Keyword search query string.
+     * @param limit Maximum number of top-matching results to return.
+     * @return List of Pair(Document, BM25Score) sorted in descending order of relevance.
+     */
+    fun searchBM25(query: String, limit: Int = 10): List<Pair<T, Float>> {
+        val scoredIds = ftsIndex.search(query, limit)
+        return scoredIds.mapNotNull { (id, score) ->
+            val doc = getById(id) ?: return@mapNotNull null
+            doc to score
+        }
+    }
+
+    /**
      * Deletes all documents in the collection and notifies observers.
      */
     suspend fun deleteAll() {
         val keysToDelete = db.getKeysByPrefixRaw(docPrefix)
+        val idxKeysToDelete = db.getKeysByPrefixRaw(idxPrefix)
+        val rptrKeysToDelete = db.getKeysByPrefixRaw(rptrPrefix)
+        val ftsKeysToDelete = db.getKeysByPrefixRaw("fts:$name:".toByteArray(Charsets.UTF_8))
+        val ftsLenKeysToDelete = db.getKeysByPrefixRaw("ftslen:$name:".toByteArray(Charsets.UTF_8))
 
-        if (keysToDelete.isEmpty()) return
+        val allKeys = keysToDelete + idxKeysToDelete + rptrKeysToDelete + ftsKeysToDelete + ftsLenKeysToDelete
+        if (allKeys.isEmpty()) return
 
-        val batch = keysToDelete.map { keyBytes ->
+        val batch = allKeys.map { keyBytes ->
             Pair(keyBytes, KoreDB.TOMBSTONE)
         }
 
         db.writeBatchRaw(batch)
+        ftsIndex.clear()
         synchronized(documentCache) {
             documentCache.clear()
         }

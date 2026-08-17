@@ -50,6 +50,7 @@ class SSTableReader(val file: File) {
     // Sparse index structures for accelerated block-level lookups.
     private val blockKeys = mutableListOf<ByteArray>()
     private val blockOffsets = mutableListOf<Int>()
+    val compressionCodec: com.pankaj.koredb.compression.CompressionCodec
 
     init {
         val channel = RandomAccessFile(file, "r").channel
@@ -63,16 +64,20 @@ class SSTableReader(val file: File) {
         // Read the metadata footer (last 16 bytes of the file).
         buffer.position(buffer.capacity() - 16)
         val bloomFilterOffset = buffer.long
-        val version = buffer.int
+        val versionAndCodec = buffer.int
         val magicNumber = buffer.int
 
         if (magicNumber != SSTable.MAGIC_NUMBER) {
             throw IllegalStateException("Corrupt SSTable: Invalid Magic Number in ${file.name}")
         }
 
+        val version = versionAndCodec and 0x00FFFFFF
         if (version != SSTable.VERSION_V1) {
             throw UnsupportedOperationException("Unsupported SSTable version: $version. Please upgrade KoreDB.")
         }
+
+        val codecType = ((versionAndCodec ushr 24) and 0xFF).toByte()
+        compressionCodec = com.pankaj.koredb.compression.CompressionCodec.fromType(codecType)
 
         // Initialize the Bloom Filter from its serialized representation.
         buffer.position(bloomFilterOffset.toInt())
@@ -86,6 +91,10 @@ class SSTableReader(val file: File) {
         dataEndOffset = bloomFilterOffset
 
         buildSparseIndex()
+    }
+
+    fun decompressValue(bytes: ByteArray): ByteArray {
+        return if (bytes.isEmpty()) bytes else compressionCodec.decompress(bytes)
     }
 
     private fun buildSparseIndex() {
@@ -152,19 +161,22 @@ class SSTableReader(val file: File) {
         localBuffer.position(startOffset)
 
         while (localBuffer.position() < dataEndOffset) {
+            val recordPos = localBuffer.position()
             val keySize = localBuffer.getInt()
             val valueSize = localBuffer.getInt()
-            
-            val keyBytes = ByteArray(keySize)
-            localBuffer.get(keyBytes)
-            
-            val cmp = ByteArrayComparator.compare(keyBytes, targetKey)
+            val keyOffset = recordPos + 8
+
+            val cmp = compareBufferWithKey(localBuffer, keyOffset, keySize, targetKey)
             if (cmp == 0) {
+                localBuffer.position(keyOffset + keySize)
                 val valueBytes = ByteArray(valueSize)
                 localBuffer.get(valueBytes)
-                return valueBytes
-            } else if (cmp > 0) break
-            else localBuffer.position(localBuffer.position() + valueSize)
+                return decompressValue(valueBytes)
+            } else if (cmp > 0) {
+                break
+            } else {
+                localBuffer.position(keyOffset + keySize + valueSize)
+            }
         }
         return null
     }

@@ -392,6 +392,20 @@ class KoreVectorCollection(
     }
 
     /**
+     * Retrieves raw vectors for multiple IDs in a batch.
+     */
+    suspend fun getBatchVectors(ids: Collection<String>): Map<String, FloatArray> {
+        val result = mutableMapOf<String, FloatArray>()
+        for (id in ids) {
+            val vector = getVector(id)
+            if (vector != null) {
+                result[id] = vector
+            }
+        }
+        return result
+    }
+
+    /**
      * Retrieves metadata for a given vector ID.
      */
     suspend fun getMetadata(id: String): Map<String, Any>? {

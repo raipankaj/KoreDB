@@ -108,6 +108,11 @@ class MemTable {
     }
 
     /**
+     * Returns the total number of entries stored in the MemTable.
+     */
+    fun size(): Int = table.size
+
+    /**
      * Clears all entries from the table and resets the size counter.
      */
     fun clear() {
