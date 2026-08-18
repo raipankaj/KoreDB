@@ -33,7 +33,15 @@ class GraphTransaction(private val db: KoreDB) {
 
     private val json = Json { ignoreUnknownKeys = true }
     private val PRESENCE_MARKER = ByteArray(1) { 1 }
-    
+
+    private fun escape(value: String): String {
+        return value.replace("%", "%25").replace(":", "%3A")
+    }
+
+    private fun unescape(value: String): String {
+        return value.replace("%3A", ":").replace("%25", "%")
+    }
+
     /**
      * The internal batch buffer storing pending key-value updates.
      */
@@ -57,8 +65,12 @@ class GraphTransaction(private val db: KoreDB) {
             batch.add(Pair(labelKey, PRESENCE_MARKER))
             
             for ((key, value) in node.properties) {
-                val propKey = "g:idx:v_prop:$label:$key:$value:${node.id}".toByteArray(Charsets.UTF_8)
+                val propKey = "g:idx:v_prop:${escape(label)}:${escape(key)}:${escape(value)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(propKey, PRESENCE_MARKER))
+
+                // 2. Reverse Pointer (Truth Oracle)
+                val rptrKey = "g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+                batch.add(Pair(rptrKey, value.toByteArray(Charsets.UTF_8)))
             }
         }
     }
