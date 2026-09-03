@@ -36,3 +36,8 @@ koredb/publish-maven.gradle
 # Dokka output
 koredb/docs/
 koredb/build/dokka/
+
+# KoreDB runtime test data & locks
+kore_data/
+*.lock
+

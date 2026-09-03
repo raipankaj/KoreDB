@@ -16,7 +16,19 @@
 -keep class com.pankaj.koredb.core.KoreSerializer { *; }
 -keep class com.pankaj.koredb.graph.** { *; }
 -keep class com.pankaj.koredb.bridge.** { *; }
+-keep class com.pankaj.koredb.engine.mvcc.** { *; }
+-keep class com.pankaj.koredb.compression.** { *; }
+-keep class com.pankaj.koredb.foundation.** { *; }
+-keep class com.pankaj.koredb.core.SimdVectorMath { *; }
+-keep class com.pankaj.koredb.hnsw.ProductQuantizer { *; }
+-keep class com.pankaj.koredb.cdc.** { *; }
+-keep class com.pankaj.koredb.engine.IntegrityVerifier { *; }
+-keep class com.pankaj.koredb.engine.IntegrityReport { *; }
+-keep class com.pankaj.koredb.engine.KoreDBException { *; }
+-keep class com.pankaj.koredb.engine.DatabaseLockedException { *; }
+-keep class com.pankaj.koredb.engine.DiskSpaceExhaustedException { *; }
 
 # Prevent R8 from removing the companion objects which contain important constants/helpers
 -keepclassmembers class com.pankaj.koredb.engine.KoreDB$Companion { *; }
 -keepclassmembers class com.pankaj.koredb.foundation.SSTable$Companion { *; }
+

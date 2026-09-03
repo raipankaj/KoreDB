@@ -20,10 +20,31 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 ---
 
+## 📚 Documentation & Guides
+
+Explore the comprehensive documentation portal in the [`docs/`](docs/index.md) folder:
+
+*   🌐 **[Documentation Portal (HTML)](docs/index.html)** — Interactive, searchable documentation website.
+*   🏛️ **[LSM Engine Architecture](docs/architecture.md)** — WAL replay, MemTable, SSTables, Bloom filters, and compaction.
+*   📄 **[Document Collections & Queries](docs/document_engine.md)** — CBOR serialization, secondary indices, numeric ranges, BM25 text search.
+*   ⚡ **[Vector Engine & HNSW](docs/vector_engine.md)** — HNSW indexing, SQ8 quantization, off-heap mmap, metadata filtering.
+*   🕸️ **[Property Graph Engine](docs/graph_engine.md)** — Bidirectional graphs, cascading deletes, BFS, Dijkstra, PageRank.
+*   🧬 **[Unified Graph RAG Bridge](docs/hybrid_graph_rag.md)** — Hybrid semantic + graph traversals + Reciprocal Rank Fusion (RRF).
+*   🔒 **[Transactions & Snapshot Isolation](docs/transactions_mvcc.md)** — ACID MVCC, First-Committer-Wins conflict resolution.
+*   🛡️ **[Enterprise Capabilities](docs/enterprise_features.md)** — Change Data Capture (CDC), AES-GCM-256 encryption, LZ4 compression.
+*   🚀 **[Android Feature & Decision Guide](docs/android_features_guide.md)** — Jetpack Compose, WorkManager, Android Keystore, memory trim.
+*   🔄 **[Room to KoreDB Migration Guide](docs/migration_from_room.md)** — Step-by-step Room DAO conversion & zero-downtime migration.
+*   🛡️ **[Production Readiness Checklist](docs/production_checklist.md)** — Architecture checklist, R8 rules, and deployment advice.
+*   📊 **[Head-to-Head Benchmarks](docs/benchmarks.md)** — Real hardware benchmark results on **Google Pixel 7 Pro** vs Room/SQLite.
+*   📱 **[Complete Sample Project](docs/sample_codebase.md)** — Production-grade Kotlin Android architecture (Entities, Repository, ViewModel).
+
+---
+
 ## ✨ Features
 
 ### 📦 Collection Engine
 *   **⚡ Blazing Performance:** LSM architecture offers $O(1)$ write performance with a "Nitro" parallel serialization path.
+*   **🚀 Order-Preserving Numeric Byte Range LSM Pushdown:** Binary search ranges (`whereBetween`, `whereGt`, `whereLt`) evaluated directly inside the LSM storage tier — **5.7× faster** than in-memory filtering.
 *   **🔍 Okapi BM25 Full-Text Search:** Sub-millisecond keyword inverted indexing with Robertson-Spärck Jones IDF, term frequency saturation, and document length normalization.
 *   **🔍 Query DSL:** Range queries, multi-predicate filtering, sorting, limit/offset pagination.
 *   **📊 Aggregation:** Built-in `count`, `sum`, `avg`, `min`, `max` — no SQL required.
@@ -33,9 +54,11 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 ### 🤖 Vector Engine
 *   **🧠 HNSW Index:** Sub-millisecond Approximate Nearest Neighbor search with RNG pruning heuristic.
+*   **⚡ 16-Lane SIMD Unrolled Kernels:** Dot product, Euclidean, Manhattan, and Cosine vector operations optimized for ARM NEON and AVX.
+*   **📦 Product Quantization (PQ 32×):** 32× vector compression with Asymmetric Distance Computation (ADC) executing **6.3M distance evaluations/sec**.
 *   **🧬 Hybrid Search:** Pre-filtered HNSW traversal with 10 metadata operators (`eq`, `gt`, `lt`, `inList`, `contains`...).
 *   **🔀 Reciprocal Rank Fusion (RRF):** Blends BM25 keyword rankings with dense vector similarity for state-of-the-art search precision.
-*   **📐 4 Distance Metrics:** Cosine, Euclidean, Inner Product, Manhattan — all SIMD-friendly with 8-lane loop unrolling.
+*   **📐 4 Distance Metrics:** Cosine, Euclidean, Inner Product, Manhattan — all SIMD-friendly with 16-lane loop unrolling.
 *   **📦 Scalar Quantization (SQ8):** 4x memory reduction with <1% recall loss.
 *   **💾 Memory-Mapped (mmap) Indexing:** Near-zero memory footprint during read/search operations via direct file-to-buffer mapping.
 *   **🗑️ Delete & Update:** Soft-delete with tombstones + background compaction.
@@ -61,16 +84,16 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 *   **Vector-First:** Find similar vectors → filter by graph structure.
 *   **Graph-First:** Traverse relationships → rerank by vector similarity.
 
-### 🏗️ Core Engine
+### 🏗️ Core Engine & Production Hardening
+*   **🔒 True MVCC ACID Engine:** Multi-Version Concurrency Control with Snapshot Isolation, optimistic conflict detection, and **30,800+ committed ACID tx/sec**.
+*   **🗜️ LZ4 High-Speed Block Compression:** Zero-dependency pure-Kotlin LZ4 codec delivering **1.05 GB/s** decompression throughput.
+*   **⚡ 2-Tier Block Cache:** Sub-microsecond LRU block cache directly integrated into SSTable readers.
+*   **🛡️ Multi-Process File Locking:** Exclusive OS-level `FileLock` (`kore.lock`) preventing concurrent process corruption (`DatabaseLockedException`).
+*   **🔄 Schema Versioning & Migrations:** Built-in `targetSchemaVersion` and `onMigrate` hooks for safe upgrades across app releases.
+*   **📱 Android LMK & Memory Trim:** Integrates with `ComponentCallbacks2` to automatically evict block caches on memory pressure (`TRIM_MEMORY_RUNNING_CRITICAL`).
+*   **🛡️ Torn-Write Auto-Quarantine:** Corrupted SSTable segments from sudden battery pull are automatically isolated to `.corrupt` without failing startup.
 *   **🏗️ Pure Kotlin:** 100% Kotlin with Zero JNI overhead. No `sqlite3.so` bloat.
-*   **🔗 Coroutine First:** Non-blocking I/O with `Flow`, background indexing and automatic hydration.
-*   **⚡ Concurrent Group Commits:** Batching write pipeline that reduces disk sync overhead under heavy concurrent workloads.
-*   **💾 Snapshot Backup & Restore:** Point-in-time snapshot exports with CRC32 checksum verification.
-*   **📊 Observability & Metrics:** Real-time atomic counters for reads, writes, compactions, memory table sizes, and disk usage.
-*   **🪵 Structured & Pluggable Logging:** Configurable log levels with support for Logcat, SLF4J, or custom handlers.
 *   **🛡️ Crash Resilient:** Write-Ahead Logging (WAL) with CRC32 checksums and crash replay recovery.
-*   **🔍 Optimized Reads:** Bloom Filters, Sparse Indexing, Object Cache (65K entries).
-*   **📦 Lightweight:** Minimal footprint, perfect for mobile apps.
 
 ---
 
@@ -80,7 +103,7 @@ KoreDB is a pure Kotlin, embedded database engine built from the ground up using
 
 ```kotlin
 dependencies {
-    implementation("io.github.raipankaj:koredb:0.1.3")
+    implementation("io.github.raipankaj:koredb:0.2.0")
 }
 ```
 
@@ -243,18 +266,23 @@ matches.forEach { (product, bm25Score) ->
 
 | Operation | Description |
 | :--- | :--- |
-| `insert(id, doc)` | Inserts or updates a document. |
-| `insertBatch(map)` | Bulk saves in one transaction. |
-| `searchableFields(extractors...)` | Enables Okapi BM25 full-text indexing on fields. |
-| `searchBM25(query, limit)` | Executes a sub-millisecond BM25 keyword search. |
-| `getById(id)` | Retrieves by unique ID. |
+| `insert(doc)` | Inserts with an auto-generated unique ID. |
+| `insert(id, doc, ttlSeconds)` | Inserts with optional Time-to-Live auto-expiration. |
+| `insertBatch(map)` | Bulk saves in one atomic transaction. |
+| `delete(id)` | Tombstone-based deletion. |
+| `deleteBatch(ids)` | Atomic batch deletion of multiple IDs and indices. |
+| `deleteAll()` | Wipes all documents and indices in the collection. |
+| `db.dropCollection(name)` | Drops collection and purges all indexes & caches. |
+| `getById(id)` | Retrieves document (returns `null` if expired or missing). |
 | `getByIdRange(start, end)` | Range scan [start, end). |
 | `getByIdPrefix(prefix)` | Prefix scan. |
 | `getByIndex(name, val)` | Secondary index lookup. |
-| `delete(id)` | Tombstone-based deletion. |
-| `deleteAll()` | Wipes the collection. |
-| `count()` | Returns document count. |
-| `query()` | Creates a query builder (filter, sort, limit, aggregate). |
+| `count()` | Returns valid document count. |
+| `rebuildIndexes()` | Backfills secondary & numeric indexes on existing data. |
+| `query().asFlow()` | Reactive Jetpack Compose Flow for filtered queries. |
+| `searchableFields(...)` | Enables Okapi BM25 full-text indexing on fields. |
+| `searchBM25(query, limit)` | Executes a sub-millisecond BM25 keyword search. |
+| `KoreDatabase.inMemory()` | Ephemeral in-memory database for unit tests. |
 | `updateFields(id, transform)` | Partial document update. |
 | `updateFieldsBatch(ids, transform)` | Batch partial update. |
 | `registerProperty(name, extractor)` | Registers a property for queries. |
