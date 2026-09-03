@@ -42,23 +42,35 @@ class GraphTransaction(private val db: KoreDB) {
     private var isCommitted = false
     private var isRolledBack = false
 
+    private fun escape(value: String): String {
+        return value.replace("%", "%25").replace(":", "%3A")
+    }
+
+    private fun unescape(value: String): String {
+        return value.replace("%3A", ":").replace("%25", "%")
+    }
+
     /**
      * Buffers a [Node] for insertion or update, including all secondary indices.
      */
     fun putNode(node: Node) {
         checkState()
-        val nodeKey = "g:v:${node.id}".toByteArray(Charsets.UTF_8)
+        val nodeKey = "g:v:${escape(node.id)}".toByteArray(Charsets.UTF_8)
         val nodeValue = json.encodeToString(node).toByteArray(Charsets.UTF_8)
         
         batch.add(Pair(nodeKey, nodeValue))
         
         for (label in node.labels) {
-            val labelKey = "g:idx:v:$label:${node.id}".toByteArray(Charsets.UTF_8)
+            val labelKey = "g:idx:v:${escape(label)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
             batch.add(Pair(labelKey, PRESENCE_MARKER))
             
             for ((key, value) in node.properties) {
-                val propKey = "g:idx:v_prop:$label:$key:$value:${node.id}".toByteArray(Charsets.UTF_8)
+                val propKey = "g:idx:v_prop:${escape(label)}:${escape(key)}:${escape(value)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(propKey, PRESENCE_MARKER))
+
+                // Mandatory reverse pointer for index freshness validation (truth oracle)
+                val rptrKey = "g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+                batch.add(Pair(rptrKey, value.toByteArray(Charsets.UTF_8)))
             }
         }
     }
@@ -70,14 +82,14 @@ class GraphTransaction(private val db: KoreDB) {
         checkState()
         val edgeValue = json.encodeToString(edge).toByteArray(Charsets.UTF_8)
         
-        val outKey = "g:e:out:${edge.sourceId}:${edge.type}:${edge.targetId}".toByteArray(Charsets.UTF_8)
-        val inKey  = "g:e:in:${edge.targetId}:${edge.type}:${edge.sourceId}".toByteArray(Charsets.UTF_8)
+        val outKey = "g:e:out:${escape(edge.sourceId)}:${escape(edge.type)}:${escape(edge.targetId)}".toByteArray(Charsets.UTF_8)
+        val inKey  = "g:e:in:${escape(edge.targetId)}:${escape(edge.type)}:${escape(edge.sourceId)}".toByteArray(Charsets.UTF_8)
         
         batch.add(Pair(outKey, edgeValue))
         batch.add(Pair(inKey, edgeValue))
         
         for ((key, value) in edge.properties) {
-             val propKey = "g:idx:e_prop:${edge.type}:$key:$value:${edge.sourceId}:${edge.targetId}".toByteArray(Charsets.UTF_8)
+             val propKey = "g:idx:e_prop:${escape(edge.type)}:${escape(key)}:${escape(value)}:${escape(edge.sourceId)}:${escape(edge.targetId)}".toByteArray(Charsets.UTF_8)
              batch.add(Pair(propKey, PRESENCE_MARKER))
         }
     }

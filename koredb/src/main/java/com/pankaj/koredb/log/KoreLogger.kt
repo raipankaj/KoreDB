@@ -84,3 +84,65 @@ class DefaultKoreLogger(private val tag: String) : KoreLogger {
         }
     }
 }
+
+/**
+ * Android Logcat logger implementation with safe JVM fallback.
+ */
+class AndroidLogcatLogger(private val tag: String) : KoreLogger {
+    override fun debug(message: String) {
+        if (KoreLogger.minLevel <= KoreLogLevel.DEBUG) {
+            try {
+                android.util.Log.d(tag, message)
+            } catch (_: Throwable) {
+                println("[DEBUG] [$tag] $message")
+            }
+        }
+    }
+
+    override fun info(message: String) {
+        if (KoreLogger.minLevel <= KoreLogLevel.INFO) {
+            try {
+                android.util.Log.i(tag, message)
+            } catch (_: Throwable) {
+                println("[INFO] [$tag] $message")
+            }
+        }
+    }
+
+    override fun warn(message: String, throwable: Throwable?) {
+        if (KoreLogger.minLevel <= KoreLogLevel.WARN) {
+            try {
+                if (throwable != null) {
+                    android.util.Log.w(tag, message, throwable)
+                } else {
+                    android.util.Log.w(tag, message)
+                }
+            } catch (_: Throwable) {
+                if (throwable != null) {
+                    println("[WARN] [$tag] $message - ${throwable.message}")
+                } else {
+                    println("[WARN] [$tag] $message")
+                }
+            }
+        }
+    }
+
+    override fun error(message: String, throwable: Throwable?) {
+        if (KoreLogger.minLevel <= KoreLogLevel.ERROR) {
+            try {
+                if (throwable != null) {
+                    android.util.Log.e(tag, message, throwable)
+                } else {
+                    android.util.Log.e(tag, message)
+                }
+            } catch (_: Throwable) {
+                if (throwable != null) {
+                    println("[ERROR] [$tag] $message - ${throwable.message}")
+                    throwable.printStackTrace()
+                } else {
+                    println("[ERROR] [$tag] $message")
+                }
+            }
+        }
+    }
+}

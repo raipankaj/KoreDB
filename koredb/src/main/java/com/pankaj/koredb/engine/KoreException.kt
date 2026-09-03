@@ -40,3 +40,19 @@ class TransactionException(message: String, cause: Throwable? = null) : KoreDBEx
  * Thrown when backup creation or restore verification fails.
  */
 class BackupRestoreException(message: String, cause: Throwable? = null) : KoreDBException(message, cause)
+
+/**
+ * Thrown when another process or database instance holds an exclusive lock on the database directory.
+ */
+class DatabaseLockedException(message: String, cause: Throwable? = null) : KoreDBException(message, cause)
+
+/**
+ * Thrown when free disk space falls below the configured safety threshold.
+ */
+class DiskSpaceExhaustedException(
+    message: String,
+    val freeBytes: Long,
+    val requiredBytes: Long,
+    cause: Throwable? = null
+) : KoreDBException(message, cause)
+

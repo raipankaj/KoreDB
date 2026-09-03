@@ -1,5 +1,9 @@
 package com.pankaj.koredb.core
 
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+
 /**
  * A fluent query builder for KoreDB collections.
  *
@@ -36,10 +40,63 @@ class KoreQuery<T>(
     private val propertyExtractors: Map<String, (T) -> String>
 ) {
     private val filters = mutableListOf<(T) -> Boolean>()
+    private val equalityFilters = mutableMapOf<String, String>()
+    private val numericRangeFilters = mutableMapOf<String, Pair<Double, Double>>()
     private var sortKey: ((T) -> Comparable<*>)? = null
     private var sortDescending = false
     private var limitCount: Int? = null
     private var offsetCount: Int = 0
+
+    /**
+     * Filters documents where the property equals the specified value.
+     * If a secondary index exists on [propertyName], KoreDB will push down
+     * the query directly to the index rather than performing a full collection scan.
+     */
+    fun whereEq(propertyName: String, value: String): KoreQuery<T> {
+        equalityFilters[propertyName] = value
+        val extractor = propertyExtractors[propertyName]
+        if (extractor != null) {
+            filters.add { doc -> extractor(doc) == value }
+        }
+        return this
+    }
+
+    /**
+     * Filters documents where a numeric property falls within the range [min, max] (inclusive).
+     * If a numeric index exists on [propertyName], KoreDB pushes down the range query
+     * directly into an O(log N) LSM-tree binary seek.
+     */
+    fun whereBetween(propertyName: String, min: Double, max: Double): KoreQuery<T> {
+        numericRangeFilters[propertyName] = Pair(min, max)
+        val numExtractor = collection.getNumericExtractor(propertyName)
+        if (numExtractor != null) {
+            filters.add { doc ->
+                val v = numExtractor(doc)
+                v in min..max
+            }
+        } else {
+            val strExtractor = propertyExtractors[propertyName]
+            if (strExtractor != null) {
+                filters.add { doc ->
+                    val v = strExtractor(doc).toDoubleOrNull()
+                    v != null && v in min..max
+                }
+            }
+        }
+        return this
+    }
+
+    /** Filters documents where numeric property is strictly greater than [min]. */
+    fun whereGt(propertyName: String, min: Double): KoreQuery<T> = whereBetween(propertyName, Math.nextUp(min), Double.MAX_VALUE)
+
+    /** Filters documents where numeric property is greater than or equal to [min]. */
+    fun whereGte(propertyName: String, min: Double): KoreQuery<T> = whereBetween(propertyName, min, Double.MAX_VALUE)
+
+    /** Filters documents where numeric property is strictly less than [max]. */
+    fun whereLt(propertyName: String, max: Double): KoreQuery<T> = whereBetween(propertyName, -Double.MAX_VALUE, Math.nextDown(max))
+
+    /** Filters documents where numeric property is less than or equal to [max]. */
+    fun whereLte(propertyName: String, max: Double): KoreQuery<T> = whereBetween(propertyName, -Double.MAX_VALUE, max)
 
     /**
      * Filters documents where the extracted property value matches the predicate.
@@ -93,9 +150,34 @@ class KoreQuery<T>(
 
     /**
      * Executes the query and returns matching documents with early-termination streaming.
+     * Leverages index pushdown when equality filters match secondary indexes.
      */
     fun execute(): List<T> {
-        var seq = collection.asSequence()
+        // Calculate whether there are non-index filters that require post-filtering
+        val canPushDownLimit = sortKey == null && limitCount != null
+        val effectiveLimitForIndex = if (canPushDownLimit && filters.size <= 1) {
+            offsetCount + limitCount!!
+        } else null
+
+        // Index Pushdown Optimization (Equality or Numeric Range)
+        var indexedCandidates: List<T>? = null
+        for ((propName, propVal) in equalityFilters) {
+            if (collection.hasIndex(propName)) {
+                indexedCandidates = collection.getByIndex(propName, propVal, effectiveLimitForIndex)
+                break
+            }
+        }
+
+        if (indexedCandidates == null) {
+            for ((propName, range) in numericRangeFilters) {
+                if (collection.hasNumericIndex(propName)) {
+                    indexedCandidates = collection.getByNumericRange(propName, range.first, range.second, effectiveLimitForIndex)
+                    break
+                }
+            }
+        }
+
+        var seq: Sequence<T> = indexedCandidates?.asSequence() ?: collection.asSequence()
 
         // Apply filters lazily
         for (filter in filters) {
@@ -107,9 +189,9 @@ class KoreQuery<T>(
         if (key != null) {
             @Suppress("UNCHECKED_CAST")
             val list = if (sortDescending) {
-                seq.toList().sortedByDescending { key(it) as Comparable<Any> }
+                seq.toList().sortedByDescending { doc -> key(doc) as Comparable<Any> }
             } else {
-                seq.toList().sortedBy { key(it) as Comparable<Any> }
+                seq.toList().sortedBy { doc -> key(doc) as Comparable<Any> }
             }
             var resultList = list
             if (offsetCount > 0) resultList = resultList.drop(offsetCount)
@@ -125,13 +207,41 @@ class KoreQuery<T>(
     }
 
     /**
+     * Converts this query into a cold [kotlinx.coroutines.flow.Flow] that emits the matching result list immediately,
+     * and subsequently re-evaluates and emits whenever relevant collection mutations occur.
+     */
+    fun asFlow(): Flow<List<T>> = flow {
+        emit(execute())
+        collection.internalUpdates.collect {
+            emit(execute())
+        }
+    }.distinctUntilChanged()
+
+    /**
      * Executes the query and returns aggregation results.
      */
     fun aggregate(block: AggregationBuilder<T>.() -> Unit): AggregationResult {
         val builder = AggregationBuilder<T>(propertyExtractors)
         builder.block()
 
-        var seq = collection.asSequence()
+        var indexedCandidates: List<T>? = null
+        for ((propName, propVal) in equalityFilters) {
+            if (collection.hasIndex(propName)) {
+                indexedCandidates = collection.getByIndex(propName, propVal)
+                break
+            }
+        }
+
+        if (indexedCandidates == null) {
+            for ((propName, range) in numericRangeFilters) {
+                if (collection.hasNumericIndex(propName)) {
+                    indexedCandidates = collection.getByNumericRange(propName, range.first, range.second)
+                    break
+                }
+            }
+        }
+
+        var seq: Sequence<T> = indexedCandidates?.asSequence() ?: collection.asSequence()
         for (filter in filters) seq = seq.filter(filter)
 
         return builder.compute(seq.toList())
@@ -139,7 +249,31 @@ class KoreQuery<T>(
 
     /** Returns the count of matching documents. */
     fun count(): Int {
-        var seq = collection.asSequence()
+        if (filters.isEmpty() && equalityFilters.isEmpty() && numericRangeFilters.isEmpty()) {
+            return collection.count()
+        }
+        var indexedCandidates: List<T>? = null
+        for ((propName, propVal) in equalityFilters) {
+            if (collection.hasIndex(propName)) {
+                indexedCandidates = collection.getByIndex(propName, propVal)
+                if (filters.size <= 1) {
+                    return indexedCandidates.size
+                }
+                break
+            }
+        }
+        if (indexedCandidates == null) {
+            for ((propName, range) in numericRangeFilters) {
+                if (collection.hasNumericIndex(propName)) {
+                    indexedCandidates = collection.getByNumericRange(propName, range.first, range.second)
+                    if (filters.size <= 1) {
+                        return indexedCandidates.size
+                    }
+                    break
+                }
+            }
+        }
+        var seq: Sequence<T> = indexedCandidates?.asSequence() ?: collection.asSequence()
         for (filter in filters) seq = seq.filter(filter)
         return seq.count()
     }

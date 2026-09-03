@@ -17,6 +17,7 @@
 package com.pankaj.koredb.foundation
 
 import com.pankaj.koredb.core.VectorMath
+import java.io.Closeable
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.MappedByteBuffer
@@ -30,10 +31,12 @@ import java.util.PriorityQueue
  * access to data persisted on disk. It is designed for low-latency point lookups, 
  * efficient prefix scans, and high-throughput vector similarity searches.
  */
-class SSTableReader(val file: File) {
+class SSTableReader(val file: File, var blockCache: BlockCache? = null) : Closeable {
     
     var level: Int = 0
 
+    private val raf: RandomAccessFile
+    private val channel: FileChannel
     private val buffer: MappedByteBuffer
     private val bloomFilter: BloomFilter
 
@@ -53,7 +56,8 @@ class SSTableReader(val file: File) {
     val compressionCodec: com.pankaj.koredb.compression.CompressionCodec
 
     init {
-        val channel = RandomAccessFile(file, "r").channel
+        raf = RandomAccessFile(file, "r")
+        channel = raf.channel
         buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
         buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
 
@@ -168,10 +172,16 @@ class SSTableReader(val file: File) {
 
             val cmp = compareBufferWithKey(localBuffer, keyOffset, keySize, targetKey)
             if (cmp == 0) {
+                val cacheKey = "${file.name}:$recordPos"
+                val cached = blockCache?.get(cacheKey)
+                if (cached != null) return cached
+
                 localBuffer.position(keyOffset + keySize)
                 val valueBytes = ByteArray(valueSize)
                 localBuffer.get(valueBytes)
-                return decompressValue(valueBytes)
+                val decompressed = if (SSTable.isVectorKey(targetKey)) valueBytes else decompressValue(valueBytes)
+                blockCache?.put(cacheKey, decompressed)
+                return decompressed
             } else if (cmp > 0) {
                 break
             } else {
@@ -280,6 +290,15 @@ class SSTableReader(val file: File) {
             finalResults.add(Pair(keyBytes, winner.second))
         }
         return finalResults.reversed()
+    }
+
+    override fun close() {
+        try {
+            channel.close()
+        } catch (_: Exception) {}
+        try {
+            raf.close()
+        } catch (_: Exception) {}
     }
 }
 

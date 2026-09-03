@@ -82,27 +82,32 @@ class WriteAheadLog(private val logFile: File) {
      */
     @Synchronized
     fun appendBatch(batch: List<Pair<ByteArray, ByteArray>>) {
-        // Calculate the exact payload size to avoid over/under-allocation
-        var payloadSize = 0
-        for (i in batch.indices) {
-            val pair = batch[i]
-            payloadSize += 12 + pair.first.size + pair.second.size
-        }
-        // Total = payload + BEGIN(4) + CRC_MARKER(4) + CRC_VALUE(8) + COMMIT(4) = payload + 20
-        val totalSize = payloadSize + 20
-
+        val bufferCapacity = 4 * 1024 * 1024 // Fixed 4MB streaming buffer
         var buffer = sharedBuffer
-        if (buffer == null || buffer.capacity() < totalSize) {
-            // Geometric growth: at least 4MB or 2× the required size
-            val newCapacity = maxOf(totalSize, 4 * 1024 * 1024)
-            buffer = ByteBuffer.allocateDirect(newCapacity)
-                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        if (buffer == null) {
+            buffer = ByteBuffer.allocateDirect(bufferCapacity).order(java.nio.ByteOrder.LITTLE_ENDIAN)
             sharedBuffer = buffer
         }
         buffer.clear()
 
-        buffer.putInt(RECORD_BEGIN)
         val crc = CRC32()
+
+        fun flushBuffer() {
+            buffer.flip()
+            while (buffer.hasRemaining()) {
+                channel.write(buffer)
+            }
+            buffer.clear()
+        }
+
+        fun ensureSpace(needed: Int) {
+            if (buffer.remaining() < needed) {
+                flushBuffer()
+            }
+        }
+
+        ensureSpace(4)
+        buffer.putInt(RECORD_BEGIN)
 
         for (i in batch.indices) {
             val pair = batch[i]
@@ -112,21 +117,40 @@ class WriteAheadLog(private val logFile: File) {
             crc.update(key)
             crc.update(value)
 
-            buffer.putInt(RECORD_PUT)
-            buffer.putInt(key.size)
-            buffer.putInt(value.size)
-            buffer.put(key)
-            buffer.put(value)
+            val recordHeaderSize = 12 // RECORD_PUT (4) + key.size (4) + value.size (4)
+            val recordTotalSize = recordHeaderSize + key.size + value.size
+
+            if (recordTotalSize <= buffer.capacity()) {
+                ensureSpace(recordTotalSize)
+                buffer.putInt(RECORD_PUT)
+                buffer.putInt(key.size)
+                buffer.putInt(value.size)
+                buffer.put(key)
+                buffer.put(value)
+            } else {
+                // Large record exceeding 4MB: write header via buffer, stream payloads directly
+                ensureSpace(recordHeaderSize)
+                buffer.putInt(RECORD_PUT)
+                buffer.putInt(key.size)
+                buffer.putInt(value.size)
+                flushBuffer()
+
+                val keyBuf = ByteBuffer.wrap(key)
+                while (keyBuf.hasRemaining()) {
+                    channel.write(keyBuf)
+                }
+                val valBuf = ByteBuffer.wrap(value)
+                while (valBuf.hasRemaining()) {
+                    channel.write(valBuf)
+                }
+            }
         }
 
+        ensureSpace(16) // BATCH_CRC (4) + crc.value (8) + RECORD_COMMIT (4)
         buffer.putInt(BATCH_CRC)
         buffer.putLong(crc.value)
         buffer.putInt(RECORD_COMMIT)
-        buffer.flip()
-
-        while (buffer.hasRemaining()) {
-            channel.write(buffer)
-        }
+        flushBuffer()
     }
 
     /**
@@ -203,8 +227,11 @@ class WriteAheadLog(private val logFile: File) {
 
                                 val keyBuffer = ByteBuffer.wrap(key)
                                 while (keyBuffer.hasRemaining()) { if (channel.read(keyBuffer) <= 0) break }
+                                if (keyBuffer.hasRemaining()) break
+
                                 val valueBuffer = ByteBuffer.wrap(value)
                                 while (valueBuffer.hasRemaining()) { if (channel.read(valueBuffer) <= 0) break }
+                                if (valueBuffer.hasRemaining()) break
 
                                 batchCrc.update(key)
                                 batchCrc.update(value)

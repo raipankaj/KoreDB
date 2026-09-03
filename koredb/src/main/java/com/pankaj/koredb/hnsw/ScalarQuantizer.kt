@@ -133,7 +133,7 @@ class ScalarQuantizer(val dimensions: Int) {
                     val diff = query[d] - recon
                     sumSq += diff * diff
                 }
-                sqrt(sumSq)
+                -sqrt(sumSq)
             }
             DistanceMetric.INNER_PRODUCT -> {
                 var dot = 0f
@@ -149,7 +149,7 @@ class ScalarQuantizer(val dimensions: Int) {
                     val recon = (quantized[d].toInt() and 0xFF) * inverseScales[d] + minBounds[d]
                     sum += abs(query[d] - recon)
                 }
-                sum
+                -sum
             }
         }
     }

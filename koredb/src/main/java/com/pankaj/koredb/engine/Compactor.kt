@@ -17,7 +17,6 @@
 package com.pankaj.koredb.engine
 
 import com.pankaj.koredb.foundation.ByteArrayComparator
-import com.pankaj.koredb.foundation.MemTable
 import com.pankaj.koredb.foundation.SSTable
 import com.pankaj.koredb.foundation.SSTableIterator
 import com.pankaj.koredb.foundation.SSTableReader
@@ -51,94 +50,95 @@ object Compactor {
      * Merges multiple SSTables into a single, clean SSTable.
      *
      * This implementation uses a multi-way merge algorithm with a [PriorityQueue]
-     * to efficiently process sorted data from multiple readers.
+     * to efficiently process sorted data from multiple readers in a streaming fashion,
+     * writing directly to disk without intermediate in-memory MemTable accumulation.
      *
      * @param readers A list of [SSTableReader]s for the segments to be compacted.
      * @param outputFile The destination file for the new, compacted SSTable.
      * @param truthOracle An optional function to validate if an index entry is still fresh.
+     * @param compressionCodec Codec for output payload compression.
+     * @param priorities Optional explicit priorities for readers (higher priority = newer data).
      */
     fun compact(
         readers: List<SSTableReader>,
         outputFile: File,
         truthOracle: ((ByteArray) -> ByteArray?)? = null,
-        compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
+        compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec,
+        priorities: List<Int>? = null
     ) {
-        // 1. Initialize Iterators for all input files
+        // 1. Initialize Iterators for all input files with level-aware priorities
         val queue = PriorityQueue<SSTableIterator>()
         readers.forEachIndexed { index, reader ->
-            val iterator = SSTableIterator(reader, priority = index)
+            val p = priorities?.getOrNull(index) ?: ((10 - reader.level) * 1_000_000 + index)
+            val iterator = SSTableIterator(reader, priority = p)
             if (iterator.currentKey != null) {
                 queue.add(iterator)
             }
         }
 
-        // 2. Process and Merge
-        val tempMemTable = MemTable()
-        var lastProcessedKey: ByteArray? = null
+        // 2. Streaming K-way merge sequence without intermediate MemTable
+        val mergedSequence = sequence {
+            var lastProcessedKey: ByteArray? = null
 
-        while (queue.isNotEmpty()) {
-            val topIterator = queue.poll()!!
-            val candidateKey = topIterator.currentKey!!
+            while (queue.isNotEmpty()) {
+                val topIterator = queue.poll()!!
+                val candidateKey = topIterator.currentKey!!
 
-            val isNewKey = lastProcessedKey == null || ByteArrayComparator.compare(candidateKey, lastProcessedKey) != 0
-            
-            if (isNewKey) {
-                lastProcessedKey = candidateKey
-                val candidateValue = topIterator.value() ?: KoreDB.TOMBSTONE
+                val isNewKey = lastProcessedKey == null || ByteArrayComparator.compare(candidateKey, lastProcessedKey) != 0
 
-                if (candidateValue.isNotEmpty()) {
-                    // --- INDEX-AWARE COMPACTION ---
-                    // Fast binary prefix check to avoid allocating strings on non-index keys
-                    var shouldDrop = false
-                    
-                    if (truthOracle != null) {
-                        if (startsWith(candidateKey, IDX_PREFIX_BYTES)) {
-                            val keyStr = String(candidateKey, Charsets.UTF_8)
-                            val parts = keyStr.split(":")
-                            if (parts.size >= 5) {
-                                val collName = parts[1]
-                                val fieldName = parts[2]
-                                val indexValue = parts[3]
-                                val id = parts[4]
-                                
-                                val rptrKey = "rptr:$collName:$fieldName:$id".toByteArray(Charsets.UTF_8)
-                                val currentTruth = truthOracle(rptrKey)?.let { String(it, Charsets.UTF_8) }
-                                
-                                if (currentTruth != null && currentTruth != indexValue) {
-                                    shouldDrop = true
+                if (isNewKey) {
+                    lastProcessedKey = candidateKey
+                    val candidateValue = topIterator.value() ?: KoreDB.TOMBSTONE
+
+                    if (candidateValue.isNotEmpty()) {
+                        // --- INDEX-AWARE COMPACTION ---
+                        var shouldDrop = false
+
+                        if (truthOracle != null) {
+                            if (startsWith(candidateKey, IDX_PREFIX_BYTES)) {
+                                val keyStr = String(candidateKey, Charsets.UTF_8)
+                                val parts = keyStr.split(":")
+                                if (parts.size >= 5) {
+                                    val collName = parts[1]
+                                    val id = parts.last()
+                                    val docKey = "doc:$collName:$id".toByteArray(Charsets.UTF_8)
+                                    val docBytes = truthOracle(docKey)
+                                    if (docBytes == null || docBytes.isEmpty()) {
+                                        shouldDrop = true // Document deleted: purge index entry
+                                    }
                                 }
-                            }
-                        } else if (startsWith(candidateKey, GRAPH_IDX_PREFIX_BYTES)) {
-                            val keyStr = String(candidateKey, Charsets.UTF_8)
-                            val parts = keyStr.split(":")
-                            if (parts.size >= 7) {
-                                val label = parts[3]
-                                val key = parts[4]
-                                val value = parts[5]
-                                val nodeId = parts[6]
-                                
-                                val rptrKey = "g:rptr:v_prop:$label:$key:$nodeId".toByteArray(Charsets.UTF_8)
-                                val currentTruth = truthOracle(rptrKey)?.let { String(it, Charsets.UTF_8) }
-                                
-                                if (currentTruth != null && currentTruth != value) {
-                                    shouldDrop = true
+                            } else if (startsWith(candidateKey, GRAPH_IDX_PREFIX_BYTES)) {
+                                val keyStr = String(candidateKey, Charsets.UTF_8)
+                                val parts = keyStr.split(":")
+                                if (parts.size >= 7) {
+                                    val label = parts[3]
+                                    val key = parts[4]
+                                    val value = parts[5]
+                                    val nodeId = parts[6]
+
+                                    val rptrKey = "g:rptr:v_prop:$label:$key:$nodeId".toByteArray(Charsets.UTF_8)
+                                    val currentTruth = truthOracle(rptrKey)?.let { String(it, Charsets.UTF_8) }
+
+                                    if (currentTruth != null && currentTruth != value) {
+                                        shouldDrop = true
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if (!shouldDrop) {
-                        tempMemTable.put(candidateKey, candidateValue)
+                        if (!shouldDrop) {
+                            yield(Pair(candidateKey, candidateValue))
+                        }
                     }
                 }
-            }
 
-            if (topIterator.advance()) {
-                queue.add(topIterator)
+                if (topIterator.advance()) {
+                    queue.add(topIterator)
+                }
             }
         }
 
-        // 3. Persist the merged, deduplicated data to disk
-        SSTable.writeFromMemTable(tempMemTable, outputFile, compressionCodec)
+        // 3. Persist the merged, deduplicated stream directly to disk
+        SSTable.writeSortedEntries(mergedSequence, outputFile, compressionCodec)
     }
 }

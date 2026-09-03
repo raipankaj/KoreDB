@@ -62,7 +62,7 @@ class SSTableIterator(
         
         // No need to restore position if we are doing a range scan, 
         // as advance() will handle the skip if valueRead is false.
-        return reader.decompressValue(valueBytes)
+        return if (currentKey != null && SSTable.isVectorKey(currentKey!!)) valueBytes else reader.decompressValue(valueBytes)
     }
 
     /**

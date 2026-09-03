@@ -108,4 +108,67 @@ class CompactionTest {
         assertNotNull("Post-compact value missing (Compaction lost data!)", postCompact)
         assertEquals("Newest version must survive compaction", "v2", String(postCompact!!))
     }
+
+    @Test
+    fun `test Compaction Level 0 overrides Level 1`() = runBlocking {
+        val key = "l0_vs_l1_key".toByteArray()
+
+        // 1. Write V1 and trigger compaction to push it to Level 1
+        db.putRaw(key, "old_l1_value".toByteArray())
+        db.flushMemTableInternal()
+
+        // Write 3 more files to force compaction into L1
+        for (i in 1..3) {
+            db.putRaw("dummy_$i".toByteArray(), "val_$i".toByteArray())
+            db.flushMemTableInternal()
+        }
+
+        db.performLeveledCompaction()
+
+        // Verify key is in L1 with old value
+        assertEquals("old_l1_value", String(db.getRaw(key)!!))
+
+        // 2. Now write V2 into Level 0 (fresh memtable flush)
+        db.putRaw(key, "new_l0_value".toByteArray())
+        db.flushMemTableInternal()
+
+        // Verify that before L0->L1 compaction, read path returns new L0 value
+        assertEquals("new_l0_value", String(db.getRaw(key)!!))
+
+        // 3. Compact L0 + L1 together
+        db.performLeveledCompaction()
+
+        // The newer Level 0 value MUST survive compaction!
+        val afterCompaction = db.getRaw(key)
+        assertNotNull("Record lost during L0->L1 compaction", afterCompaction)
+        assertEquals("Level 0 value must override Level 1 value", "new_l0_value", String(afterCompaction!!))
+    }
+
+    @Test
+    fun `test Compaction Level 0 Tombstone overrides Level 1 value`() = runBlocking {
+        val key = "l0_tombstone_key".toByteArray()
+
+        // 1. Write V1 and push to Level 1
+        db.putRaw(key, "persisted_value".toByteArray())
+        db.flushMemTableInternal()
+
+        for (i in 1..3) {
+            db.putRaw("dummy_tomb_$i".toByteArray(), "val_$i".toByteArray())
+            db.flushMemTableInternal()
+        }
+        db.performLeveledCompaction()
+
+        assertEquals("persisted_value", String(db.getRaw(key)!!))
+
+        // 2. Delete key in Level 0
+        db.deleteRaw(key)
+        db.flushMemTableInternal()
+
+        // 3. Compact L0 + L1 together
+        db.performLeveledCompaction()
+
+        // The tombstone in Level 0 MUST delete the Level 1 value!
+        val afterCompaction = db.getRaw(key)
+        assertNull("Level 0 tombstone must delete Level 1 entry during compaction", afterCompaction)
+    }
 }

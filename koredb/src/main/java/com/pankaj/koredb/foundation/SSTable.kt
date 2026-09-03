@@ -77,6 +77,26 @@ class SSTable {
             outputFile: File,
             compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
         ) {
+            writeSortedEntries(
+                memTable.getSortedEntries().map { it.key to it.value },
+                outputFile,
+                compressionCodec
+            )
+        }
+
+        /**
+         * Persists a sequence of sorted key-value pairs directly to an SSTable file.
+         * Used for streaming compaction to eliminate intermediate in-memory MemTable accumulation.
+         *
+         * @param entries Sorted key-value pairs to write.
+         * @param outputFile The destination SSTable file.
+         * @param compressionCodec Codec for payload compression.
+         */
+        fun writeSortedEntries(
+            entries: Sequence<Pair<ByteArray, ByteArray>>,
+            outputFile: File,
+            compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
+        ) {
             val fileOutputStream = FileOutputStream(outputFile)
             val channel: FileChannel = fileOutputStream.channel
 
@@ -84,24 +104,19 @@ class SSTable {
             // Parameters are tuned for 100k entries with a low false-positive rate.
             val bloomFilter = BloomFilter(100_000, 3)
 
-            // --- OPTIMIZATION: Single reusable DirectByteBuffer ---
-            // Eliminates tens of thousands of per-record heap allocations.
-            // DirectByteBuffer bypasses the JVM heap for faster kernel I/O.
             val bufferCapacity = 256 * 1024 // 256KB write buffer
             var buffer = ByteBuffer.allocateDirect(bufferCapacity)
                 .order(java.nio.ByteOrder.LITTLE_ENDIAN)
 
             // 1. Write the Data Blocks: Iterate through sorted entries and append to file.
-            for (entry in memTable.getSortedEntries()) {
-                val key = entry.key
-                val rawValue = entry.value
-                val value = if (rawValue.isNotEmpty()) compressionCodec.compress(rawValue) else rawValue
+            for (entry in entries) {
+                val key = entry.first
+                val rawValue = entry.second
+                val value = if (rawValue.isNotEmpty() && !isVectorKey(key)) compressionCodec.compress(rawValue) else rawValue
 
                 bloomFilter.add(key)
 
-                // --- OPTIMIZATION: Capped prefix bloom with zero-copy hashing ---
-                // Only index the first MAX_PREFIX_DEPTH colon-delimited segments.
-                // Uses addRange() to hash sub-ranges in-place without copyOfRange.
+                // Capped prefix bloom with zero-copy hashing
                 var colonCount = 0
                 for (i in key.indices) {
                     if (key[i] == ':'.code.toByte()) {
@@ -179,5 +194,15 @@ class SSTable {
          * "idx:collection:field:") while avoiding the O(K) explosion from deeply nested keys.
          */
         private const val MAX_PREFIX_DEPTH = 3
+
+        val VEC_PREFIX = "vec:".toByteArray(Charsets.UTF_8)
+
+        fun isVectorKey(key: ByteArray): Boolean {
+            if (key.size < VEC_PREFIX.size) return false
+            for (i in VEC_PREFIX.indices) {
+                if (key[i] != VEC_PREFIX[i]) return false
+            }
+            return true
+        }
     }
 }

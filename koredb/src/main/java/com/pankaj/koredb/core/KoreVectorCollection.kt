@@ -4,6 +4,7 @@ import com.pankaj.koredb.engine.KoreDB
 import com.pankaj.koredb.hnsw.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import java.io.Closeable
 
 /**
  * Configuration for a vector collection.
@@ -70,7 +71,7 @@ class KoreVectorCollection(
     val name: String,
     private val db: KoreDB,
     private val config: VectorCollectionConfig = VectorCollectionConfig()
-) {
+) : Closeable {
     private val quantizer = if (config.quantization && config.dimensions > 0) {
         ScalarQuantizer(config.dimensions)
     } else null
@@ -462,7 +463,7 @@ class KoreVectorCollection(
     /**
      * Shuts down the background indexing worker.
      */
-    fun close() {
+    override fun close() {
         indexingChannel.close()
         indexingScope.cancel()
         mmapHnsw?.close()

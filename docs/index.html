@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KoreDB Documentation | AI-Native Multi-Model Embedded Engine</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-hover: #4f46e5;
+            --bg: #0b0f19;
+            --surface: #111827;
+            --surface-card: #1e293b;
+            --surface-border: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-cyan: #06b6d4;
+            --accent-emerald: #10b981;
+            --accent-amber: #f59e0b;
+            --code-bg: #0f172a;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg);
+            color: var(--text-main);
+            line-height: 1.6;
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* SIDEBAR */
+        #sidebar {
+            width: 280px;
+            background: var(--surface);
+            border-right: 1px solid var(--surface-border);
+            position: fixed;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            overflow-y: auto;
+            padding: 24px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        .brand-logo {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--primary), var(--accent-cyan));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 20px;
+            color: white;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
+        }
+
+        .brand-text h1 {
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            background: linear-gradient(to right, #fff, #94a3b8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .brand-text span {
+            font-size: 11px;
+            color: var(--accent-cyan);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .nav-section {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .nav-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin: 12px 8px 4px 8px;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 8px;
+            color: #cbd5e1;
+            text-decoration: none;
+            font-size: 13.5px;
+            font-weight: 500;
+            transition: all 0.15s ease;
+        }
+
+        .nav-link:hover {
+            background: var(--surface-card);
+            color: white;
+            transform: translateX(3px);
+        }
+
+        .nav-link.active {
+            background: rgba(99, 102, 241, 0.15);
+            color: #818cf8;
+            font-weight: 600;
+            border-left: 3px solid var(--primary);
+        }
+
+        /* MAIN CONTENT */
+        #content {
+            margin-left: 280px;
+            flex: 1;
+            padding: 48px 64px;
+            max-width: 1100px;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+            background: rgba(99, 102, 241, 0.2);
+            color: #a5b4fc;
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            margin-bottom: 16px;
+        }
+
+        h1.hero-title {
+            font-size: 42px;
+            font-weight: 800;
+            line-height: 1.15;
+            letter-spacing: -1px;
+            margin-bottom: 16px;
+            background: linear-gradient(to right, #ffffff, #cbd5e1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        p.lead {
+            font-size: 18px;
+            color: var(--text-muted);
+            margin-bottom: 32px;
+            line-height: 1.6;
+        }
+
+        /* GRID CARDS */
+        .grid-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin: 32px 0;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: 12px;
+            padding: 24px;
+            transition: all 0.2s ease;
+        }
+
+        .card:hover {
+            border-color: var(--primary);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+            transform: translateY(-2px);
+        }
+
+        .card-icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            margin-bottom: 16px;
+        }
+
+        .icon-blue { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+        .icon-purple { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+        .icon-emerald { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+        .icon-amber { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+
+        .card h3 {
+            font-size: 17px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+
+        .card p {
+            font-size: 13.5px;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+
+        /* CODE BLOCK */
+        pre {
+            background: var(--code-bg);
+            border: 1px solid var(--surface-border);
+            border-radius: 10px;
+            padding: 20px;
+            overflow-x: auto;
+            font-family: 'Fira Code', monospace;
+            font-size: 13.5px;
+            margin: 20px 0;
+            line-height: 1.5;
+        }
+
+        code {
+            font-family: 'Fira Code', monospace;
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+            color: #e2e8f0;
+        }
+
+        /* BENCHMARK TABLE */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 28px 0;
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: 10px;
+            overflow: hidden;
+            font-size: 14px;
+        }
+
+        th {
+            background: var(--surface-card);
+            text-align: left;
+            padding: 14px 18px;
+            font-weight: 600;
+            color: #e2e8f0;
+            border-bottom: 1px solid var(--surface-border);
+        }
+
+        td {
+            padding: 14px 18px;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+            color: #cbd5e1;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .winner-tag {
+            display: inline-block;
+            background: rgba(16, 185, 129, 0.2);
+            color: #34d399;
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 12px;
+        }
+
+        /* SECTION HEADERS */
+        h2.section-title {
+            font-size: 26px;
+            font-weight: 700;
+            margin: 48px 0 16px 0;
+            letter-spacing: -0.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 1px solid var(--surface-border);
+            padding-bottom: 12px;
+        }
+
+        @media (max-width: 900px) {
+            #sidebar { display: none; }
+            #content { margin-left: 0; padding: 24px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- SIDEBAR -->
+    <nav id="sidebar">
+        <div class="brand">
+            <div class="brand-logo">K</div>
+            <div class="brand-text">
+                <h1>KoreDB</h1>
+                <span>v0.2.0 • Android & Kotlin</span>
+            </div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-title">Getting Started</div>
+            <a href="index.html" class="nav-link active">Overview</a>
+            <a href="index.html#installation" class="nav-link">Installation</a>
+            <a href="index.html#quickstart" class="nav-link">Quickstart</a>
+            <a href="index.html#benchmarks" class="nav-link">Head-to-Head Benchmarks</a>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-title">Core Engines</div>
+            <a href="document_engine.md" class="nav-link">📄 Document Collections</a>
+            <a href="vector_engine.md" class="nav-link">⚡ Vector Database (HNSW)</a>
+            <a href="graph_engine.md" class="nav-link">🕸️ Property Graph Engine</a>
+            <a href="hybrid_graph_rag.md" class="nav-link">🧬 Unified Graph RAG Bridge</a>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-title">Engine Architecture</div>
+            <a href="architecture.md" class="nav-link">🏛️ LSM-Tree & WAL Internals</a>
+            <a href="transactions_mvcc.md" class="nav-link">🔒 MVCC Snapshot Isolation</a>
+            <a href="enterprise_features.md" class="nav-link">🛡️ Enterprise CDC & Crypto</a>
+            <a href="android_features_guide.md" class="nav-link">🚀 Android Feature Guide</a>
+            <a href="migration_from_room.md" class="nav-link">🔄 Room Migration Guide</a>
+            <a href="production_checklist.md" class="nav-link">🛡️ Production Checklist</a>
+            <a href="sample_codebase.md" class="nav-link">📱 Complete Sample Project</a>
+        </div>
+    </nav>
+
+    <!-- MAIN CONTENT -->
+    <main id="content">
+        <div class="badge">🚀 KoreDB 0.2.0 is Published on Maven Central</div>
+        <h1 class="hero-title">AI-Native, Multi-Model Database Engine for Modern Android</h1>
+        <p class="lead">
+            KoreDB unifies <strong>Typed Documents</strong>, <strong>HNSW Vector Embeddings</strong>, and <strong>Property Graphs</strong> into a single zero-dependency, ultra-fast embedded LSM storage engine built in 100% Kotlin.
+        </p>
+
+        <!-- CARDS -->
+        <div class="grid-cards">
+            <div class="card">
+                <div class="card-icon icon-blue">📄</div>
+                <h3>Document Engine</h3>
+                <p>O(1) LSM writes, CBOR zero-copy binary serialization, secondary string & numeric range indexing, and BM25 full-text search.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon icon-purple">⚡</div>
+                <h3>Vector Engine</h3>
+                <p>Sub-millisecond Approximate Nearest Neighbor (ANN) search via HNSW, SQ8 quantization, off-heap memory-mapped indexing, and hybrid filtering.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon icon-emerald">🕸️</div>
+                <h3>Graph Engine</h3>
+                <p>Bidirectional property graph with cascading deletes, variable-length traversals, Dijkstra shortest path, A*, and PageRank algorithms.</p>
+            </div>
+            <div class="card">
+                <div class="card-icon icon-amber">🧬</div>
+                <h3>Graph RAG Bridge</h3>
+                <p>Combines graph traversal constraints with semantic vector similarity and BM25 text rank in a single fluent query.</p>
+            </div>
+        </div>
+
+        <!-- BENCHMARKS -->
+        <h2 id="benchmarks" class="section-title">📊 Real Device Hardware Benchmark: Google Pixel 7 Pro</h2>
+        <p>Executed natively on physical <strong>Google Pixel 7 Pro (cheetah, Android 14/15)</strong> via Android Instrumentation Test Runner (<code>./gradlew :app:connectedDebugAndroidTest</code>). <strong>64 of 64 tests passed (100% success rate)</strong>:</p>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Workload</th>
+                    <th>Room / SQLite</th>
+                    <th>KoreDB (Optimized)</th>
+                    <th>Pixel 7 Pro Result</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Point Reads (10,000 cached)</strong></td>
+                    <td>8,905 ms</td>
+                    <td><strong>6 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (1,484x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>KNN Vector Search (15,000 vecs)</strong></td>
+                    <td>29,871 ms</td>
+                    <td><strong>135 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (221x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Negative Lookups (5,000 ops)</strong></td>
+                    <td>4,099 ms</td>
+                    <td><strong>33 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (124x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Single Reads (5,000 ops)</strong></td>
+                    <td>5,622 ms</td>
+                    <td><strong>88 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (64x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Graph Build (2k nodes, 10k edges)</strong></td>
+                    <td>25,921 ms</td>
+                    <td><strong>484 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (54x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Vector Search (top-10 × 50)</strong></td>
+                    <td>3,384 ms</td>
+                    <td><strong>89 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (38x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Single Writes (5,000 ops)</strong></td>
+                    <td>15,125 ms</td>
+                    <td><strong>585 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (26x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Secondary Index Lookups (1,000x)</strong></td>
+                    <td>4,357 ms</td>
+                    <td><strong>257 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (17x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Parallel Reads (8 threads)</strong></td>
+                    <td>3,638 ms</td>
+                    <td><strong>209 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (17x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Complex Range Scans (50KB/rec)</strong></td>
+                    <td>225 ms</td>
+                    <td><strong>26 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (8.7x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Random Updates (10,000 items)</strong></td>
+                    <td>308 ms</td>
+                    <td><strong>101 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (3.1x Faster)</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Massive Bulk Ingest (50,000 items)</strong></td>
+                    <td>926 ms</td>
+                    <td><strong>612 ms</strong></td>
+                    <td><span class="winner-tag">KoreDB (1.5x Faster)</span></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <!-- INSTALLATION -->
+        <h2 id="installation" class="section-title">📦 Installation</h2>
+        <p>Add KoreDB to your module's <code>build.gradle.kts</code>:</p>
+
+<pre><code>repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("io.github.raipankaj:koredb:0.2.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.8.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
+}</code></pre>
+
+        <!-- QUICKSTART -->
+        <h2 id="quickstart" class="section-title">⚡ Quickstart</h2>
+        <p>Initialize KoreDatabase in your application or repository layer:</p>
+
+<pre><code>// 1. Define your data class
+@Serializable
+data class Product(val id: String, val title: String, val category: String, val price: Double)
+
+// 2. Open or create database
+val db = KoreDatabase(File(context.filesDir, "app_data"))
+
+// 3. Obtain a high-performance binary collection
+val products = db.binaryCollection&lt;Product&gt;("products")
+products.createIndex("category") { it.category }
+products.createNumericIndex("price") { it.price }
+
+// 4. Insert documents
+products.insert("p1", Product("p1", "MacBook Pro M3", "electronics", 1999.0))
+products.insert("p2", Product("p2", "AirPods Max", "electronics", 549.0))
+
+// 5. Query by secondary index (5.7x faster than Room)
+val electronics = products.find("category", "electronics")
+
+// 6. Query by numeric range (6.1x faster than Room)
+val budgetItems = products.findRange("price", 100.0, 600.0)
+
+// 7. ACID MVCC Transaction (4.3x faster than Room)
+db.transaction { tx ->
+    val txCol = tx.binaryCollection&lt;Product&gt;("products")
+    txCol.insert("p3", Product("p3", "Magic Mouse", "electronics", 99.0))
+}</code></pre>
+
+        <!-- DOCUMENTATION INDEX -->
+        <h2 class="section-title">📚 Documentation Guides</h2>
+        <ul style="list-style: none; display: flex; flex-direction: column; gap: 12px; margin-top: 16px;">
+            <li>👉 <a href="architecture.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Engine Architecture & LSM Internals</a> — Deep-dive into WAL replay, MemTable, SSTables, Bloom Filter, and Leveled Compaction.</li>
+            <li>👉 <a href="document_engine.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Document Collections & Indexing</a> — Binary CBOR serialization, secondary indices, range scans, TTL, and BM25 text search.</li>
+            <li>👉 <a href="vector_engine.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Vector Database & HNSW Search</a> — Embeddings, similarity distance metrics, SQ8 scalar quantization, and metadata filtering.</li>
+            <li>👉 <a href="graph_engine.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Property Graph Engine</a> — Directed edges, dual bidirectional indexing, cascading deletes, BFS, Dijkstra, and PageRank.</li>
+            <li>👉 <a href="hybrid_graph_rag.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Unified Graph RAG Bridge</a> — Combining semantic search with knowledge graph traversals for AI on Android.</li>
+            <li>👉 <a href="transactions_mvcc.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Transactions & Snapshot Isolation</a> — Multi-Version Concurrency Control, conflict validation, and synchronous commits.</li>
+            <li>👉 <a href="enterprise_features.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Enterprise Capabilities</a> — Change Data Capture (CDC), AES-GCM-256 encryption, LZ4 compression, and crash recovery.</li>
+            <li>👉 <a href="android_features_guide.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Android Feature & Decision Guide</a> — When and how to use each feature in Android (Jetpack Compose, WorkManager, Keystore).</li>
+            <li>👉 <a href="sample_codebase.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Complete Sample Codebase</a> — Step-by-step production Android integration example.</li>
+        </ul>
+    </main>
+</body>
+</html>

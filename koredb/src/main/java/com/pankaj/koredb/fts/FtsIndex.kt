@@ -159,6 +159,7 @@ class FtsIndex(
 
     /**
      * Executes a BM25 full-text keyword query using bounded Min-Heap top-K selection.
+     * Supports on-demand disk seeking for terms not currently present in the in-memory postings cache.
      *
      * @param query Raw search query string.
      * @param limit Maximum number of top-matching results to return.
@@ -176,11 +177,40 @@ class FtsIndex(
         val scoreAccumulator = HashMap<String, Float>()
 
         for (term in queryTerms) {
-            val docMap = postings[term] ?: continue
+            var docMap = postings[term]
+            if (docMap == null) {
+                // Seek term posting list on-demand from disk LSM tree
+                val termPrefix = "fts:$collectionName:$term:".toByteArray(Charsets.UTF_8)
+                val entries = db.getByPrefixWithKeysRaw(termPrefix)
+                if (entries.isNotEmpty()) {
+                    val map = ConcurrentHashMap<String, Int>()
+                    for ((k, v) in entries) {
+                        if (v.size >= 4) {
+                            val escapedDocId = String(k.copyOfRange(termPrefix.size, k.size), Charsets.UTF_8)
+                            val docId = unescape(escapedDocId)
+                            val freq = ByteBuffer.wrap(v).order(ByteOrder.LITTLE_ENDIAN).getInt()
+                            map[docId] = freq
+                        }
+                    }
+                    postings[term] = map
+                    docMap = map
+                }
+            }
+            if (docMap == null || docMap.isEmpty()) continue
+
             val idf = scorer.calculateIDF(nDocs, docMap.size.toLong())
 
             for ((docId, freq) in docMap) {
-                val dLen = docLengths[docId] ?: avgDl.toInt()
+                var dLen = docLengths[docId]
+                if (dLen == null) {
+                    val rawLenBytes = db.getRaw(makeLenKey(docId))
+                    if (rawLenBytes != null && rawLenBytes.size >= 4) {
+                        dLen = ByteBuffer.wrap(rawLenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt()
+                        docLengths[docId] = dLen
+                    } else {
+                        dLen = avgDl.toInt()
+                    }
+                }
                 val termScore = scorer.scoreTerm(idf, freq, dLen, avgDl)
                 scoreAccumulator[docId] = (scoreAccumulator[docId] ?: 0f) + termScore
             }
@@ -199,7 +229,7 @@ class FtsIndex(
 
         val results = ArrayList<Pair<String, Float>>(minHeap.size)
         while (minHeap.isNotEmpty()) {
-            results.add(minHeap.poll())
+            results.add(minHeap.poll()!!)
         }
         results.reverse() // Descending order
         return results
@@ -239,9 +269,12 @@ class FtsIndex(
         docCount.set(0)
     }
 
+    private fun escape(value: String): String = value.replace("%", "%25").replace(":", "%3A")
+    private fun unescape(value: String): String = value.replace("%3A", ":").replace("%25", "%")
+
     private fun makePostingKey(term: String, docId: String): ByteArray {
         val termBytes = term.toByteArray(Charsets.UTF_8)
-        val docIdBytes = docId.toByteArray(Charsets.UTF_8)
+        val docIdBytes = escape(docId).toByteArray(Charsets.UTF_8)
         val key = ByteArray(ftsPrefix.size + termBytes.size + 1 + docIdBytes.size)
         System.arraycopy(ftsPrefix, 0, key, 0, ftsPrefix.size)
         var pos = ftsPrefix.size
@@ -253,7 +286,7 @@ class FtsIndex(
     }
 
     private fun makeLenKey(docId: String): ByteArray {
-        val idBytes = docId.toByteArray(Charsets.UTF_8)
+        val idBytes = escape(docId).toByteArray(Charsets.UTF_8)
         val key = ByteArray(ftsLenPrefix.size + idBytes.size)
         System.arraycopy(ftsLenPrefix, 0, key, 0, ftsLenPrefix.size)
         System.arraycopy(idBytes, 0, key, ftsLenPrefix.size, idBytes.size)

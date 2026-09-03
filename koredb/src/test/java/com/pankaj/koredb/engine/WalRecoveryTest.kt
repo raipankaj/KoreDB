@@ -50,7 +50,7 @@ class WalRecoveryTest {
         db.putRaw(k1, v1)
         db.putRaw(k2, v2)
         db.putRaw(k3, v3)
-        db.close()
+        db.close(flushMemTable = false)
 
         // 2. Corrupt the WAL by truncating the last record partially
         val walFile = File(testDir, "kore.wal")
@@ -90,7 +90,7 @@ class WalRecoveryTest {
     @Test
     fun `test Recovery from Garbage Tail`() = runBlocking {
         db.putRaw("safe".toByteArray(), "data".toByteArray())
-        db.close()
+        db.close(flushMemTable = false)
 
         val walFile = File(testDir, "kore.wal")
         RandomAccessFile(walFile, "rw").use { raf ->
@@ -114,7 +114,7 @@ class WalRecoveryTest {
         val kOld = "oldKey".toByteArray()
         val vOld = "oldValue".toByteArray()
         db.putRaw(kOld, vOld)
-        db.close()
+        db.close(flushMemTable = false)
 
         // 2. Manually simulate the start of a flush:
         // Rename kore.wal to kore.wal.old

@@ -51,16 +51,23 @@ class GraphQuery(private val storage: GraphStorage) {
      * @param propertyValue The value of the property to match.
      * @return The current [GraphQuery] instance for method chaining.
      */
+    private fun escape(value: String): String = value.replace("%", "%25").replace(":", "%3A")
+    private fun unescape(value: String): String = value.replace("%3A", ":").replace("%25", "%")
+
     fun startingWith(label: String, propertyKey: String, propertyValue: String): GraphQuery {
-        val prefix = "g:idx:v_prop:$label:$propertyKey:$propertyValue:".toByteArray(Charsets.UTF_8)
+        val escapedLabel = escape(label)
+        val escapedKey = escape(propertyKey)
+        val escapedVal = escape(propertyValue)
+        val prefix = "g:idx:v_prop:$escapedLabel:$escapedKey:$escapedVal:".toByteArray(Charsets.UTF_8)
         val indexKeys = storage.db.getKeysByPrefixRaw(prefix)
 
         currentIds = indexKeys.mapNotNull { keyBytes ->
-            val nodeId = String(keyBytes, Charsets.UTF_8).substringAfterLast(":")
+            val escapedNodeId = String(keyBytes, Charsets.UTF_8).substringAfterLast(":")
+            val nodeId = unescape(escapedNodeId)
 
             // Validation using Reverse Pointer (Truth Oracle)
             // This ensures starting nodes are fresh even before traversal begins.
-            val rptrKey = "g:rptr:v_prop:$label:$propertyKey:$nodeId".toByteArray(Charsets.UTF_8)
+            val rptrKey = "g:rptr:v_prop:$escapedLabel:$escapedKey:$escapedNodeId".toByteArray(Charsets.UTF_8)
             val currentValueBytes = storage.db.getRaw(rptrKey)
 
             if (currentValueBytes != null) {

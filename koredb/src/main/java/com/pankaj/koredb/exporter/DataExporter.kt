@@ -54,25 +54,27 @@ data class ExportStats(
  */
 suspend fun <T : Any> KoreCollection<T>.exportToJson(outputFile: File): ExportStats = withContext(Dispatchers.IO) {
     val startTime = System.currentTimeMillis()
-    val allDocs = getAllWithIds()
-
-    val jsonString = buildString {
-        appendLine("[")
-        val entries = allDocs.entries.toList()
-        entries.forEachIndexed { index, entry ->
-            val docJson = String(serializer.serialize(entry.value), Charsets.UTF_8)
-            append("  {\"_id\": \"${escapeJson(entry.key)}\", \"_doc\": $docJson}")
-            if (index < entries.size - 1) appendLine(",") else appendLine()
-        }
-        appendLine("]")
-    }
-
     outputFile.parentFile?.mkdirs()
-    outputFile.writeText(jsonString, Charsets.UTF_8)
+    var count = 0L
+
+    outputFile.bufferedWriter(Charsets.UTF_8).use { writer ->
+        writer.write("[\n")
+        var isFirst = true
+        for ((id, doc) in getAllWithIds()) {
+            if (!isFirst) {
+                writer.write(",\n")
+            }
+            val docJson = String(serializer.serialize(doc), Charsets.UTF_8)
+            writer.write("  {\"_id\": \"${escapeJson(id)}\", \"_doc\": $docJson}")
+            isFirst = false
+            count++
+        }
+        writer.write("\n]\n")
+    }
 
     val elapsed = System.currentTimeMillis() - startTime
     ExportStats(
-        totalRecords = allDocs.size.toLong(),
+        totalRecords = count,
         totalBytes = outputFile.length(),
         executionTimeMs = elapsed
     )

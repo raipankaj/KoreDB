@@ -432,9 +432,7 @@ class HNSWIndex(
 
     private fun connect(source: HNSWNode, target: HNSWNode, level: Int) {
         if (level <= source.nodeLevel) {
-            synchronized(source) {
-                source.neighbors[level].add(target.id)
-            }
+            source.neighbors[level].add(target.id)
         }
     }
 

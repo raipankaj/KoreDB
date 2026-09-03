@@ -40,32 +40,13 @@ enum class DistanceMetric {
      */
     COSINE {
         override fun compute(a: FloatArray, b: FloatArray): Float {
-            var dot = 0f; var normA = 0f; var normB = 0f
-            var i = 0
-            val size = a.size
-            // 4x loop unrolling for SIMD vectorization
-            while (i <= size - 4) {
-                dot += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3]
-                normA += a[i]*a[i] + a[i+1]*a[i+1] + a[i+2]*a[i+2] + a[i+3]*a[i+3]
-                normB += b[i]*b[i] + b[i+1]*b[i+1] + b[i+2]*b[i+2] + b[i+3]*b[i+3]
-                i += 4
-            }
-            while (i < size) {
-                dot += a[i]*b[i]; normA += a[i]*a[i]; normB += b[i]*b[i]; i++
-            }
-            val divisor = sqrt(normA) * sqrt(normB)
-            return if (divisor == 0f) 0f else dot / divisor
+            val magA = com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(a)
+            val magB = com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(b)
+            return com.pankaj.koredb.core.SimdVectorMath.cosineSimilarity16(a, magA, b, magB)
         }
 
         override fun computeWithMagnitudes(a: FloatArray, magA: Float, b: FloatArray, magB: Float): Float {
-            var dot = 0f
-            var i = 0; val size = a.size
-            while (i <= size - 4) {
-                dot += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3]; i += 4
-            }
-            while (i < size) { dot += a[i]*b[i]; i++ }
-            val divisor = magA * magB
-            return if (divisor == 0f) 0f else dot / divisor
+            return com.pankaj.koredb.core.SimdVectorMath.cosineSimilarity16(a, magA, b, magB)
         }
     },
 
@@ -76,15 +57,8 @@ enum class DistanceMetric {
      */
     EUCLIDEAN {
         override fun compute(a: FloatArray, b: FloatArray): Float {
-            var sum = 0f
-            var i = 0; val size = a.size
-            while (i <= size - 4) {
-                val d0 = a[i]-b[i]; val d1 = a[i+1]-b[i+1]
-                val d2 = a[i+2]-b[i+2]; val d3 = a[i+3]-b[i+3]
-                sum += d0*d0 + d1*d1 + d2*d2 + d3*d3; i += 4
-            }
-            while (i < size) { val d = a[i]-b[i]; sum += d*d; i++ }
-            return -sqrt(sum) // Negate: higher = closer
+            val sq = com.pankaj.koredb.core.SimdVectorMath.euclideanDistanceSq16(a, b)
+            return -sqrt(sq) // Negate: higher = closer
         }
     },
 
@@ -94,13 +68,7 @@ enum class DistanceMetric {
      */
     INNER_PRODUCT {
         override fun compute(a: FloatArray, b: FloatArray): Float {
-            var dot = 0f
-            var i = 0; val size = a.size
-            while (i <= size - 4) {
-                dot += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3]; i += 4
-            }
-            while (i < size) { dot += a[i]*b[i]; i++ }
-            return dot
+            return com.pankaj.koredb.core.SimdVectorMath.dotProduct16(a, b)
         }
     },
 
@@ -111,13 +79,7 @@ enum class DistanceMetric {
      */
     MANHATTAN {
         override fun compute(a: FloatArray, b: FloatArray): Float {
-            var sum = 0f
-            var i = 0; val size = a.size
-            while (i <= size - 4) {
-                sum += abs(a[i]-b[i]) + abs(a[i+1]-b[i+1]) + abs(a[i+2]-b[i+2]) + abs(a[i+3]-b[i+3])
-                i += 4
-            }
-            while (i < size) { sum += abs(a[i]-b[i]); i++ }
+            val sum = com.pankaj.koredb.core.SimdVectorMath.manhattanDistance16(a, b)
             return -sum // Negate: higher = closer
         }
     };

@@ -35,6 +35,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import java.io.File
 import java.io.RandomAccessFile
@@ -63,7 +64,8 @@ import java.util.zip.CRC32
 class KoreDB(
     val directory: File,
     val crypto: com.pankaj.koredb.crypto.KoreCrypto? = null,
-    val compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
+    val compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.Lz4CompressionCodec(),
+    val minFreeSpaceBytes: Long = 10 * 1024 * 1024L
 ) {
 
     private val logger = KoreLogger.getLogger("KoreDB")
@@ -76,6 +78,10 @@ class KoreDB(
     
     private val sstFileCounter = AtomicInteger(0)
     private val MEMTABLE_FLUSH_THRESHOLD_BYTES = 16 * 1024 * 1024
+
+    private val lockFile: File
+    private var lockRaf: java.io.RandomAccessFile? = null
+    private var fileLock: java.nio.channels.FileLock? = null
 
     private val walFile: File
     @Volatile
@@ -98,11 +104,28 @@ class KoreDB(
     private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val sstReaders = mutableListOf<SSTableReader>()
+    val blockCache = com.pankaj.koredb.foundation.BlockCache()
 
     @Volatile
     internal var isCompacting = false
 
     init {
+        directory.mkdirs()
+        lockFile = File(directory, "kore.lock")
+        val raf = java.io.RandomAccessFile(lockFile, "rw")
+        val lock = try {
+            raf.channel.tryLock()
+        } catch (e: Exception) {
+            raf.close()
+            throw DatabaseLockedException("Failed to acquire process lock for database at ${directory.absolutePath}", e)
+        }
+        if (lock == null) {
+            raf.close()
+            throw DatabaseLockedException("Database at ${directory.absolutePath} is currently locked by another process or instance.")
+        }
+        lockRaf = raf
+        fileLock = lock
+
         walFile = File(directory, "kore.wal")
         loadStorageState()
     }
@@ -124,7 +147,7 @@ class KoreDB(
         // Initialize state from the MANIFEST file, which tracks active SSTable segments.
         val manifestFile = File(directory, "MANIFEST")
         val levelsMap = mutableMapOf<String, Int>()
-        val activeFiles = if (manifestFile.exists()) {
+        val manifestFiles = if (manifestFile.exists()) {
             manifestFile.readLines().filter { it.isNotBlank() }.map { line ->
                 val parts = line.split(":")
                 val filename = parts[0]
@@ -133,12 +156,15 @@ class KoreDB(
                 File(directory, filename)
             }
         } else {
-            // Fallback: Discovery via file system scan if MANIFEST is missing.
-            directory.listFiles { _, name -> name.endsWith(".sst") }?.toList() ?: emptyList()
+            emptyList()
         }
 
+        // Also discover any orphan/unmanifested .sst files on disk (e.g. from interrupted flushes)
+        val diskSstFiles = directory.listFiles { _, name -> name.endsWith(".sst") }?.toList() ?: emptyList()
+        val allSstFiles = (manifestFiles + diskSstFiles).distinctBy { it.name }
+
         // Determine the next file index based on existing segments.
-        val maxIndex = activeFiles
+        val maxIndex = allSstFiles
             .mapNotNull {
                 val name = it.name
                 if (name.startsWith("segment_")) {
@@ -154,14 +180,16 @@ class KoreDB(
         sstFileCounter.set(maxIndex + 1)
 
         // Load active SSTable segments into memory-mapped readers.
-        activeFiles.sortedBy { it.name }.forEach { file ->
+        allSstFiles.sortedBy { it.name }.forEach { file ->
             if (file.exists()) {
                 try {
-                    val reader = SSTableReader(file)
+                    val reader = SSTableReader(file, blockCache)
                     reader.level = levelsMap[file.name] ?: 0
                     sstReaders.add(reader)
                 } catch (e: Exception) {
-                    logger.warn("Skipping corrupt file: ${file.name}", e)
+                    val corruptDest = File(directory, "${file.name}.corrupt")
+                    file.renameTo(corruptDest)
+                    logger.error("QUARANTINED CORRUPT SSTABLE: ${file.name} moved to ${corruptDest.name}", e)
                 }
             }
         }
@@ -243,6 +271,17 @@ class KoreDB(
     suspend fun writeBatchRaw(batch: List<Pair<ByteArray, ByteArray>>, urgent: Boolean = false) {
         if (batch.isEmpty()) return
 
+        if (minFreeSpaceBytes > 0) {
+            val usable = directory.usableSpace
+            if (usable in 1 until minFreeSpaceBytes) {
+                throw DiskSpaceExhaustedException(
+                    "Disk space exhausted: available $usable bytes is below safety threshold of $minFreeSpaceBytes bytes",
+                    freeBytes = usable,
+                    requiredBytes = minFreeSpaceBytes
+                )
+            }
+        }
+
         val finalBatch = if (crypto != null) {
             batch.map { (key, value) ->
                 if (value.isNotEmpty()) {
@@ -253,6 +292,28 @@ class KoreDB(
             }
         } else {
             batch
+        }
+
+        // Fast-path: Uncontended single writer executes synchronously without queue/deferred overhead
+        if (writeQueue.isEmpty() && isLeaderActive.compareAndSet(false, true)) {
+            try {
+                writeBatchDirectInternal(finalBatch, urgent)
+                if (!writeQueue.isEmpty()) {
+                    processGroupCommits()
+                }
+                return
+            } finally {
+                isLeaderActive.set(false)
+                if (!writeQueue.isEmpty() && isLeaderActive.compareAndSet(false, true)) {
+                    backgroundScope.launch {
+                        try {
+                            processGroupCommits()
+                        } finally {
+                            isLeaderActive.set(false)
+                        }
+                    }
+                }
+            }
         }
 
         val request = WriteRequest(finalBatch, urgent)
@@ -280,6 +341,49 @@ class KoreDB(
         request.deferred.await()
     }
 
+    private val writeDirectLock = Any()
+
+    internal fun writeBatchDirectInternal(batch: List<Pair<ByteArray, ByteArray>>, urgent: Boolean = false) {
+        synchronized(writeDirectLock) {
+            while (immutableMemTable != null && memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
+                Thread.sleep(10)
+            }
+            wal.appendBatch(batch)
+            memTable.putAll(batch)
+            writeCounter.addAndGet(batch.size.toLong())
+            if (urgent) {
+                wal.flush()
+            }
+            if (memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
+                synchronized(sstReaders) {
+                    if (immutableMemTable == null && memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
+                        triggerBackgroundFlush()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Directly persists a batch of mutations to WAL and MemTable synchronously without coroutine queueing.
+     * Ideal for single-threaded transaction commits and ultra-low-latency operations.
+     */
+    fun writeBatchDirect(batch: Collection<Pair<ByteArray, ByteArray>>, urgent: Boolean = false) {
+        if (batch.isEmpty()) return
+        val finalBatch = if (crypto != null) {
+            batch.map { (key, value) ->
+                if (value.isNotEmpty() && value !== TOMBSTONE) {
+                    Pair(key, crypto.encrypt(value, aad = key))
+                } else {
+                    Pair(key, value)
+                }
+            }
+        } else {
+            if (batch is List<Pair<ByteArray, ByteArray>>) batch else batch.toList()
+        }
+        writeBatchDirectInternal(finalBatch, urgent)
+    }
+
     private suspend fun processGroupCommits() {
         while (true) {
             val requests = mutableListOf<WriteRequest>()
@@ -293,34 +397,24 @@ class KoreDB(
             }
             
             if (requests.isNotEmpty()) {
-                val mergedBatch = mutableListOf<Pair<ByteArray, ByteArray>>()
+                val mergedBatch: List<Pair<ByteArray, ByteArray>>
                 var anyUrgent = false
-                for (r in requests) {
-                    mergedBatch.addAll(r.batch)
-                    if (r.urgent) anyUrgent = true
+                if (requests.size == 1) {
+                    val r = requests[0]
+                    mergedBatch = r.batch
+                    anyUrgent = r.urgent
+                } else {
+                    val list = mutableListOf<Pair<ByteArray, ByteArray>>()
+                    for (r in requests) {
+                        list.addAll(r.batch)
+                        if (r.urgent) anyUrgent = true
+                    }
+                    mergedBatch = list
                 }
                 
                 try {
                     withContext(Dispatchers.IO) {
-                        while (immutableMemTable != null && memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
-                            Thread.sleep(10)
-                        }
-                        
-                        wal.appendBatch(mergedBatch)
-                        memTable.putAll(mergedBatch)
-                        writeCounter.addAndGet(mergedBatch.size.toLong())
-                        
-                        if (anyUrgent) {
-                            wal.flush()
-                        }
-                        
-                        if (memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
-                            flushMutex.withLock {
-                                if (memTable.sizeInBytes() >= MEMTABLE_FLUSH_THRESHOLD_BYTES) {
-                                    triggerBackgroundFlush()
-                                }
-                            }
-                        }
+                        writeBatchDirectInternal(mergedBatch, anyUrgent)
                     }
                     
                     for (r in requests) {
@@ -442,7 +536,7 @@ class KoreDB(
                 val sstFile = File(directory, "segment_${sstFileCounter.getAndIncrement()}.sst")
                 SSTable.writeFromMemTable(oldMemTable, sstFile, compressionCodec)
 
-                val newReader = SSTableReader(sstFile)
+                val newReader = SSTableReader(sstFile, blockCache)
                 newReader.level = 0
                 synchronized(sstReaders) {
                     sstReaders.add(newReader)
@@ -490,7 +584,7 @@ class KoreDB(
                 val sstFile = File(directory, "segment_${sstFileCounter.getAndIncrement()}.sst")
                 SSTable.writeFromMemTable(oldMemTable, sstFile, compressionCodec)
                 
-                val newReader = SSTableReader(sstFile)
+                val newReader = SSTableReader(sstFile, blockCache)
                 newReader.level = 0
                 synchronized(sstReaders) {
                     sstReaders.add(newReader)
@@ -513,10 +607,25 @@ class KoreDB(
         }
     }
 
+    @Volatile
+    internal var isBackupInProgress = false
+
     /**
      * Performs a leveled compaction. Merges Level 0 files with Level 1 files, 
      * then cascades further compaction as levels exceed their capacity thresholds.
      */
+    /**
+     * Compacts SSTables, purges tombstones, and reclaims disk space.
+     */
+    fun compact() {
+        if (memTable.size() > 0) {
+            kotlinx.coroutines.runBlocking {
+                flushMemTableInternal()
+            }
+        }
+        performLeveledCompaction()
+    }
+
     internal fun performLeveledCompaction() {
         logger.info("STARTING LEVELED COMPACTION...")
         val readersSnapshot = synchronized(sstReaders) { sstReaders.toList() }
@@ -536,7 +645,7 @@ class KoreDB(
             raf.channel.force(true)
         }
 
-        val newL1Reader = SSTableReader(compactedFile)
+        val newL1Reader = SSTableReader(compactedFile, blockCache)
         newL1Reader.level = 1
 
         synchronized(sstReaders) {
@@ -545,7 +654,10 @@ class KoreDB(
         }
 
         writeManifest()
-        filesToMerge.forEach { it.file.delete() }
+        filesToMerge.forEach { 
+            it.close()
+            it.file.delete() 
+        }
         compactionCounter.incrementAndGet()
         logger.info("L0 -> L1 COMPACTION COMPLETE. File size: ${compactedFile.length() / 1024} KB")
 
@@ -575,7 +687,7 @@ class KoreDB(
                 raf.channel.force(true)
             }
 
-            val newL2Reader = SSTableReader(compactedFile)
+            val newL2Reader = SSTableReader(compactedFile, blockCache)
             newL2Reader.level = 2
 
             synchronized(sstReaders) {
@@ -584,7 +696,10 @@ class KoreDB(
             }
 
             writeManifest()
-            filesToMerge.forEach { it.file.delete() }
+            filesToMerge.forEach { 
+                it.close()
+                it.file.delete() 
+            }
             compactionCounter.incrementAndGet()
             logger.info("L1 -> L2 COMPACTION COMPLETE. File size: ${compactedFile.length() / 1024} KB")
 
@@ -605,7 +720,7 @@ class KoreDB(
                     raf.channel.force(true)
                 }
 
-                val newL3Reader = SSTableReader(compactedFileL3)
+                val newL3Reader = SSTableReader(compactedFileL3, blockCache)
                 newL3Reader.level = 3
 
                 synchronized(sstReaders) {
@@ -614,7 +729,10 @@ class KoreDB(
                 }
 
                 writeManifest()
-                filesToMergeL3.forEach { it.file.delete() }
+                filesToMergeL3.forEach { 
+                    it.close()
+                    it.file.delete() 
+                }
                 compactionCounter.incrementAndGet()
                 logger.info("L2 -> L3 COMPACTION COMPLETE. File size: ${compactedFileL3.length() / 1024} KB")
             }
@@ -624,11 +742,13 @@ class KoreDB(
     private fun checkAndTriggerCompaction() {
         val l0Count = synchronized(sstReaders) { sstReaders.count { it.level == 0 } }
         if (l0Count >= 4) { // Trigger Leveled Compaction when Level 0 has 4 or more files
-            if (!isCompacting) {
+            if (!isCompacting && !isBackupInProgress) {
                 isCompacting = true
                 backgroundScope.launch {
                     try {
-                        performLeveledCompaction()
+                        if (!isBackupInProgress) {
+                            performLeveledCompaction()
+                        }
                     } catch (e: Exception) {
                         logger.error("Compaction failed: ${e.message}", e)
                     } finally {
@@ -714,7 +834,7 @@ class KoreDB(
     /**
      * Returns all key-value pairs whose keys fall within the range [startKey, endKey).
      */
-    fun getRangeWithKeysRaw(startKey: ByteArray, endKey: ByteArray): List<Pair<ByteArray, ByteArray>> {
+    fun getRangeWithKeysRaw(startKey: ByteArray, endKey: ByteArray, limit: Int? = null): List<Pair<ByteArray, ByteArray>> {
         readCounter.incrementAndGet()
         val iterators = PriorityQueue<KoreIterator>()
         val imm: MemTable?
@@ -722,6 +842,21 @@ class KoreDB(
         synchronized(sstReaders) {
             imm = immutableMemTable
             readersSnapshot = sstReaders.toList()
+        }
+
+        if (readersSnapshot.isEmpty() && imm == null) {
+            val results = mutableListOf<Pair<ByteArray, ByteArray>>()
+            for (entry in memTable.getTailEntries(startKey)) {
+                val key = entry.key
+                if (ByteArrayComparator.compare(key, endKey) >= 0) break
+                val value = entry.value
+                if (value.isNotEmpty()) {
+                    val plainValue = if (crypto != null) crypto.decrypt(value, aad = key) else value
+                    results.add(Pair(key, plainValue))
+                    if (limit != null && results.size >= limit) break
+                }
+            }
+            return results
         }
 
         for (i in readersSnapshot.indices) {
@@ -756,6 +891,7 @@ class KoreDB(
                 if (value.isNotEmpty()) {
                     val plainValue = if (crypto != null) crypto.decrypt(value, aad = key) else value
                     results.add(Pair(key, plainValue))
+                    if (limit != null && results.size >= limit) break
                 }
                 lastKey = key
             }
@@ -766,6 +902,27 @@ class KoreDB(
         }
 
         return results
+    }
+
+    /**
+     * Returns all key-value pairs whose keys fall within the inclusive range [startKey, endKey].
+     */
+    fun getRangeInclusiveWithKeysRaw(startKey: ByteArray, endKey: ByteArray): List<Pair<ByteArray, ByteArray>> {
+        val nextEndKey = endKey.copyOf()
+        var i = nextEndKey.size - 1
+        var carry = true
+        while (i >= 0 && carry) {
+            val v = (nextEndKey[i].toInt() and 0xFF) + 1
+            nextEndKey[i] = v.toByte()
+            carry = v > 255
+            i--
+        }
+        val actualEndKey = if (carry) null else nextEndKey
+        return if (actualEndKey != null) {
+            getRangeWithKeysRaw(startKey, actualEndKey)
+        } else {
+            getRangeWithKeysRaw(startKey, endKey)
+        }
     }
 
     /**
@@ -941,7 +1098,7 @@ class KoreDB(
     /**
      * Returns all keys that match the specified prefix.
      */
-    fun getKeysByPrefixRaw(prefix: ByteArray): List<ByteArray> {
+    fun getKeysByPrefixRaw(prefix: ByteArray, limit: Int? = null): List<ByteArray> {
         readCounter.incrementAndGet()
         val endKey = prefix.copyOf()
         var i = endKey.size - 1
@@ -960,6 +1117,20 @@ class KoreDB(
         synchronized(sstReaders) {
             imm = immutableMemTable
             readersSnapshot = sstReaders.toList()
+        }
+
+        if (readersSnapshot.isEmpty() && imm == null) {
+            val results = mutableListOf<ByteArray>()
+            for (entry in memTable.getTailEntries(prefix)) {
+                val key = entry.key
+                if (!key.startsWith(prefix)) break
+                val value = entry.value
+                if (value.isNotEmpty()) {
+                    results.add(key)
+                    if (limit != null && results.size >= limit) break
+                }
+            }
+            return results
         }
 
         for (idx in readersSnapshot.indices) {
@@ -1002,6 +1173,7 @@ class KoreDB(
                 val value = top.value() ?: KoreDB.TOMBSTONE
                 if (value.isNotEmpty()) {
                     results.add(key)
+                    if (limit != null && results.size >= limit) break
                 }
                 lastKey = key
             }
@@ -1116,10 +1288,13 @@ class KoreDB(
     fun nuke() {
         wal.close()
         synchronized(sstReaders) {
+            sstReaders.forEach { it.close() }
             sstReaders.clear()
         }
 
-        directory.listFiles()?.forEach { it.delete() }
+        directory.listFiles()?.forEach { 
+            if (it.name != "kore.lock") it.delete() 
+        }
 
         memTable.clear()
         immutableMemTable = null
@@ -1131,10 +1306,40 @@ class KoreDB(
 
     /**
      * Releases all resources and closes active file handles.
+     *
+     * @param flushMemTable If true (default), gracefully flushes the active MemTable
+     * to an SSTable and truncates the WAL, ensuring instantaneous startup on next launch.
+     * If false, file handles are closed immediately to simulate a process crash or power loss.
      */
-    fun close() {
+    fun close(flushMemTable: Boolean = true) {
+        if (flushMemTable && memTable.size() > 0) {
+            try {
+                kotlinx.coroutines.runBlocking {
+                    flushMemTableInternal()
+                }
+            } catch (e: Exception) {
+                logger.warn("Error flushing MemTable during close: ${e.message}")
+            }
+        }
         wal.close()
+        synchronized(sstReaders) {
+            sstReaders.forEach { it.close() }
+            sstReaders.clear()
+        }
+        backgroundScope.cancel()
+        try {
+            fileLock?.release()
+        } catch (_: Exception) {}
+        try {
+            lockRaf?.close()
+        } catch (_: Exception) {}
     }
+
+    /**
+     * Executes an integrity verification across all active database files.
+     */
+    fun verifyIntegrity(): IntegrityReport =
+        IntegrityVerifier.verify(directory)
 
     /**
      * Retrieves runtime storage engine and operational metrics.
@@ -1156,6 +1361,7 @@ class KoreDB(
     /**
      * Creates a consistent point-in-time snapshot backup in [destDir].
      * Flushes in-memory entries and verifies file integrity via CRC32.
+     * Synchronizes with background compaction to prevent missing file race conditions.
      *
      * @param destDir Target directory where backup files and BACKUP.json will be written.
      * @return [BackupMetadata] containing file lists, sizes, and integrity checksums.
@@ -1165,49 +1371,58 @@ class KoreDB(
             destDir.mkdirs()
         }
 
-        // 1. Ensure all memory table entries are flushed to SSTables
-        flushMemTableInternal()
-
-        val snapshotReaders = synchronized(sstReaders) { sstReaders.toList() }
-        val manifestFile = File(directory, "MANIFEST")
-        val filesToCopy = mutableListOf<File>()
-        if (manifestFile.exists()) {
-            filesToCopy.add(manifestFile)
-        }
-        for (reader in snapshotReaders) {
-            if (reader.file.exists()) {
-                filesToCopy.add(reader.file)
+        isBackupInProgress = true
+        try {
+            while (isCompacting) {
+                delay(10)
             }
-        }
 
-        val checksumMap = mutableMapOf<String, Long>()
-        val sstableNames = mutableListOf<String>()
-        var totalSize = 0L
+            // 1. Ensure all memory table entries are flushed to SSTables
+            flushMemTableInternal()
 
-        for (file in filesToCopy) {
-            val destFile = File(destDir, file.name)
-            file.copyTo(destFile, overwrite = true)
-            val crc = computeCrc32(destFile)
-            checksumMap[file.name] = crc
-            totalSize += destFile.length()
-            if (file.name.endsWith(".sst")) {
-                sstableNames.add(file.name)
+            val snapshotReaders = synchronized(sstReaders) { sstReaders.toList() }
+            val manifestFile = File(directory, "MANIFEST")
+            val filesToCopy = mutableListOf<File>()
+            if (manifestFile.exists()) {
+                filesToCopy.add(manifestFile)
             }
+            for (reader in snapshotReaders) {
+                if (reader.file.exists()) {
+                    filesToCopy.add(reader.file)
+                }
+            }
+
+            val checksumMap = mutableMapOf<String, Long>()
+            val sstableNames = mutableListOf<String>()
+            var totalSize = 0L
+
+            for (file in filesToCopy) {
+                val destFile = File(destDir, file.name)
+                file.copyTo(destFile, overwrite = true)
+                val crc = computeCrc32(destFile)
+                checksumMap[file.name] = crc
+                totalSize += destFile.length()
+                if (file.name.endsWith(".sst")) {
+                    sstableNames.add(file.name)
+                }
+            }
+
+            val metadata = BackupMetadata(
+                timestamp = System.currentTimeMillis(),
+                version = "0.1.3",
+                sstableFiles = sstableNames,
+                fileChecksums = checksumMap,
+                totalSizeBytes = totalSize
+            )
+
+            val jsonString = backupJson.encodeToString(BackupMetadata.serializer(), metadata)
+            File(destDir, "BACKUP.json").writeText(jsonString)
+
+            logger.info("Created database backup with ${sstableNames.size} SSTables at ${destDir.absolutePath}")
+            metadata
+        } finally {
+            isBackupInProgress = false
         }
-
-        val metadata = BackupMetadata(
-            timestamp = System.currentTimeMillis(),
-            version = "0.1.3",
-            sstableFiles = sstableNames,
-            fileChecksums = checksumMap,
-            totalSizeBytes = totalSize
-        )
-
-        val jsonString = backupJson.encodeToString(BackupMetadata.serializer(), metadata)
-        File(destDir, "BACKUP.json").writeText(jsonString)
-
-        logger.info("Created database backup with ${sstableNames.size} SSTables at ${destDir.absolutePath}")
-        metadata
     }
 
     /**
@@ -1243,6 +1458,7 @@ class KoreDB(
         // Close current WAL and clear readers
         wal.close()
         synchronized(sstReaders) {
+            sstReaders.forEach { it.close() }
             sstReaders.clear()
         }
 

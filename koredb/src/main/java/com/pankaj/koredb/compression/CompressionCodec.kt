@@ -46,12 +46,14 @@ interface CompressionCodec {
         const val TYPE_NONE: Byte = 0
         const val TYPE_DEFLATE: Byte = 1
         const val TYPE_GZIP: Byte = 2
+        const val TYPE_LZ4: Byte = 3
 
         fun fromType(type: Byte): CompressionCodec {
             return when (type) {
                 TYPE_NONE -> NoOpCompressionCodec
                 TYPE_DEFLATE -> DeflateCompressionCodec()
                 TYPE_GZIP -> GzipCompressionCodec
+                TYPE_LZ4 -> Lz4CompressionCodec()
                 else -> NoOpCompressionCodec
             }
         }

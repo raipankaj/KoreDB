@@ -37,16 +37,91 @@ import java.util.concurrent.ConcurrentHashMap
 class KoreDatabase(
     private val directory: File,
     private val crypto: com.pankaj.koredb.crypto.KoreCrypto? = null,
-    private val compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec
+    private val compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.Lz4CompressionCodec(),
+    val targetSchemaVersion: Int = 1,
+    val minFreeSpaceBytes: Long = 10 * 1024 * 1024L,
+    val enableCdc: Boolean = true,
+    private val onMigrate: ((db: KoreDatabase, oldVersion: Int, newVersion: Int) -> Unit)? = null
 ) {
 
     /**
      * The underlying storage engine. 
      * Initialized lazily to ensure [KoreAndroid.create] is non-blocking on the UI thread.
      */
-    val engine: KoreDB by lazy { KoreDB(directory, crypto, compressionCodec) }
+    val engine: KoreDB by lazy { KoreDB(directory, crypto, compressionCodec, minFreeSpaceBytes) }
+    val cdcManager: com.pankaj.koredb.cdc.CdcManager by lazy { com.pankaj.koredb.cdc.CdcManager(engine, enabled = enableCdc) }
     
     private val collections = ConcurrentHashMap<String, KoreCollection<*>>()
+    var onCloseCallback: (() -> Unit)? = null
+    @Volatile
+    private var isMigrated = false
+    @Volatile
+    private var isDecryptionFailure = false
+
+    companion object {
+        private val SCHEMA_VERSION_KEY = "__koredb_schema_version__".toByteArray(Charsets.UTF_8)
+
+        /**
+         * Creates a transient in-memory [KoreDatabase] instance for fast unit testing.
+         * Automatically cleans up its temporary storage when [close] is called.
+         */
+        fun inMemory(): KoreDatabase {
+            val tempDir = java.nio.file.Files.createTempDirectory("koredb_mem_").toFile()
+            val db = KoreDatabase(tempDir)
+            db.onCloseCallback = {
+                tempDir.deleteRecursively()
+            }
+            return db
+        }
+    }
+
+    init {
+        if (onMigrate != null) {
+            ensureMigrated()
+        }
+    }
+
+    private fun ensureMigrated() {
+        if (!isMigrated) {
+            synchronized(this) {
+                if (!isMigrated) {
+                    isMigrated = true
+                    val currentVer = getStoredSchemaVersion()
+                    if (!isDecryptionFailure && currentVer < targetSchemaVersion) {
+                        onMigrate?.invoke(this, currentVer, targetSchemaVersion)
+                        setSchemaVersion(targetSchemaVersion)
+                        kotlinx.coroutines.runBlocking {
+                            engine.flushMemTableInternal()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun getStoredSchemaVersion(): Int {
+        val bytes = try {
+            engine.getRaw(SCHEMA_VERSION_KEY)
+        } catch (e: com.pankaj.koredb.engine.CorruptionException) {
+            isDecryptionFailure = true
+            null
+        } catch (_: Throwable) {
+            null
+        } ?: return 0
+        return String(bytes, Charsets.UTF_8).toIntOrNull() ?: 0
+    }
+
+    val schemaVersion: Int 
+        get() {
+            ensureMigrated()
+            return getStoredSchemaVersion()
+        }
+
+    private fun setSchemaVersion(version: Int) {
+        kotlinx.coroutines.runBlocking {
+            engine.putRaw(SCHEMA_VERSION_KEY, version.toString().toByteArray(Charsets.UTF_8))
+        }
+    }
 
     /**
      * Retrieves a [KoreCollection] for the specified type [T].
@@ -68,16 +143,140 @@ class KoreDatabase(
      * @param serializer The [KSerializer] to use for document serialization.
      * @return A thread-safe collection instance.
      */
+
+    /**
+     * Retrieves all mutations recorded at or after [sinceTimestamp], ordered chronologically.
+     */
+    fun getMutationsSince(sinceTimestamp: Long, limit: Int = 1000): List<com.pankaj.koredb.cdc.MutationRecord> =
+        cdcManager.getMutationsSince(sinceTimestamp, limit)
+
+    /**
+     * Prunes acknowledged mutations up to [upToSequence] to free disk space.
+     */
+    fun acknowledgeMutations(upToSequence: Long) =
+        cdcManager.acknowledgeMutations(upToSequence)
+
+    /**
+     * Registers a listener for real-time mutation streaming to sync workers.
+     */
+    fun registerMutationListener(listener: com.pankaj.koredb.cdc.MutationListener) =
+        cdcManager.registerListener(listener)
+
+    /**
+     * Unregisters a previously registered mutation listener.
+     */
+    fun unregisterMutationListener(listener: com.pankaj.koredb.cdc.MutationListener) =
+        cdcManager.unregisterListener(listener)
+
     @Suppress("UNCHECKED_CAST")
     fun <T : Any> collection(
         name: String, 
         serializer: KSerializer<T>
     ): KoreCollection<T> {
-        return collections.getOrPut(name) {
+        ensureMigrated()
+        val cacheKey = "$name:${serializer.descriptor.serialName}"
+        return collections.getOrPut(cacheKey) {
             val koreSerializer = KotlinxKoreSerializer(serializer)
-            KoreCollection(name, engine, koreSerializer)
+            val col = KoreCollection(name, engine, koreSerializer)
+            col.cdcManager = cdcManager
+            col
         } as KoreCollection<T>
     }
+
+    /**
+     * Retrieves or creates a high-performance binary [KoreCollection] for type [T] using CBOR serialization.
+     * Yields up to 4x higher throughput and 50-70% smaller on-disk records compared to JSON.
+     */
+    inline fun <reified T : Any> binaryCollection(name: String) =
+        binaryCollection(name, serializer<T>())
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Suppress("UNCHECKED_CAST")
+    fun <T : Any> binaryCollection(
+        name: String,
+        serializer: KSerializer<T>
+    ): KoreCollection<T> {
+        ensureMigrated()
+        val cacheKey = "binary:$name:${serializer.descriptor.serialName}"
+        return collections.getOrPut(cacheKey) {
+            val koreSerializer = com.pankaj.koredb.core.CborKoreSerializer(serializer)
+            val col = KoreCollection(name, engine, koreSerializer)
+            col.cdcManager = cdcManager
+            col
+        } as KoreCollection<T>
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    fun <T : Any> collection(
+        name: String,
+        serializer: com.pankaj.koredb.core.KoreSerializer<T>
+    ): KoreCollection<T> {
+        ensureMigrated()
+        val cacheKey = "$name:${serializer.serialName}"
+        return collections.getOrPut(cacheKey) {
+            val col = KoreCollection(name, engine, serializer)
+            col.cdcManager = cdcManager
+            col
+        } as KoreCollection<T>
+    }
+
+    /**
+     * Clears cached collection instances. Useful during schema migrations.
+     */
+    fun clearCollectionCache() {
+        collections.clear()
+    }
+
+    /**
+     * Clears in-memory document caches across all active collections.
+     */
+    fun clearDocumentCaches() {
+        collections.values.forEach { it.clearCache() }
+    }
+
+    /**
+     * Selectively invalidates modified keys from the document caches.
+     */
+    fun invalidateCachedDocuments(keys: Set<String>) {
+        for (key in keys) {
+            if (key.startsWith("doc:")) {
+                val parts = key.split(":")
+                if (parts.size >= 3) {
+                    val collName = parts[1]
+                    val id = parts.subList(2, parts.size).joinToString(":")
+                    for ((k, col) in collections) {
+                        if (k == collName || k.startsWith("$collName:")) {
+                            col.invalidateCache(id)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Completely drops a collection by deleting all its documents, secondary indices,
+     * numeric indices, FTS indices, and in-memory caches.
+     *
+     * @param name The unique name of the collection to drop.
+     */
+    suspend fun dropCollection(name: String) {
+        val matchingCols = collections.filterKeys { it.startsWith("$name:") || it == name }
+        if (matchingCols.isNotEmpty()) {
+            for ((_, col) in matchingCols) {
+                col.deleteAll()
+            }
+        } else {
+            val dummySerializer = KotlinxKoreSerializer(kotlinx.serialization.builtins.ByteArraySerializer())
+            val tempCol = KoreCollection(name, engine, dummySerializer)
+            tempCol.deleteAll()
+        }
+        for (k in matchingCols.keys) {
+            collections.remove(k)
+        }
+    }
+
+    private val vectorCollections = ConcurrentHashMap<String, KoreVectorCollection>()
 
     /**
      * Retrieves or creates a [KoreVectorCollection] for similarity search.
@@ -86,11 +285,13 @@ class KoreDatabase(
      * @return A collection instance with default configuration.
      */
     fun vectorCollection(name: String): KoreVectorCollection {
-        return KoreVectorCollection(name, engine)
+        return vectorCollections.getOrPut(name) {
+            KoreVectorCollection(name, engine)
+        }
     }
 
     /**
-     * Creates a [KoreVectorCollection] with custom configuration.
+     * Creates or retrieves a [KoreVectorCollection] with custom configuration.
      *
      * Usage:
      * ```kotlin
@@ -111,8 +312,55 @@ class KoreDatabase(
         name: String,
         configure: com.pankaj.koredb.core.VectorCollectionConfig.Builder.() -> Unit
     ): KoreVectorCollection {
-        val config = com.pankaj.koredb.core.VectorCollectionConfig.Builder().apply(configure).build()
-        return KoreVectorCollection(name, engine, config)
+        return vectorCollections.getOrPut(name) {
+            val config = com.pankaj.koredb.core.VectorCollectionConfig.Builder().apply(configure).build()
+            KoreVectorCollection(name, engine, config)
+        }
+    }
+
+    val mvccManager = com.pankaj.koredb.engine.mvcc.MvccManager()
+
+    /**
+     * Begins an explicit MVCC transaction under Snapshot Isolation.
+     */
+    fun beginTransaction(): com.pankaj.koredb.engine.mvcc.MvccTransaction {
+        val snapshot = mvccManager.beginSnapshot()
+        return com.pankaj.koredb.engine.mvcc.MvccTransaction(this, snapshot, mvccManager)
+    }
+
+    /**
+     * Executes a transactional block under Snapshot Isolation.
+     * Writes are buffered and atomically committed upon block return.
+     * Throws [com.pankaj.koredb.engine.mvcc.MvccConflictException] if a concurrent transaction
+     * committed conflicting mutations on the same keys.
+     */
+    fun <R> transaction(block: (com.pankaj.koredb.engine.mvcc.MvccTransaction) -> R): R {
+        val tx = beginTransaction()
+        try {
+            val result = block(tx)
+            tx.commit()
+            return result
+        } catch (e: Exception) {
+            tx.rollback()
+            throw e
+        }
+    }
+
+    /**
+     * Executes a comprehensive database integrity check across all active SSTables,
+     * sparse indices, and WAL logs (analogous to SQLite's `PRAGMA integrity_check`).
+     *
+     * @return An [IntegrityReport] containing health status and diagnostics.
+     */
+    fun verifyIntegrity(): com.pankaj.koredb.engine.IntegrityReport =
+        com.pankaj.koredb.engine.IntegrityVerifier.verify(directory)
+
+    /**
+     * Executes a full leveled compaction across all SSTables, purging tombstones
+     * and reclaiming disk storage (analogous to SQLite's `VACUUM`).
+     */
+    fun compact() {
+        engine.compact()
     }
 
     /**
@@ -121,8 +369,12 @@ class KoreDatabase(
      * After calling this method, further operations on the database or its
      * collections may fail or result in undefined behavior.
      */
-    fun close() {
-        engine.close()
+    fun close(flushMemTable: Boolean = true) {
+        onCloseCallback?.invoke()
+        onCloseCallback = null
+        vectorCollections.values.forEach { it.close() }
+        vectorCollections.clear()
+        engine.close(flushMemTable)
     }
 
     fun graph(): GraphStorage {
