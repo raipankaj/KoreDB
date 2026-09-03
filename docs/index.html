@@ -7,6 +7,11 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/kotlin.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
     <style>
         :root {
             --primary: #6366f1;
@@ -37,6 +42,39 @@
             display: flex;
             min-height: 100vh;
         }
+
+        /* MARKDOWN TYPOGRAPHY STYLES */
+        #content h1 { font-size: 32px; font-weight: 800; margin: 32px 0 16px 0; color: #fff; border-bottom: 1px solid var(--surface-border); padding-bottom: 8px; }
+        #content h2 { font-size: 24px; font-weight: 700; margin: 32px 0 14px 0; color: #f1f5f9; border-bottom: 1px solid rgba(51, 65, 85, 0.4); padding-bottom: 6px; }
+        #content h3 { font-size: 19px; font-weight: 600; margin: 24px 0 10px 0; color: #e2e8f0; }
+        #content h4 { font-size: 16px; font-weight: 600; margin: 18px 0 8px 0; color: #cbd5e1; }
+        #content p { margin-bottom: 16px; color: #cbd5e1; font-size: 15px; line-height: 1.7; }
+        #content ul, #content ol { margin: 12px 0 20px 24px; color: #cbd5e1; }
+        #content li { margin-bottom: 6px; font-size: 14.5px; line-height: 1.6; }
+        #content hr { border: 0; border-top: 1px solid var(--surface-border); margin: 32px 0; }
+        #content a { color: var(--accent-cyan); text-decoration: none; font-weight: 500; }
+        #content a:hover { text-decoration: underline; }
+        #content blockquote {
+            border-left: 4px solid var(--primary);
+            background: rgba(99, 102, 241, 0.1);
+            padding: 14px 18px;
+            border-radius: 0 8px 8px 0;
+            margin: 18px 0;
+            color: #e2e8f0;
+        }
+        #content blockquote p { margin-bottom: 0; }
+
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            border-left-color: var(--primary);
+            animation: spin 0.8s linear infinite;
+            margin: 50px auto 16px auto;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .loading-state { text-align: center; color: var(--text-muted); padding: 80px 0; font-size: 15px; }
 
         /* SIDEBAR */
         #sidebar {
@@ -306,13 +344,65 @@
             padding-bottom: 12px;
         }
 
+        .mobile-header {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 60px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--surface-border);
+            padding: 0 16px;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 200;
+        }
+
+        #menu-btn {
+            background: transparent;
+            border: 1px solid var(--surface-border);
+            color: var(--text-main);
+            font-size: 20px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
         @media (max-width: 900px) {
-            #sidebar { display: none; }
-            #content { margin-left: 0; padding: 24px; }
+            .mobile-header { display: flex; }
+            #sidebar {
+                transform: translateX(-100%);
+                transition: transform 0.25s ease-in-out;
+                top: 60px;
+                width: 280px;
+                background: var(--surface);
+                border-right: 1px solid var(--surface-border);
+                box-shadow: 10px 0 30px rgba(0,0,0,0.6);
+                display: flex;
+            }
+            #sidebar.open {
+                transform: translateX(0);
+            }
+            #content {
+                margin-left: 0;
+                padding: 80px 20px 40px 20px;
+            }
         }
     </style>
 </head>
 <body>
+
+    <!-- MOBILE HEADER -->
+    <div class="mobile-header">
+        <div class="brand">
+            <div class="brand-logo" style="width: 32px; height: 32px; font-size: 16px;">K</div>
+            <div class="brand-text">
+                <h1 style="font-size: 16px;">KoreDB</h1>
+            </div>
+        </div>
+        <button id="menu-btn" aria-label="Toggle Menu">☰</button>
+    </div>
 
     <!-- SIDEBAR -->
     <nav id="sidebar">
@@ -326,29 +416,30 @@
 
         <div class="nav-section">
             <div class="nav-title">Getting Started</div>
-            <a href="index.html" class="nav-link active">Overview</a>
-            <a href="index.html#installation" class="nav-link">Installation</a>
-            <a href="index.html#quickstart" class="nav-link">Quickstart</a>
-            <a href="index.html#benchmarks" class="nav-link">Head-to-Head Benchmarks</a>
+            <a href="#overview" class="nav-link active">Overview</a>
+            <a href="#installation" class="nav-link">Installation</a>
+            <a href="#quickstart" class="nav-link">Quickstart</a>
+            <a href="#benchmarks" class="nav-link">Head-to-Head Benchmarks</a>
         </div>
 
         <div class="nav-section">
             <div class="nav-title">Core Engines</div>
-            <a href="document_engine.md" class="nav-link">📄 Document Collections</a>
-            <a href="vector_engine.md" class="nav-link">⚡ Vector Database (HNSW)</a>
-            <a href="graph_engine.md" class="nav-link">🕸️ Property Graph Engine</a>
-            <a href="hybrid_graph_rag.md" class="nav-link">🧬 Unified Graph RAG Bridge</a>
+            <a href="#document_engine" class="nav-link">📄 Document Collections</a>
+            <a href="#vector_engine" class="nav-link">⚡ Vector Database (HNSW)</a>
+            <a href="#graph_engine" class="nav-link">🕸️ Property Graph Engine</a>
+            <a href="#hybrid_graph_rag" class="nav-link">🧬 Unified Graph RAG Bridge</a>
         </div>
 
         <div class="nav-section">
             <div class="nav-title">Engine Architecture</div>
-            <a href="architecture.md" class="nav-link">🏛️ LSM-Tree & WAL Internals</a>
-            <a href="transactions_mvcc.md" class="nav-link">🔒 MVCC Snapshot Isolation</a>
-            <a href="enterprise_features.md" class="nav-link">🛡️ Enterprise CDC & Crypto</a>
-            <a href="android_features_guide.md" class="nav-link">🚀 Android Feature Guide</a>
-            <a href="migration_from_room.md" class="nav-link">🔄 Room Migration Guide</a>
-            <a href="production_checklist.md" class="nav-link">🛡️ Production Checklist</a>
-            <a href="sample_codebase.md" class="nav-link">📱 Complete Sample Project</a>
+            <a href="#architecture" class="nav-link">🏛️ LSM-Tree & WAL Internals</a>
+            <a href="#transactions_mvcc" class="nav-link">🔒 MVCC Snapshot Isolation</a>
+            <a href="#enterprise_features" class="nav-link">🛡️ Enterprise CDC & Crypto</a>
+            <a href="#android_features_guide" class="nav-link">🚀 Android Feature Guide</a>
+            <a href="#migration_from_room" class="nav-link">🔄 Room Migration Guide</a>
+            <a href="#production_checklist" class="nav-link">🛡️ Production Checklist</a>
+            <a href="#benchmarks_report" class="nav-link">📊 Full Benchmark Report</a>
+            <a href="#sample_codebase" class="nav-link">📱 Complete Sample Project</a>
         </div>
     </nav>
 
@@ -522,16 +613,146 @@ db.transaction { tx ->
         <!-- DOCUMENTATION INDEX -->
         <h2 class="section-title">📚 Documentation Guides</h2>
         <ul style="list-style: none; display: flex; flex-direction: column; gap: 12px; margin-top: 16px;">
-            <li>👉 <a href="architecture.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Engine Architecture & LSM Internals</a> — Deep-dive into WAL replay, MemTable, SSTables, Bloom Filter, and Leveled Compaction.</li>
-            <li>👉 <a href="document_engine.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Document Collections & Indexing</a> — Binary CBOR serialization, secondary indices, range scans, TTL, and BM25 text search.</li>
-            <li>👉 <a href="vector_engine.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Vector Database & HNSW Search</a> — Embeddings, similarity distance metrics, SQ8 scalar quantization, and metadata filtering.</li>
-            <li>👉 <a href="graph_engine.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Property Graph Engine</a> — Directed edges, dual bidirectional indexing, cascading deletes, BFS, Dijkstra, and PageRank.</li>
-            <li>👉 <a href="hybrid_graph_rag.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Unified Graph RAG Bridge</a> — Combining semantic search with knowledge graph traversals for AI on Android.</li>
-            <li>👉 <a href="transactions_mvcc.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Transactions & Snapshot Isolation</a> — Multi-Version Concurrency Control, conflict validation, and synchronous commits.</li>
-            <li>👉 <a href="enterprise_features.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Enterprise Capabilities</a> — Change Data Capture (CDC), AES-GCM-256 encryption, LZ4 compression, and crash recovery.</li>
-            <li>👉 <a href="android_features_guide.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Android Feature & Decision Guide</a> — When and how to use each feature in Android (Jetpack Compose, WorkManager, Keystore).</li>
-            <li>👉 <a href="sample_codebase.md" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Complete Sample Codebase</a> — Step-by-step production Android integration example.</li>
+            <li>👉 <a href="#architecture" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Engine Architecture & LSM Internals</a> — Deep-dive into WAL replay, MemTable, SSTables, Bloom Filter, and Leveled Compaction.</li>
+            <li>👉 <a href="#document_engine" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Document Collections & Indexing</a> — Binary CBOR serialization, secondary indices, range scans, TTL, and BM25 text search.</li>
+            <li>👉 <a href="#vector_engine" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Vector Database & HNSW Search</a> — Embeddings, similarity distance metrics, SQ8 scalar quantization, and metadata filtering.</li>
+            <li>👉 <a href="#graph_engine" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Property Graph Engine</a> — Directed edges, dual bidirectional indexing, cascading deletes, BFS, Dijkstra, and PageRank.</li>
+            <li>👉 <a href="#hybrid_graph_rag" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Unified Graph RAG Bridge</a> — Combining semantic search with knowledge graph traversals for AI on Android.</li>
+            <li>👉 <a href="#transactions_mvcc" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Transactions & Snapshot Isolation</a> — Multi-Version Concurrency Control, conflict validation, and synchronous commits.</li>
+            <li>👉 <a href="#enterprise_features" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Enterprise Capabilities</a> — Change Data Capture (CDC), AES-GCM-256 encryption, LZ4 compression, and crash recovery.</li>
+            <li>👉 <a href="#android_features_guide" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Android Feature & Decision Guide</a> — When and how to use each feature in Android (Jetpack Compose, WorkManager, Keystore).</li>
+            <li>👉 <a href="#migration_from_room" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Room to KoreDB Migration Guide</a> — Converting DAOs, entities, and zero-downtime background migration.</li>
+            <li>👉 <a href="#production_checklist" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Production Readiness Checklist</a> — Verification checklist, R8 rules, storage paths, and health monitoring.</li>
+            <li>👉 <a href="#benchmarks_report" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Head-to-Head Benchmarks</a> — Real Google Pixel 7 Pro hardware comparison vs Room/SQLite.</li>
+            <li>👉 <a href="#sample_codebase" style="color: #38bdf8; text-decoration: none; font-weight: 600;">Complete Sample Codebase</a> — Step-by-step production Android integration example.</li>
         </ul>
     </main>
+
+    <script>
+        const contentEl = document.getElementById('content');
+        const overviewContent = contentEl.innerHTML;
+
+        const docMap = {
+            'document_engine': 'document_engine.md',
+            'vector_engine': 'vector_engine.md',
+            'graph_engine': 'graph_engine.md',
+            'hybrid_graph_rag': 'hybrid_graph_rag.md',
+            'architecture': 'architecture.md',
+            'transactions_mvcc': 'transactions_mvcc.md',
+            'enterprise_features': 'enterprise_features.md',
+            'android_features_guide': 'android_features_guide.md',
+            'migration_from_room': 'migration_from_room.md',
+            'production_checklist': 'production_checklist.md',
+            'benchmarks_report': 'benchmarks.md',
+            'sample_codebase': 'sample_codebase.md'
+        };
+
+        // Allow alias matching if .md extension was supplied
+        for (const [key, val] of Object.entries(docMap)) {
+            docMap[key + '.md'] = val;
+            docMap[val] = val;
+        }
+
+        async function render() {
+            const hash = window.location.hash.replace(/^#/, '').trim();
+
+            // Update sidebar active link
+            document.querySelectorAll('.nav-link').forEach(link => {
+                const href = link.getAttribute('href');
+                if (href === '#' + hash || (!hash && (href === '#overview' || href === 'index.html'))) {
+                    link.classList.add('active');
+                } else {
+                    link.classList.remove('active');
+                }
+            });
+
+            // Overview or in-page anchor
+            if (!hash || hash === 'overview') {
+                contentEl.innerHTML = overviewContent;
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+                attachContentListeners();
+                return;
+            }
+
+            if (hash === 'installation' || hash === 'quickstart' || hash === 'benchmarks') {
+                contentEl.innerHTML = overviewContent;
+                attachContentListeners();
+                const target = document.getElementById(hash);
+                if (target) target.scrollIntoView({ behavior: 'smooth' });
+                return;
+            }
+
+            // Document page
+            const docFile = docMap[hash];
+            if (docFile) {
+                contentEl.innerHTML = '<div class="loading-state"><div class="spinner"></div><p>Loading documentation...</p></div>';
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+
+                try {
+                    const response = await fetch(docFile);
+                    if (!response.ok) throw new Error(`HTTP ${response.status} loading ${docFile}`);
+                    const markdownText = await response.text();
+
+                    // Parse markdown to HTML
+                    contentEl.innerHTML = marked.parse(markdownText);
+
+                    // Syntax highlight all code blocks
+                    contentEl.querySelectorAll('pre code').forEach(block => {
+                        hljs.highlightElement(block);
+                    });
+
+                    // Rewrite internal .md links inside the loaded document to hash links
+                    contentEl.querySelectorAll('a').forEach(a => {
+                        const href = a.getAttribute('href');
+                        if (href && !href.startsWith('http') && !href.startsWith('#')) {
+                            const cleanKey = href.replace(/\.md$/, '').replace(/^\.\//, '');
+                            if (docMap[cleanKey] || docMap[href]) {
+                                a.setAttribute('href', '#' + cleanKey);
+                            }
+                        }
+                    });
+
+                } catch (err) {
+                    contentEl.innerHTML = `
+                        <div style="padding: 40px; text-align: center;">
+                            <h2 style="color: #f87171;">⚠️ Failed to load document</h2>
+                            <p style="margin: 16px 0; color: #94a3b8;">${err.message}</p>
+                            <a href="#overview" style="display: inline-block; padding: 10px 20px; background: var(--primary); color: white; border-radius: 8px; text-decoration: none; font-weight: 600;">Return to Overview</a>
+                        </div>
+                    `;
+                }
+            }
+        }
+
+        function attachContentListeners() {
+            contentEl.querySelectorAll('a[href$=".md"]').forEach(a => {
+                const href = a.getAttribute('href');
+                const cleanKey = href.replace(/\.md$/, '').replace(/^\.\//, '');
+                if (docMap[cleanKey] || docMap[href]) {
+                    a.setAttribute('href', '#' + cleanKey);
+                }
+            });
+        }
+
+        window.addEventListener('hashchange', render);
+        window.addEventListener('DOMContentLoaded', () => {
+            render();
+            attachContentListeners();
+
+            // Mobile menu toggle
+            const menuBtn = document.getElementById('menu-btn');
+            const sidebar = document.getElementById('sidebar');
+            if (menuBtn && sidebar) {
+                menuBtn.addEventListener('click', () => {
+                    sidebar.classList.toggle('open');
+                });
+                sidebar.querySelectorAll('.nav-link').forEach(link => {
+                    link.addEventListener('click', () => {
+                        sidebar.classList.remove('open');
+                    });
+                });
+            }
+        });
+    </script>
 </body>
 </html>

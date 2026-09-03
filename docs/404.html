@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redirecting | KoreDB Documentation</title>
+    <script>
+        // Redirect direct page accesses (e.g. /KoreDB/architecture or /KoreDB/architecture.md) to /KoreDB/#architecture
+        const pathSegments = window.location.pathname.split('/').filter(Boolean);
+        const lastSegment = pathSegments[pathSegments.length - 1] || '';
+        const cleanPage = lastSegment.replace(/\.md$/, '').replace(/\.html$/, '');
+
+        if (cleanPage && cleanPage !== 'index' && cleanPage !== 'KoreDB') {
+            window.location.replace('/KoreDB/#' + cleanPage);
+        } else {
+            window.location.replace('/KoreDB/');
+        }
+    </script>
+</head>
+<body style="background: #0b0f19; color: #94a3b8; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
+    <p>Redirecting to KoreDB Documentation...</p>
+</body>
+</html>
