@@ -18,6 +18,7 @@ package com.pankaj.koredb.db
 
 import android.content.Context
 import com.pankaj.koredb.compression.CompressionCodec
+import com.pankaj.koredb.compression.Lz4CompressionCodec
 import com.pankaj.koredb.compression.NoOpCompressionCodec
 import com.pankaj.koredb.crypto.AesGcmCrypto
 import com.pankaj.koredb.crypto.KoreCrypto
@@ -74,7 +75,7 @@ object KoreAndroid {
      */
     class Builder(private val context: Context, private val dbName: String) {
         private var crypto: KoreCrypto? = null
-        private var compressionCodec: CompressionCodec = NoOpCompressionCodec
+        private var compressionCodec: CompressionCodec = Lz4CompressionCodec()
         private var storageLocation: StorageLocation = StorageLocation.DATABASE_DIR
         private var schemaVersion: Int = 1
         private var onMigrate: ((KoreDatabase, Int, Int) -> Unit)? = null

@@ -31,99 +31,104 @@ class MmapHNSWIndex(file: File) {
 
     init {
         val raf = RandomAccessFile(file, "r")
-        fileLength = raf.length()
-        channel = raf.channel
-        buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileLength)
-        buffer.order(ByteOrder.BIG_ENDIAN)
+        try {
+            fileLength = raf.length()
+            channel = raf.channel
+            buffer = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileLength)
+            buffer.order(ByteOrder.BIG_ENDIAN)
 
-        // Read Header
-        val magic = buffer.getInt()
-        if (magic != 0x4D484E53) { // "MHNS" magic
-            throw IllegalArgumentException("Invalid memory-mapped HNSW file format.")
-        }
-        val version = buffer.getInt()
-        if (version != 3) {
-            throw IllegalArgumentException("Unsupported HNSW version: $version. Expected version 3.")
-        }
-        maxLevel = buffer.getInt()
-        val metricName = readUTFFromBuffer(buffer)
-        metric = DistanceMetric.valueOf(metricName)
+            // Read Header
+            val magic = buffer.getInt()
+            if (magic != 0x4D484E53) { // "MHNS" magic
+                throw IllegalArgumentException("Invalid memory-mapped HNSW file format.")
+            }
+            val version = buffer.getInt()
+            if (version != 3) {
+                throw IllegalArgumentException("Unsupported HNSW version: $version. Expected version 3.")
+            }
+            maxLevel = buffer.getInt()
+            val metricName = readUTFFromBuffer(buffer)
+            metric = DistanceMetric.valueOf(metricName)
 
-        val hasEntry = buffer.get() == 1.toByte()
-        entryNodeId = if (hasEntry) readUTFFromBuffer(buffer) else null
+            val hasEntry = buffer.get() == 1.toByte()
+            entryNodeId = if (hasEntry) readUTFFromBuffer(buffer) else null
 
-        val hasQuantizer = buffer.get() == 1.toByte()
-        if (hasQuantizer) {
-            val dims = buffer.getInt()
-            // Skip calibration arrays
-            buffer.position(buffer.position() + dims * 8)
-        }
-
-        nodeCount = buffer.getInt()
-
-        // Read String ID Index block
-        idxToNodeId = Array(nodeCount) { "" }
-        for (i in 0 until nodeCount) {
-            val id = readUTFFromBuffer(buffer)
-            idxToNodeId[i] = id
-            nodeIdToIdx[id] = i
-        }
-
-        entryNodeIdx = entryNodeId?.let { nodeIdToIdx[it] } ?: -1
-
-        // Read offset table from the end of the file
-        val footerMagic = buffer.getInt((fileLength - 4).toInt())
-        if (footerMagic != 0x4D484E53) {
-            throw IllegalArgumentException("HNSW file corrupted: invalid footer magic.")
-        }
-        val offsetTableStart = buffer.getLong((fileLength - 12).toInt())
-
-        nodeOffsets = LongArray(nodeCount)
-        buffer.position(offsetTableStart.toInt())
-        for (i in 0 until nodeCount) {
-            nodeOffsets[i] = buffer.getLong()
-        }
-
-        // Read Metadata for all nodes eagerly
-        for (i in 0 until nodeCount) {
-            val offset = nodeOffsets[i]
-            val localBuf = buffer.duplicate()
-            localBuf.position(offset.toInt())
-
-            // Skip: ID (readUTF), Magnitude (Float), Level (Int), Vector size (Int)
-            val id = readUTFFromBuffer(localBuf)
-            localBuf.getFloat() // magnitude
-            val level = localBuf.getInt()
-            val vecSize = localBuf.getInt()
-            localBuf.position(localBuf.position() + vecSize * 4)
-
-            // Skip adjacency lists
-            for (l in 0..level) {
-                val neighborsCount = localBuf.getInt()
-                localBuf.position(localBuf.position() + neighborsCount * 4)
+            val hasQuantizer = buffer.get() == 1.toByte()
+            if (hasQuantizer) {
+                val dims = buffer.getInt()
+                // Skip calibration arrays
+                buffer.position(buffer.position() + dims * 8)
             }
 
-            // Read Metadata
-            val hasMeta = localBuf.get() == 1.toByte()
-            if (hasMeta) {
-                val metaSize = localBuf.getInt()
-                val meta = HashMap<String, Any>(metaSize)
-                repeat(metaSize) {
-                    val key = readUTFFromBuffer(localBuf)
-                    val type = localBuf.get().toInt()
-                    val value: Any = when (type) {
-                        1 -> readUTFFromBuffer(localBuf)
-                        2 -> localBuf.getInt()
-                        3 -> localBuf.getLong()
-                        4 -> localBuf.getFloat()
-                        5 -> localBuf.getDouble()
-                        6 -> localBuf.get() == 1.toByte()
-                        else -> readUTFFromBuffer(localBuf)
-                    }
-                    meta[key] = value
+            nodeCount = buffer.getInt()
+
+            // Read String ID Index block
+            idxToNodeId = Array(nodeCount) { "" }
+            for (i in 0 until nodeCount) {
+                val id = readUTFFromBuffer(buffer)
+                idxToNodeId[i] = id
+                nodeIdToIdx[id] = i
+            }
+
+            entryNodeIdx = entryNodeId?.let { nodeIdToIdx[it] } ?: -1
+
+            // Read offset table from the end of the file
+            val footerMagic = buffer.getInt((fileLength - 4).toInt())
+            if (footerMagic != 0x4D484E53) {
+                throw IllegalArgumentException("HNSW file corrupted: invalid footer magic.")
+            }
+            val offsetTableStart = buffer.getLong((fileLength - 12).toInt())
+
+            nodeOffsets = LongArray(nodeCount)
+            buffer.position(offsetTableStart.toInt())
+            for (i in 0 until nodeCount) {
+                nodeOffsets[i] = buffer.getLong()
+            }
+
+            // Read Metadata for all nodes eagerly
+            for (i in 0 until nodeCount) {
+                val offset = nodeOffsets[i]
+                val localBuf = buffer.duplicate()
+                localBuf.position(offset.toInt())
+
+                // Skip: ID (readUTF), Magnitude (Float), Level (Int), Vector size (Int)
+                val id = readUTFFromBuffer(localBuf)
+                localBuf.getFloat() // magnitude
+                val level = localBuf.getInt()
+                val vecSize = localBuf.getInt()
+                localBuf.position(localBuf.position() + vecSize * 4)
+
+                // Skip adjacency lists
+                for (l in 0..level) {
+                    val neighborsCount = localBuf.getInt()
+                    localBuf.position(localBuf.position() + neighborsCount * 4)
                 }
-                metadata[i] = meta
+
+                // Read Metadata
+                val hasMeta = localBuf.get() == 1.toByte()
+                if (hasMeta) {
+                    val metaSize = localBuf.getInt()
+                    val meta = HashMap<String, Any>(metaSize)
+                    repeat(metaSize) {
+                        val key = readUTFFromBuffer(localBuf)
+                        val type = localBuf.get().toInt()
+                        val value: Any = when (type) {
+                            1 -> readUTFFromBuffer(localBuf)
+                            2 -> localBuf.getInt()
+                            3 -> localBuf.getLong()
+                            4 -> localBuf.getFloat()
+                            5 -> localBuf.getDouble()
+                            6 -> localBuf.get() == 1.toByte()
+                            else -> readUTFFromBuffer(localBuf)
+                        }
+                        meta[key] = value
+                    }
+                    metadata[i] = meta
+                }
             }
+        } catch (e: Throwable) {
+            try { raf.close() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -154,6 +159,7 @@ class MmapHNSWIndex(file: File) {
                     if (l <= nodeLevel) {
                         val neighbors = getNeighbors(currIdx, l, localBuffer)
                         for (neighborIdx in neighbors) {
+                            if (neighborIdx !in 0 until nodeCount) continue
                             val d = distance(query, queryMag, neighborIdx, localBuffer)
                             if (d > currDist) {
                                 currDist = d
@@ -207,11 +213,12 @@ class MmapHNSWIndex(file: File) {
 
             val neighbors = getNeighbors(currIdx, level, localBuffer)
             for (neighborIdx in neighbors) {
+                if (neighborIdx !in 0 until nodeCount) continue
                 if (neighborIdx in visited) continue
                 visited.add(neighborIdx)
 
                 val dist = distance(query, queryMag, neighborIdx, localBuffer)
-                val worstResult = if (results.size >= ef) results.peek()!!.second else Float.MIN_VALUE
+                val worstResult = if (results.size >= ef) results.peek()!!.second else -Float.MAX_VALUE
 
                 if (results.size < ef || dist > worstResult) {
                     candidates.add(neighborIdx to dist)
@@ -252,7 +259,7 @@ class MmapHNSWIndex(file: File) {
                     val diff = query[i] - localBuffer.getFloat(vectorStartOffset + i * 4)
                     sum += diff * diff
                 }
-                1.0f / (1.0f + sum)
+                -kotlin.math.sqrt(sum)
             }
             DistanceMetric.INNER_PRODUCT -> {
                 VectorMath.dotProduct(query, localBuffer, vectorStartOffset, vecSize)
@@ -263,7 +270,7 @@ class MmapHNSWIndex(file: File) {
                     val diff = kotlin.math.abs(query[i] - localBuffer.getFloat(vectorStartOffset + i * 4))
                     sum += diff
                 }
-                1.0f / (1.0f + sum)
+                -sum
             }
         }
     }

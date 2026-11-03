@@ -1,7 +1,5 @@
 package com.pankaj.koredb.foundation
 
-import java.nio.ByteBuffer
-
 /**
  * Utility for encoding numeric primitives (Int, Long, Float, Double) into raw byte arrays
  * such that the natural lexicographical byte comparison order (as performed by [ByteArrayComparator])
@@ -39,14 +37,27 @@ object OrderPreservingEncoder {
 
     fun encodeLong(value: Long): ByteArray {
         val flipped = value xor Long.MIN_VALUE
-        val buffer = ByteBuffer.allocate(8)
-        buffer.putLong(flipped)
-        return buffer.array()
+        return byteArrayOf(
+            (flipped ushr 56).toByte(),
+            (flipped ushr 48).toByte(),
+            (flipped ushr 40).toByte(),
+            (flipped ushr 32).toByte(),
+            (flipped ushr 24).toByte(),
+            (flipped ushr 16).toByte(),
+            (flipped ushr 8).toByte(),
+            flipped.toByte()
+        )
     }
 
     fun decodeLong(bytes: ByteArray, offset: Int = 0): Long {
-        val buffer = ByteBuffer.wrap(bytes, offset, 8)
-        val raw = buffer.getLong()
+        val raw = ((bytes[offset].toLong() and 0xFFL) shl 56) or
+                ((bytes[offset + 1].toLong() and 0xFFL) shl 48) or
+                ((bytes[offset + 2].toLong() and 0xFFL) shl 40) or
+                ((bytes[offset + 3].toLong() and 0xFFL) shl 32) or
+                ((bytes[offset + 4].toLong() and 0xFFL) shl 24) or
+                ((bytes[offset + 5].toLong() and 0xFFL) shl 16) or
+                ((bytes[offset + 6].toLong() and 0xFFL) shl 8) or
+                (bytes[offset + 7].toLong() and 0xFFL)
         return raw xor Long.MIN_VALUE
     }
 
@@ -84,14 +95,27 @@ object OrderPreservingEncoder {
         val bits = java.lang.Double.doubleToLongBits(value)
         val mask = if (bits < 0) -1L else Long.MIN_VALUE
         val encoded = bits xor mask
-        val buffer = ByteBuffer.allocate(8)
-        buffer.putLong(encoded)
-        return buffer.array()
+        return byteArrayOf(
+            (encoded ushr 56).toByte(),
+            (encoded ushr 48).toByte(),
+            (encoded ushr 40).toByte(),
+            (encoded ushr 32).toByte(),
+            (encoded ushr 24).toByte(),
+            (encoded ushr 16).toByte(),
+            (encoded ushr 8).toByte(),
+            encoded.toByte()
+        )
     }
 
     fun decodeDouble(bytes: ByteArray, offset: Int = 0): Double {
-        val buffer = ByteBuffer.wrap(bytes, offset, 8)
-        val encoded = buffer.getLong()
+        val encoded = ((bytes[offset].toLong() and 0xFFL) shl 56) or
+                ((bytes[offset + 1].toLong() and 0xFFL) shl 48) or
+                ((bytes[offset + 2].toLong() and 0xFFL) shl 40) or
+                ((bytes[offset + 3].toLong() and 0xFFL) shl 32) or
+                ((bytes[offset + 4].toLong() and 0xFFL) shl 24) or
+                ((bytes[offset + 5].toLong() and 0xFFL) shl 16) or
+                ((bytes[offset + 6].toLong() and 0xFFL) shl 8) or
+                (bytes[offset + 7].toLong() and 0xFFL)
         val mask = if ((encoded and Long.MIN_VALUE) != 0L) Long.MIN_VALUE else -1L
         val bits = encoded xor mask
         return java.lang.Double.longBitsToDouble(bits)

@@ -43,8 +43,8 @@ class KoreCollection<T>(
     private val updates = MutableSharedFlow<String>(extraBufferCapacity = 100)
     internal val internalUpdates: kotlinx.coroutines.flow.SharedFlow<String> get() = updates
     var cdcManager: com.pankaj.koredb.cdc.CdcManager? = null
-    private val indexExtractors = mutableMapOf<String, (T) -> String>()
-    private val searchableExtractors = mutableListOf<(T) -> String>()
+    private val indexExtractors = java.util.concurrent.ConcurrentHashMap<String, (T) -> String>()
+    private val searchableExtractors = java.util.concurrent.CopyOnWriteArrayList<(T) -> String>()
     val ftsIndex: com.pankaj.koredb.fts.FtsIndex = com.pankaj.koredb.fts.FtsIndex(name, db)
 
     // Object Cache to bypass JSON deserialization for frequent queries
@@ -92,6 +92,57 @@ class KoreCollection<T>(
     fun createIndex(indexName: String, extractor: (T) -> String) {
         indexExtractors[indexName] = extractor
         propertyExtractors[indexName] = extractor
+        builtIndexes.remove(indexName)
+    }
+
+    /**
+     * Registers a multi-value secondary index for collection/array fields (`List<String>`, `Set<String>`, etc.).
+     * Each element returned by [extractor] is indexed independently, enabling $O(\log N)$ tag/array lookups.
+     */
+    fun createMultiValueIndex(indexName: String, extractor: (T) -> Iterable<String>) {
+        multiValueIndexExtractors[indexName] = extractor
+        propertyExtractors[indexName] = { doc -> extractor(doc).joinToString(",") }
+        builtIndexes.remove(indexName)
+    }
+
+    fun hasMultiValueIndex(indexName: String): Boolean = multiValueIndexExtractors.containsKey(indexName)
+    fun getMultiValueExtractor(indexName: String): ((T) -> Iterable<String>)? = multiValueIndexExtractors[indexName]
+
+    private fun escapeCompositePart(part: String): String {
+        if (part.indexOf('%') == -1 && part.indexOf('|') == -1) return part
+        return part.replace("%", "%25").replace("|", "%7C")
+    }
+
+    internal fun encodeCompositeValue(values: List<String>): String {
+        return values.joinToString("|") { escapeCompositePart(it) }
+    }
+
+    /**
+     * Registers a composite multi-field secondary index (e.g. `listOf("category", "tier")`).
+     * Constituent fields must be registered via [registerProperty], [createIndex], or `@Kore*` annotations.
+     */
+    fun createCompositeIndex(fields: List<String>, indexName: String = fields.joinToString("+")) {
+        require(fields.size >= 2) { "Composite index requires at least 2 fields, got $fields" }
+        compositeIndexFields[indexName] = fields
+        createIndex(indexName) { doc ->
+            encodeCompositeValue(fields.map { f -> propertyExtractors[f]?.invoke(doc) ?: "" })
+        }
+    }
+
+    /**
+     * Registers a composite multi-field secondary index (e.g. `createCompositeIndex("category", "tier")`).
+     */
+    fun createCompositeIndex(vararg fields: String) {
+        createCompositeIndex(fields.toList())
+    }
+
+    fun getCompositeIndexes(): Map<String, List<String>> = compositeIndexFields
+
+    /**
+     * Queries a composite index directly with the ordered list of field values.
+     */
+    fun getByCompositeIndex(indexName: String, values: List<String>, limit: Int? = null): List<T> {
+        return getByIndex(indexName, encodeCompositeValue(values), limit)
     }
 
     /**
@@ -109,7 +160,120 @@ class KoreCollection<T>(
     private val ttlPrefix = "ttl:$name:".toByteArray(Charsets.UTF_8)
     private val idxPrefix = "idx:$name:".toByteArray(Charsets.UTF_8)
     private val idxNumPrefix = "idx_num:$name:".toByteArray(Charsets.UTF_8)
+    private val idxMetaPrefix = "meta:idx:$name:".toByteArray(Charsets.UTF_8)
     private val numericIndexExtractors = java.util.concurrent.ConcurrentHashMap<String, (T) -> Double>()
+    private val multiValueIndexExtractors = java.util.concurrent.ConcurrentHashMap<String, (T) -> Iterable<String>>()
+    private val compositeIndexFields = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+    private val builtIndexes = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun makeIndexWatermarkKey(indexName: String): ByteArray {
+        return "meta:idx:$name:${escape(indexName)}".toByteArray(Charsets.UTF_8)
+    }
+
+    /**
+     * Ensures that [indexName] has been built across existing documents on disk.
+     * If the collection already contains documents from an earlier schema version without this index's
+     * watermark, KoreDB automatically backfills the index once and persists the watermark.
+     */
+    private fun ensureIndexBuilt(indexName: String) {
+        if (builtIndexes.contains(indexName)) return
+        if (!hasIndex(indexName) && !hasNumericIndex(indexName)) return
+        synchronized(this) {
+            if (builtIndexes.contains(indexName)) return
+            val watermarkKey = makeIndexWatermarkKey(indexName)
+            if (db.getRaw(watermarkKey) != null) {
+                builtIndexes.add(indexName)
+                return
+            }
+            val hasExistingDocs = db.getKeysByPrefixRaw(docPrefix, limit = 1).isNotEmpty()
+            if (hasExistingDocs) {
+                backfillSingleIndexSync(indexName, watermarkKey)
+            } else {
+                db.writeBatchDirect(listOf(watermarkKey to PRESENCE_MARKER))
+            }
+            builtIndexes.add(indexName)
+        }
+    }
+
+    private fun ensureIndexesInitializedForWrite(batch: MutableList<Pair<ByteArray, ByteArray>>) {
+        val allIndexNames = ArrayList<String>(
+            indexExtractors.size + multiValueIndexExtractors.size + numericIndexExtractors.size
+        )
+        allIndexNames.addAll(indexExtractors.keys)
+        allIndexNames.addAll(multiValueIndexExtractors.keys)
+        allIndexNames.addAll(numericIndexExtractors.keys)
+        if (allIndexNames.all { builtIndexes.contains(it) }) return
+
+        synchronized(this) {
+            var checkedExisting = false
+            var hasExistingDocs = false
+            for (idxName in allIndexNames) {
+                if (builtIndexes.contains(idxName)) continue
+                val watermarkKey = makeIndexWatermarkKey(idxName)
+                if (db.getRaw(watermarkKey) != null) {
+                    builtIndexes.add(idxName)
+                    continue
+                }
+                if (!checkedExisting) {
+                    hasExistingDocs = db.getKeysByPrefixRaw(docPrefix, limit = 1).isNotEmpty()
+                    checkedExisting = true
+                }
+                if (hasExistingDocs) {
+                    backfillSingleIndexSync(idxName, watermarkKey)
+                } else {
+                    batch.add(watermarkKey to PRESENCE_MARKER)
+                }
+                builtIndexes.add(idxName)
+            }
+        }
+    }
+
+    private fun backfillSingleIndexSync(indexName: String, watermarkKey: ByteArray) {
+        val strExtractor = indexExtractors[indexName]
+        val multiExtractor = multiValueIndexExtractors[indexName]
+        val numExtractor = numericIndexExtractors[indexName]
+        if (strExtractor == null && multiExtractor == null && numExtractor == null) return
+
+        val rawResults = db.getByPrefixWithKeysRaw(docPrefix)
+        val batch = ArrayList<Pair<ByteArray, ByteArray>>(minOf(rawResults.size + 1, 5001))
+        val idxNameBytes = getIndexNameBytes(indexName)
+
+        for ((keyBytes, valueBytes) in rawResults) {
+            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+            val id = unescape(escapedId)
+            val idBytes = escape(id).toByteArray(Charsets.UTF_8)
+
+            val document = try {
+                serializer.deserialize(valueBytes)
+            } catch (_: Throwable) {
+                continue
+            }
+
+            if (strExtractor != null) {
+                val value = strExtractor(document)
+                val valBytes = escape(value).toByteArray(Charsets.UTF_8)
+                batch.add(buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
+            }
+            if (multiExtractor != null) {
+                for (item in multiExtractor(document)) {
+                    val valBytes = escape(item).toByteArray(Charsets.UTF_8)
+                    batch.add(buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
+                }
+            }
+            if (numExtractor != null) {
+                val numValue = numExtractor(document)
+                val valBytes = com.pankaj.koredb.foundation.OrderPreservingEncoder.encodeDouble(numValue)
+                batch.add(buildIndexKey(idxNumPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
+            }
+
+            if (batch.size >= 5000) {
+                db.writeBatchDirect(batch)
+                batch.clear()
+            }
+        }
+        batch.add(watermarkKey to PRESENCE_MARKER)
+        db.writeBatchDirect(batch)
+    }
 
     /**
      * Registers a typed numeric secondary index for instant order-preserving range queries.
@@ -120,13 +284,14 @@ class KoreCollection<T>(
     fun createNumericIndex(indexName: String, extractor: (T) -> Double) {
         numericIndexExtractors[indexName] = extractor
         propertyExtractors[indexName] = { doc -> extractor(doc).toString() }
+        builtIndexes.remove(indexName)
     }
 
     fun hasNumericIndex(indexName: String): Boolean = numericIndexExtractors.containsKey(indexName)
     fun getNumericExtractor(indexName: String): ((T) -> Double)? = numericIndexExtractors[indexName]
 
     // Cache for index name bytes to avoid repeated UTF-8 encoding
-    private val indexNameCache = mutableMapOf<String, ByteArray>()
+    private val indexNameCache = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
 
     private fun getIndexNameBytes(name: String): ByteArray {
         return indexNameCache.getOrPut(name) { name.toByteArray(Charsets.UTF_8) }
@@ -142,6 +307,22 @@ class KoreCollection<T>(
     @Volatile
     private var hasTtlRecords = false
 
+    @Volatile
+    private var ttlChecked = false
+
+    private fun ensureTtlChecked() {
+        if (!ttlChecked) {
+            synchronized(this) {
+                if (!ttlChecked) {
+                    if (!hasTtlRecords) {
+                        hasTtlRecords = db.getKeysByPrefixRaw(ttlPrefix, limit = 1).isNotEmpty()
+                    }
+                    ttlChecked = true
+                }
+            }
+        }
+    }
+
     private fun makeTtlKey(idBytes: ByteArray): ByteArray {
         val result = ByteArray(ttlPrefix.size + idBytes.size)
         System.arraycopy(ttlPrefix, 0, result, 0, ttlPrefix.size)
@@ -150,6 +331,7 @@ class KoreCollection<T>(
     }
 
     private fun isExpired(idBytes: ByteArray): Boolean {
+        if (!ttlChecked) ensureTtlChecked()
         if (!hasTtlRecords) return false
         val ttlBytes = db.getRaw(makeTtlKey(idBytes)) ?: return false
         if (ttlBytes.size != 8) return false
@@ -195,6 +377,7 @@ class KoreCollection<T>(
         val docKey = makeDocKey(idBytes)
 
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
+        ensureIndexesInitializedForWrite(batch)
         batch.add(docKey to docBytes)
 
         if (ttlSeconds > 0) {
@@ -220,6 +403,15 @@ class KoreCollection<T>(
             // sidx: idx:$name:$idxName:$idxValue:$id
             val idxKey = buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes)
             batch.add(idxKey to PRESENCE_MARKER)
+        }
+
+        multiValueIndexExtractors.forEach { (idxName, extractor) ->
+            val idxNameBytes = getIndexNameBytes(idxName)
+            for (item in extractor(document)) {
+                val valBytes = escape(item).toByteArray(Charsets.UTF_8)
+                val idxKey = buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes)
+                batch.add(idxKey to PRESENCE_MARKER)
+            }
         }
 
         numericIndexExtractors.forEach { (idxName, extractor) ->
@@ -379,9 +571,18 @@ class KoreCollection<T>(
         val endKey = makeDocKey(escape(endId).toByteArray(Charsets.UTF_8))
 
         val rawResults = db.getRangeWithKeysRaw(startKey, endKey)
+        if (!ttlChecked) ensureTtlChecked()
+        val checkTtl = hasTtlRecords
+        val results = ArrayList<T>(rawResults.size)
 
-        return rawResults.map { (keyBytes, valueBytes) ->
-            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+        for ((keyBytes, valueBytes) in rawResults) {
+            val idLength = keyBytes.size - docPrefix.size
+            if (checkTtl) {
+                val idBytes = ByteArray(idLength)
+                System.arraycopy(keyBytes, docPrefix.size, idBytes, 0, idLength)
+                if (isExpired(idBytes)) continue
+            }
+            val escapedId = String(keyBytes, docPrefix.size, idLength, Charsets.UTF_8)
             val id = unescape(escapedId)
             
             var doc: T? = null
@@ -395,8 +596,9 @@ class KoreCollection<T>(
                     documentCache[id] = doc!!
                 }
             }
-            doc!!
+            results.add(doc!!)
         }
+        return results
     }
 
     /**
@@ -408,9 +610,18 @@ class KoreCollection<T>(
     fun getByIdPrefix(idPrefix: String): List<T> {
         val prefixBytes = makeDocKey(escape(idPrefix).toByteArray(Charsets.UTF_8))
         val rawResults = db.getByPrefixWithKeysRaw(prefixBytes)
+        if (!ttlChecked) ensureTtlChecked()
+        val checkTtl = hasTtlRecords
+        val results = ArrayList<T>(rawResults.size)
 
-        return rawResults.map { (keyBytes, valueBytes) ->
-            val escapedId = String(keyBytes, docPrefix.size, keyBytes.size - docPrefix.size, Charsets.UTF_8)
+        for ((keyBytes, valueBytes) in rawResults) {
+            val idLength = keyBytes.size - docPrefix.size
+            if (checkTtl) {
+                val idBytes = ByteArray(idLength)
+                System.arraycopy(keyBytes, docPrefix.size, idBytes, 0, idLength)
+                if (isExpired(idBytes)) continue
+            }
+            val escapedId = String(keyBytes, docPrefix.size, idLength, Charsets.UTF_8)
             val id = unescape(escapedId)
             
             var doc: T? = null
@@ -424,8 +635,9 @@ class KoreCollection<T>(
                     documentCache[id] = doc!!
                 }
             }
-            doc!!
+            results.add(doc!!)
         }
+        return results
     }
 
     /**
@@ -440,25 +652,59 @@ class KoreCollection<T>(
      * @return A list of matching documents.
      */
     fun getByIndex(indexName: String, value: String, limit: Int? = null): List<T> {
+        ensureIndexBuilt(indexName)
         val idxNameBytes = getIndexNameBytes(indexName)
         val escapedValue = escape(value)
         val valBytes = escapedValue.toByteArray(Charsets.UTF_8)
         val prefix = buildKey(idxPrefix, idxNameBytes, valBytes)
         
-        val indexKeys = db.getKeysByPrefixRaw(prefix, limit)
+        var indexKeys = db.getKeysByPrefixRaw(prefix, limit)
         val results = mutableListOf<T>()
+        val seenIds = java.util.HashSet<String>()
         val extractor = indexExtractors[indexName]
+        val multiExtractor = multiValueIndexExtractors[indexName]
 
         for (keyBytes in indexKeys) {
             if (limit != null && results.size >= limit) break
-            val escapedId = String(keyBytes, prefix.size, keyBytes.size - 1 - prefix.size, Charsets.UTF_8)
+            val idLen = keyBytes.size - 1 - prefix.size
+            if (idLen <= 0) continue
+            val escapedId = String(keyBytes, prefix.size, idLen, Charsets.UTF_8)
             val id = unescape(escapedId)
+            if (!seenIds.add(id)) continue
 
             val doc = getById(id) ?: continue
             if (extractor != null && extractor(doc) != value) {
                 continue // Stale index entry
             }
+            if (multiExtractor != null && !multiExtractor(doc).any { it == value }) {
+                continue // Stale multi-value index entry
+            }
             results.add(doc)
+        }
+
+        // If stale index entries caused fewer than `limit` valid results when the raw scan hit `limit`,
+        // fetch the remaining prefix keys so valid documents are not truncated.
+        if (limit != null && results.size < limit && indexKeys.size == limit) {
+            results.clear()
+            seenIds.clear()
+            indexKeys = db.getKeysByPrefixRaw(prefix, null)
+            for (keyBytes in indexKeys) {
+                if (results.size >= limit) break
+                val idLen = keyBytes.size - 1 - prefix.size
+                if (idLen <= 0) continue
+                val escapedId = String(keyBytes, prefix.size, idLen, Charsets.UTF_8)
+                val id = unescape(escapedId)
+                if (!seenIds.add(id)) continue
+
+                val doc = getById(id) ?: continue
+                if (extractor != null && extractor(doc) != value) {
+                    continue
+                }
+                if (multiExtractor != null && !multiExtractor(doc).any { it == value }) {
+                    continue
+                }
+                results.add(doc)
+            }
         }
         return results
     }
@@ -468,6 +714,7 @@ class KoreCollection<T>(
      * Leverages order-preserving byte encoding and LSM range scan for sub-millisecond execution.
      */
     fun getByNumericRange(indexName: String, min: Double, max: Double, limit: Int? = null): List<T> {
+        ensureIndexBuilt(indexName)
         val idxNameBytes = getIndexNameBytes(indexName)
         val minEncoded = com.pankaj.koredb.foundation.OrderPreservingEncoder.encodeDouble(min)
         val maxEncoded = com.pankaj.koredb.foundation.OrderPreservingEncoder.encodeDouble(max)
@@ -480,17 +727,19 @@ class KoreCollection<T>(
         System.arraycopy(endPrefix, 0, endKey, 0, endPrefix.size)
         endKey[endKey.size - 1] = 0xFF.toByte()
 
-        val pairs = db.getRangeWithKeysRaw(startKey, endKey, limit)
+        var pairs = db.getRangeWithKeysRaw(startKey, endKey, limit)
         val results = mutableListOf<T>()
+        val seenIds = java.util.HashSet<String>()
         val extractor = numericIndexExtractors[indexName]
+        val prefixLen = idxNumPrefix.size + idxNameBytes.size + 10
 
         for ((keyBytes, _) in pairs) {
             if (limit != null && results.size >= limit) break
-            val prefixLen = idxNumPrefix.size + idxNameBytes.size + 10
             if (keyBytes.size <= prefixLen + 1) continue
             val idLength = keyBytes.size - prefixLen - 1
             val escapedId = String(keyBytes, prefixLen, idLength, Charsets.UTF_8)
             val id = unescape(escapedId)
+            if (!seenIds.add(id)) continue
 
             val doc = getById(id) ?: continue
             if (extractor != null) {
@@ -500,6 +749,29 @@ class KoreCollection<T>(
                 }
             }
             results.add(doc)
+        }
+
+        if (limit != null && results.size < limit && pairs.size == limit) {
+            results.clear()
+            seenIds.clear()
+            pairs = db.getRangeWithKeysRaw(startKey, endKey, null)
+            for ((keyBytes, _) in pairs) {
+                if (results.size >= limit) break
+                if (keyBytes.size <= prefixLen + 1) continue
+                val idLength = keyBytes.size - prefixLen - 1
+                val escapedId = String(keyBytes, prefixLen, idLength, Charsets.UTF_8)
+                val id = unescape(escapedId)
+                if (!seenIds.add(id)) continue
+
+                val doc = getById(id) ?: continue
+                if (extractor != null) {
+                    val currentVal = extractor(doc)
+                    if (currentVal < min || currentVal > max) {
+                        continue
+                    }
+                }
+                results.add(doc)
+            }
         }
         return results
     }
@@ -633,15 +905,24 @@ class KoreCollection<T>(
                 val value = extractor(document)
                 val valBytes = escape(value).toByteArray(Charsets.UTF_8)
                 val idxNameBytes = getIndexNameBytes(idxName)
-                val idxKey = buildKey(idxPrefix, idxNameBytes, valBytes, idBytes)
+                val idxKey = buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes)
                 batch.add(idxKey to PRESENCE_MARKER)
+            }
+
+            multiValueIndexExtractors.forEach { (idxName, extractor) ->
+                val idxNameBytes = getIndexNameBytes(idxName)
+                for (item in extractor(document)) {
+                    val valBytes = escape(item).toByteArray(Charsets.UTF_8)
+                    val idxKey = buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes)
+                    batch.add(idxKey to PRESENCE_MARKER)
+                }
             }
 
             numericIndexExtractors.forEach { (idxName, extractor) ->
                 val numValue = extractor(document)
                 val valBytes = com.pankaj.koredb.foundation.OrderPreservingEncoder.encodeDouble(numValue)
                 val idxNameBytes = getIndexNameBytes(idxName)
-                val idxKey = buildKey(idxNumPrefix, idxNameBytes, valBytes, idBytes)
+                val idxKey = buildIndexKey(idxNumPrefix, idxNameBytes, valBytes, idBytes)
                 batch.add(idxKey to PRESENCE_MARKER)
             }
 
@@ -649,6 +930,12 @@ class KoreCollection<T>(
                 db.writeBatchRaw(batch)
                 batch.clear()
             }
+        }
+
+        val allIdxNames = indexExtractors.keys + multiValueIndexExtractors.keys + numericIndexExtractors.keys
+        for (idxName in allIdxNames) {
+            batch.add(makeIndexWatermarkKey(idxName) to PRESENCE_MARKER)
+            builtIndexes.add(idxName)
         }
 
         if (batch.isNotEmpty()) {
@@ -662,8 +949,9 @@ class KoreCollection<T>(
      */
     suspend fun rebuildIndex(indexName: String) {
         val strExtractor = indexExtractors[indexName]
+        val multiExtractor = multiValueIndexExtractors[indexName]
         val numExtractor = numericIndexExtractors[indexName]
-        if (strExtractor == null && numExtractor == null) return
+        if (strExtractor == null && multiExtractor == null && numExtractor == null) return
 
         val rawResults = db.getByPrefixWithKeysRaw(docPrefix)
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
@@ -683,14 +971,22 @@ class KoreCollection<T>(
             if (strExtractor != null) {
                 val value = strExtractor(document)
                 val valBytes = escape(value).toByteArray(Charsets.UTF_8)
-                val idxKey = buildKey(idxPrefix, idxNameBytes, valBytes, idBytes)
+                val idxKey = buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes)
                 batch.add(idxKey to PRESENCE_MARKER)
+            }
+
+            if (multiExtractor != null) {
+                for (item in multiExtractor(document)) {
+                    val valBytes = escape(item).toByteArray(Charsets.UTF_8)
+                    val idxKey = buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes)
+                    batch.add(idxKey to PRESENCE_MARKER)
+                }
             }
 
             if (numExtractor != null) {
                 val numValue = numExtractor(document)
                 val valBytes = com.pankaj.koredb.foundation.OrderPreservingEncoder.encodeDouble(numValue)
-                val idxKey = buildKey(idxNumPrefix, idxNameBytes, valBytes, idBytes)
+                val idxKey = buildIndexKey(idxNumPrefix, idxNameBytes, valBytes, idBytes)
                 batch.add(idxKey to PRESENCE_MARKER)
             }
 
@@ -700,17 +996,17 @@ class KoreCollection<T>(
             }
         }
 
-        if (batch.isNotEmpty()) {
-            db.writeBatchRaw(batch)
-            batch.clear()
-        }
+        batch.add(makeIndexWatermarkKey(indexName) to PRESENCE_MARKER)
+        db.writeBatchRaw(batch)
+        batch.clear()
+        builtIndexes.add(indexName)
     }
 
     /**
-     * Performs a batch insert of multiple documents.
-     * Checks if a secondary index exists on the given index name.
+     * Checks if a secondary index (scalar, composite, or multi-value) exists on the given index name.
      */
-    fun hasIndex(indexName: String): Boolean = indexExtractors.containsKey(indexName)
+    fun hasIndex(indexName: String): Boolean =
+        indexExtractors.containsKey(indexName) || multiValueIndexExtractors.containsKey(indexName)
 
     /**
      * High-throughput bulk insertion of documents from an arbitrary [Collection] using an ID extractor.
@@ -718,19 +1014,25 @@ class KoreCollection<T>(
      */
     suspend fun insertBatch(documents: Collection<T>, idExtractor: (T) -> String) = coroutineScope {
         if (documents.isEmpty()) return@coroutineScope
-        val entriesPerDoc = 1 + indexExtractors.size + numericIndexExtractors.size
+        val entriesPerDoc = 1 + indexExtractors.size + multiValueIndexExtractors.size * 2 + numericIndexExtractors.size
         val totalKvPairs = documents.size * entriesPerDoc
         
         if (totalKvPairs <= SINGLE_WRITE_THRESHOLD) {
-            val combined = ArrayList<Pair<ByteArray, ByteArray>>(totalKvPairs)
+            val combined = ArrayList<Pair<ByteArray, ByteArray>>(totalKvPairs + 8)
+            ensureIndexesInitializedForWrite(combined)
             for (doc in documents) {
                 serializeSingleDoc(idExtractor(doc), doc, combined)
             }
             db.writeBatchRaw(combined)
         } else {
             val chunks = documents.chunked(5000)
+            var isFirstChunk = true
             for (chunk in chunks) {
-                val batch = ArrayList<Pair<ByteArray, ByteArray>>(chunk.size * entriesPerDoc)
+                val batch = ArrayList<Pair<ByteArray, ByteArray>>(chunk.size * entriesPerDoc + 8)
+                if (isFirstChunk) {
+                    ensureIndexesInitializedForWrite(batch)
+                    isFirstChunk = false
+                }
                 for (doc in chunk) {
                     serializeSingleDoc(idExtractor(doc), doc, batch)
                 }
@@ -755,19 +1057,25 @@ class KoreCollection<T>(
      */
     suspend fun insertBatch(documents: Map<String, T>) = coroutineScope {
         if (documents.isEmpty()) return@coroutineScope
-        val entriesPerDoc = 1 + indexExtractors.size + numericIndexExtractors.size
+        val entriesPerDoc = 1 + indexExtractors.size + multiValueIndexExtractors.size * 2 + numericIndexExtractors.size
         val totalKvPairs = documents.size * entriesPerDoc
         
         if (totalKvPairs <= SINGLE_WRITE_THRESHOLD) {
-            val combined = ArrayList<Pair<ByteArray, ByteArray>>(totalKvPairs)
+            val combined = ArrayList<Pair<ByteArray, ByteArray>>(totalKvPairs + 8)
+            ensureIndexesInitializedForWrite(combined)
             for ((id, doc) in documents) {
                 serializeSingleDoc(id, doc, combined)
             }
             db.writeBatchRaw(combined)
         } else {
             val chunks = documents.entries.chunked(5000)
+            var isFirstChunk = true
             for (chunk in chunks) {
-                val batch = ArrayList<Pair<ByteArray, ByteArray>>(chunk.size * entriesPerDoc)
+                val batch = ArrayList<Pair<ByteArray, ByteArray>>(chunk.size * entriesPerDoc + 8)
+                if (isFirstChunk) {
+                    ensureIndexesInitializedForWrite(batch)
+                    isFirstChunk = false
+                }
                 for (entry in chunk) {
                     serializeSingleDoc(entry.key, entry.value, batch)
                 }
@@ -795,6 +1103,34 @@ class KoreCollection<T>(
         private const val SINGLE_WRITE_THRESHOLD = 50_000
     }
 
+    internal fun stageSecondaryIndices(
+        id: String,
+        doc: T,
+        putFn: (ByteArray, ByteArray) -> Unit
+    ) {
+        if (indexExtractors.isEmpty() && multiValueIndexExtractors.isEmpty() && numericIndexExtractors.isEmpty()) return
+        val idBytes = escape(id).toByteArray(Charsets.UTF_8)
+        for ((idxName, extractor) in indexExtractors) {
+            val value = extractor(doc)
+            val valBytes = escape(value).toByteArray(Charsets.UTF_8)
+            val idxNameBytes = getIndexNameBytes(idxName)
+            putFn(buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes), PRESENCE_MARKER)
+        }
+        for ((idxName, extractor) in multiValueIndexExtractors) {
+            val idxNameBytes = getIndexNameBytes(idxName)
+            for (item in extractor(doc)) {
+                val valBytes = escape(item).toByteArray(Charsets.UTF_8)
+                putFn(buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes), PRESENCE_MARKER)
+            }
+        }
+        for ((idxName, extractor) in numericIndexExtractors) {
+            val numValue = extractor(doc)
+            val valBytes = com.pankaj.koredb.foundation.OrderPreservingEncoder.encodeDouble(numValue)
+            val idxNameBytes = getIndexNameBytes(idxName)
+            putFn(buildIndexKey(idxNumPrefix, idxNameBytes, valBytes, idBytes), PRESENCE_MARKER)
+        }
+    }
+
     private fun serializeSingleDoc(
         id: String,
         doc: T,
@@ -815,6 +1151,14 @@ class KoreCollection<T>(
             val valBytes = escape(value).toByteArray(Charsets.UTF_8)
             val idxNameBytes = getIndexNameBytes(idxName)
             out.add(buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
+        }
+
+        for ((idxName, extractor) in multiValueIndexExtractors) {
+            val idxNameBytes = getIndexNameBytes(idxName)
+            for (item in extractor(doc)) {
+                val valBytes = escape(item).toByteArray(Charsets.UTF_8)
+                out.add(buildIndexKey(idxPrefix, idxNameBytes, valBytes, idBytes) to PRESENCE_MARKER)
+            }
         }
 
         for ((idxName, extractor) in numericIndexExtractors) {
@@ -847,11 +1191,12 @@ class KoreCollection<T>(
         val keysToDelete = db.getKeysByPrefixRaw(docPrefix)
         val idxKeysToDelete = db.getKeysByPrefixRaw(idxPrefix)
         val idxNumKeysToDelete = db.getKeysByPrefixRaw(idxNumPrefix)
+        val idxMetaKeysToDelete = db.getKeysByPrefixRaw(idxMetaPrefix)
         val ftsKeysToDelete = db.getKeysByPrefixRaw("fts:$name:".toByteArray(Charsets.UTF_8))
         val ftsLenKeysToDelete = db.getKeysByPrefixRaw("ftslen:$name:".toByteArray(Charsets.UTF_8))
         val ttlKeysToDelete = db.getKeysByPrefixRaw(ttlPrefix)
 
-        val allKeys = keysToDelete + ttlKeysToDelete + idxKeysToDelete + idxNumKeysToDelete + ftsKeysToDelete + ftsLenKeysToDelete
+        val allKeys = keysToDelete + ttlKeysToDelete + idxKeysToDelete + idxNumKeysToDelete + idxMetaKeysToDelete + ftsKeysToDelete + ftsLenKeysToDelete
         if (allKeys.isEmpty()) return
 
         val batch = allKeys.map { keyBytes ->
@@ -860,6 +1205,7 @@ class KoreCollection<T>(
 
         db.writeBatchRaw(batch)
         ftsIndex.clear()
+        builtIndexes.clear()
         synchronized(documentCache) {
             documentCache.clear()
         }
@@ -870,7 +1216,9 @@ class KoreCollection<T>(
     // QUERY DSL
     // ========================================================================
 
-    private val propertyExtractors = mutableMapOf<String, (T) -> String>()
+    private val propertyExtractors = java.util.concurrent.ConcurrentHashMap<String, (T) -> String>()
+
+    internal fun hasPropertyExtractor(name: String): Boolean = propertyExtractors.containsKey(name)
 
     /**
      * Registers a property extractor for use in queries and aggregations.

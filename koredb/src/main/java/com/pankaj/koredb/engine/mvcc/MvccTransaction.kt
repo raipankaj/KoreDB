@@ -30,7 +30,7 @@ class MvccTransaction(
     /**
      * Reads raw bytes for a key. Checks local write buffer first before querying database.
      */
-    private val readCache = mutableMapOf<String, ByteArray?>()
+    private val readCache = ConcurrentHashMap<String, ByteArray>()
 
     fun getRaw(key: ByteArray): ByteArray? {
         val keyStr = String(key, Charsets.ISO_8859_1)
@@ -39,13 +39,18 @@ class MvccTransaction(
             val value = local.second
             return if (value.contentEquals(KoreDB.TOMBSTONE)) null else value
         }
-        if (readCache.containsKey(keyStr)) {
-            return readCache[keyStr]
+        val cached = readCache[keyStr]
+        if (cached != null) {
+            return if (cached === NULL_SENTINEL) null else cached
         }
         readKeys.add(keyStr)
         val value = db.engine.getRaw(key)
-        readCache[keyStr] = value
+        readCache[keyStr] = value ?: NULL_SENTINEL
         return value
+    }
+
+    companion object {
+        private val NULL_SENTINEL = ByteArray(0)
     }
 
     /**

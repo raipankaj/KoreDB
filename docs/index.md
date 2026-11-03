@@ -1,6 +1,6 @@
 # KoreDB Documentation
 
-Welcome to the official documentation for **KoreDB** (`io.github.raipankaj:koredb:0.2.0`) — the high-performance, AI-native multi-model database engine built specifically for modern Android and Kotlin applications.
+Welcome to the official documentation for **KoreDB** (`io.github.raipankaj:koredb:0.2.1`) — the high-performance, AI-native multi-model database engine built specifically for modern Android and Kotlin applications.
 
 KoreDB eliminates the traditional impedance mismatch of mobile data storage by unifying **three core paradigms** on top of a single, ultra-fast **Log-Structured Merge-tree (LSM)** storage foundation:
 
@@ -66,7 +66,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.raipankaj:koredb:0.2.0")
+    implementation("io.github.raipankaj:koredb:0.2.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.8.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
 }

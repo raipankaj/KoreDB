@@ -52,6 +52,9 @@ class MvccCollection<T : Any>(
         val key = collection.makeDocKey(id)
         val bytes = collection.internalSerializer.serialize(document)
         tx.putRaw(key, bytes)
+        collection.stageSecondaryIndices(id, document) { idxKey, marker ->
+            tx.putRaw(idxKey, marker)
+        }
     }
 
     /**

@@ -215,8 +215,9 @@ class GraphVectorBridge(
                     .take(targetLimit)
             }
             QueryStrategy.VECTOR_FIRST_ADAPTIVE -> {
+                val candidateSet = candidateNodeIds?.let { if (it is Set<*>) @Suppress("UNCHECKED_CAST") (it as Set<String>) else it.toHashSet() }
                 val predicate: (String) -> Boolean = { id ->
-                    (candidateNodeIds == null || id in candidateNodeIds) &&
+                    (candidateSet == null || id in candidateSet) &&
                             (graphPredicate == null || graphPredicate(id))
                 }
                 adaptiveVectorSearch(
@@ -321,11 +322,12 @@ class GraphVectorBridge(
         val vectorMap = vectors.getBatchVectors(expandedNodes)
         val nodeMap = graph.getNodes(expandedNodes)
         val results = mutableListOf<BridgeResult>()
+        val metric = vectors.metric
         for (id in expandedNodes) {
             val vector = vectorMap[id]
             val node = nodeMap[id]
             if (vector != null) {
-                val similarity = com.pankaj.koredb.hnsw.DistanceMetric.COSINE.compute(query, vector)
+                val similarity = metric.compute(query, vector)
                 results.add(
                     BridgeResult(
                         id = id,
@@ -419,11 +421,12 @@ class GraphVectorBridge(
             val vectorMap = vectors.getBatchVectors(nodeIds)
             val nodeMap = graph.getNodes(nodeIds)
             val results = mutableListOf<BridgeResult>()
+            val metric = vectors.metric
 
             for (id in nodeIds) {
                 val vector = vectorMap[id]
                 if (vector != null) {
-                    val similarity = com.pankaj.koredb.hnsw.DistanceMetric.COSINE.compute(query, vector)
+                    val similarity = metric.compute(query, vector)
                     results.add(BridgeResult(
                         id = id,
                         similarity = similarity,
@@ -502,4 +505,631 @@ class GraphVectorBridge(
             doc to rrfScore
         }
     }
+
+    /**
+     * Executes HippoRAG 2 multi-hop associative retrieval.
+     *
+     * 1. Dual Retrieval: Vector search (and optional BM25 keyword search if [collection] is provided).
+     * 2. Reciprocal Rank Fusion (RRF) to generate seed scores.
+     * 3. HippoRAG 2 Personalized PageRank over graph with hub-noise elimination ($W_{uv} = A_{uv} / d_{in}(v)^\beta$).
+     * 4. Passage extraction into [BridgeResult].
+     */
+    suspend fun hippoRAGQuery(
+        queryText: String,
+        queryVector: FloatArray,
+        collection: com.pankaj.koredb.core.KoreCollection<*>? = null,
+        seedLimit: Int = 15,
+        maxHops: Int = 2,
+        dampingFactor: Double = 0.85,
+        hubDampingBeta: Double = 0.5,
+        iterations: Int = 20,
+        finalLimit: Int = 10,
+        targetLabels: Set<String> = setOf("Chunk", "Document")
+    ): List<BridgeResult> = kotlinx.coroutines.coroutineScope {
+        val overfetch = seedLimit * 2
+
+        val vectorDeferred = async(Dispatchers.Default) {
+            vectors.search(queryVector, limit = overfetch)
+        }
+
+        val bm25Results = if (collection != null && queryText.isNotBlank()) {
+            val bm25Deferred = async(Dispatchers.Default) {
+                collection.ftsIndex.search(queryText, limit = overfetch)
+            }
+            bm25Deferred.await()
+        } else {
+            emptyList()
+        }
+
+        val vectorResults = vectorDeferred.await()
+
+        val seedScores = mutableMapOf<String, Double>()
+        if (bm25Results.isNotEmpty()) {
+            val fused = com.pankaj.koredb.fts.ReciprocalRankFusion.fuse(
+                bm25Results = bm25Results,
+                vectorResults = vectorResults,
+                limit = seedLimit
+            )
+            for ((id, score) in fused) {
+                seedScores[id] = score.toDouble()
+            }
+        } else {
+            for ((rank, res) in vectorResults.take(seedLimit).withIndex()) {
+                val rrfScore = 1.0 / (60.0 + (rank + 1))
+                seedScores[res.first] = rrfScore
+            }
+        }
+
+        val pprRanks = com.pankaj.koredb.graph.algo.GraphAlgorithms.personalizedPageRank(
+            storage = graph,
+            seedScores = seedScores,
+            edgeTypes = null,
+            maxHops = maxHops,
+            iterations = iterations,
+            dampingFactor = dampingFactor,
+            hubDampingBeta = hubDampingBeta
+        )
+
+        val candidateIds = pprRanks.keys.take(finalLimit * 3)
+        val nodeMap = graph.getNodes(candidateIds)
+
+        val results = mutableListOf<BridgeResult>()
+        for ((id, score) in pprRanks) {
+            val node = nodeMap[id] ?: graph.getNode(id)
+            if (targetLabels.isEmpty() || (node != null && node.labels.any { it in targetLabels })) {
+                results.add(
+                    BridgeResult(
+                        id = id,
+                        similarity = score.toFloat(),
+                        node = node,
+                        metadata = node?.properties
+                    )
+                )
+                if (results.size >= finalLimit) break
+            }
+        }
+
+        if (results.isEmpty() && pprRanks.isNotEmpty()) {
+            for ((id, score) in pprRanks.entries.take(finalLimit)) {
+                val node = nodeMap[id] ?: graph.getNode(id)
+                results.add(
+                    BridgeResult(
+                        id = id,
+                        similarity = score.toFloat(),
+                        node = node,
+                        metadata = node?.properties
+                    )
+                )
+            }
+        }
+
+        results
+    }
+
+    suspend fun hippoRAGQuery(
+        queryText: String,
+        queryVector: FloatArray,
+        seedLimit: Int = 15,
+        maxHops: Int = 2,
+        dampingFactor: Double = 0.85,
+        hubDampingBeta: Double = 0.5,
+        iterations: Int = 20,
+        finalLimit: Int = 10,
+        targetLabels: Set<String> = setOf("Chunk", "Document")
+    ): List<BridgeResult> = hippoRAGQuery(
+        queryText = queryText,
+        queryVector = queryVector,
+        collection = null,
+        seedLimit = seedLimit,
+        maxHops = maxHops,
+        dampingFactor = dampingFactor,
+        hubDampingBeta = hubDampingBeta,
+        iterations = iterations,
+        finalLimit = finalLimit,
+        targetLabels = targetLabels
+    )
+
+    // ========================================================================
+    // ON-DEVICE AI: AUTO-CHUNKED GRAPHRAG INGESTION, MEMORY & CONTEXT PACKING
+    // ========================================================================
+
+    /**
+     * Scored episodic/semantic memory result combining vector similarity, exponential temporal decay,
+     * and intrinsic memory importance.
+     */
+    data class MemorySearchResult(
+        val id: String,
+        val finalScore: Float,
+        val similarityScore: Float,
+        val recencyScore: Float,
+        val importanceScore: Float,
+        val node: Node?
+    )
+
+    /**
+     * Assembled, token-budgeted context payload ready to inject into an on-device SLM prompt
+     * (e.g., Gemini Nano, Gemma, Llama).
+     */
+    data class PromptContextWindow(
+        val formattedContext: String,
+        val includedNodeIds: List<String>,
+        val estimatedTokens: Int,
+        val maxTokenBudget: Int,
+        val truncatedCount: Int
+    )
+
+    /**
+     * Executes a Maximal Marginal Relevance (MMR) Diversity Search enriched with graph [Node] data.
+     *
+     * Balances semantic similarity to [query] against redundancy among selected results:
+     * $$\text{MMR}(i) = \lambda \cdot \text{Sim}(q, v_i) - (1 - \lambda) \cdot \max_{j \in S} \text{Sim}(v_i, v_j)$$
+     */
+    suspend fun searchMMR(
+        query: FloatArray,
+        limit: Int = 10,
+        fetchK: Int = maxOf(limit * 4, 20),
+        diversityLambda: Float = 0.5f,
+        filter: (VectorFilterBuilder.() -> Unit)? = null
+    ): List<BridgeResult> {
+        val mmrResults = vectors.searchMMR(
+            query = query,
+            limit = limit,
+            fetchK = fetchK,
+            diversityLambda = diversityLambda,
+            filterBuilder = filter
+        )
+        if (mmrResults.isEmpty()) return emptyList()
+        val nodeMap = graph.getNodes(mmrResults.map { it.first })
+        return mmrResults.map { (id, score) ->
+            BridgeResult(id = id, similarity = score, node = nodeMap[id])
+        }
+    }
+
+    /**
+     * Automatically chunks a long document using [com.pankaj.koredb.ai.KoreTextChunker],
+     * stores the parent `Document` node and child `Chunk` nodes in [GraphStorage],
+     * links them with `HAS_CHUNK`, `CHUNK_OF`, `NEXT_CHUNK`, and `PREV_CHUNK` edges,
+     * optionally extracts shared `Entity` nodes (`Chunk -[MENTIONS]-> Entity -[MENTIONED_IN]-> Chunk`)
+     * for cross-document multi-hop GraphRAG discovery, and indexes each chunk's embedding in [KoreVectorCollection].
+     *
+     * @param documentId Unique ID for the parent document node.
+     * @param title Human-readable document title.
+     * @param text Full document body text to split and index.
+     * @param maxChunkChars Maximum characters per chunk (default 512).
+     * @param overlapChars Overlap characters between consecutive chunks (default 64).
+     * @param metadata Optional additional properties stored on the parent document node.
+     * @param extractEntities Whether to extract shared `Entity` graph nodes from each chunk (default `true`).
+     * @param entityExtractor Function that extracts [com.pankaj.koredb.ai.KoreEntityExtractor.EntityMention]s from chunk text.
+     * @param embedder Suspend callback that computes an embedding vector for a chunk string.
+     * @return List of generated chunk node IDs (`"${documentId}#chunk_0"`, etc.).
+     */
+    suspend fun ingestDocumentWithChunks(
+        documentId: String,
+        title: String,
+        text: String,
+        maxChunkChars: Int = 512,
+        overlapChars: Int = 64,
+        metadata: Map<String, String> = emptyMap(),
+        extractEntities: Boolean = true,
+        entityExtractor: (String) -> List<com.pankaj.koredb.ai.KoreEntityExtractor.EntityMention> =
+            com.pankaj.koredb.ai.KoreEntityExtractor::extract,
+        embedder: suspend (String) -> FloatArray
+    ): List<String> {
+        val chunks = com.pankaj.koredb.ai.KoreTextChunker.chunk(
+            text = text,
+            maxChunkChars = maxChunkChars,
+            overlapChars = overlapChars
+        )
+
+        val docProps = HashMap<String, String>(metadata.size + 3)
+        docProps.putAll(metadata)
+        docProps["title"] = title
+        docProps["chunkCount"] = chunks.size.toString()
+        graph.putNode(Node(id = documentId, labels = setOf("Document"), properties = docProps))
+
+        if (chunks.isEmpty()) return emptyList()
+
+        val chunkIds = ArrayList<String>(chunks.size)
+        val vectorBatch = LinkedHashMap<String, FloatArray>(chunks.size)
+        val seenDocEntities = HashSet<String>()
+
+        for (i in chunks.indices) {
+            val chunk = chunks[i]
+            val chunkId = "${documentId}#chunk_${chunk.index}"
+            chunkIds.add(chunkId)
+
+            val chunkNode = Node(
+                id = chunkId,
+                labels = setOf("Chunk"),
+                properties = mapOf(
+                    "documentId" to documentId,
+                    "title" to title,
+                    "text" to chunk.text,
+                    "chunkIndex" to chunk.index.toString(),
+                    "startOffset" to chunk.startOffset.toString(),
+                    "endOffset" to chunk.endOffset.toString(),
+                    "estimatedTokens" to chunk.estimatedTokens.toString()
+                )
+            )
+            graph.putNode(chunkNode)
+            graph.putEdge(com.pankaj.koredb.graph.Edge(documentId, chunkId, "HAS_CHUNK"))
+            graph.putEdge(com.pankaj.koredb.graph.Edge(chunkId, documentId, "CHUNK_OF"))
+
+            if (i > 0) {
+                val prevId = chunkIds[i - 1]
+                graph.putEdge(com.pankaj.koredb.graph.Edge(prevId, chunkId, "NEXT_CHUNK"))
+                graph.putEdge(com.pankaj.koredb.graph.Edge(chunkId, prevId, "PREV_CHUNK"))
+            }
+
+            if (extractEntities) {
+                val entities = entityExtractor(chunk.text)
+                for (entity in entities) {
+                    val entityNode = Node(
+                        id = entity.id,
+                        labels = setOf("Entity", entity.type),
+                        properties = mapOf(
+                            "name" to entity.name,
+                            "title" to entity.name,
+                            "entityType" to entity.type
+                        )
+                    )
+                    graph.putNode(entityNode)
+                    graph.putEdge(com.pankaj.koredb.graph.Edge(chunkId, entity.id, "MENTIONS"))
+                    graph.putEdge(com.pankaj.koredb.graph.Edge(entity.id, chunkId, "MENTIONED_IN"))
+                    if (seenDocEntities.add(entity.id)) {
+                        graph.putEdge(com.pankaj.koredb.graph.Edge(documentId, entity.id, "MENTIONS_ENTITY"))
+                    }
+                }
+            }
+
+            vectorBatch[chunkId] = embedder(chunk.text)
+        }
+
+        vectors.insertBatch(vectorBatch)
+        vectors.waitForIndexing()
+        return chunkIds
+    }
+
+    /**
+     * Agentic Episodic Memory Retrieval with Exponential Temporal Decay and Importance Weighting.
+     *
+     * Computes a unified memory relevance score:
+     * $$\text{Score}(m) = w_{\text{sim}} \cdot \text{Sim}(q, m) + w_{\text{recency}} \cdot 2^{-\Delta t / T_{1/2}} + w_{\text{importance}} \cdot \text{Importance}(m)$$
+     *
+     * @param query Query embedding vector.
+     * @param limit Number of top memories to return.
+     * @param nowMs Reference timestamp in milliseconds (defaults to `System.currentTimeMillis()`).
+     * @param halfLifeHours Half-life $T_{1/2}$ in hours at which the recency score decays to `0.5` (default `24.0` hours).
+     * @param similarityWeight Weight $w_{\text{sim}}$ for semantic similarity (default `0.65f`).
+     * @param recencyWeight Weight $w_{\text{recency}}$ for temporal recency (default `0.20f`).
+     * @param importanceWeight Weight $w_{\text{importance}}$ for memory importance (default `0.15f`).
+     * @param timestampPropertyKey Node property key storing the creation timestamp in ms (default `"timestampMs"`).
+     * @param importancePropertyKey Node property key storing importance in $[0.0, 1.0]$ (default `"importance"`).
+     */
+    suspend fun searchMemory(
+        query: FloatArray,
+        limit: Int = 10,
+        nowMs: Long = System.currentTimeMillis(),
+        halfLifeHours: Double = 24.0,
+        similarityWeight: Float = 0.65f,
+        recencyWeight: Float = 0.20f,
+        importanceWeight: Float = 0.15f,
+        timestampPropertyKey: String = "timestampMs",
+        importancePropertyKey: String = "importance"
+    ): List<MemorySearchResult> {
+        val candidateLimit = (limit * 4).coerceAtLeast(20)
+        val rawCandidates = vectors.search(query, candidateLimit)
+        if (rawCandidates.isEmpty()) return emptyList()
+
+        val nodeMap = graph.getNodes(rawCandidates.map { it.first })
+        val safeHalfLife = halfLifeHours.coerceAtLeast(1e-6)
+        val decayLambda = kotlin.math.ln(2.0) / safeHalfLife
+
+        val scored = ArrayList<MemorySearchResult>(rawCandidates.size)
+        for ((id, sim) in rawCandidates) {
+            val node = nodeMap[id]
+            val createdAtMs = node?.properties?.get(timestampPropertyKey)?.toLongOrNull() ?: nowMs
+            val ageHours = ((nowMs - createdAtMs).coerceAtLeast(0L)).toDouble() / 3_600_000.0
+            val recency = kotlin.math.exp(-decayLambda * ageHours).toFloat()
+
+            val importance = (node?.properties?.get(importancePropertyKey)?.toFloatOrNull() ?: 0.5f)
+                .coerceIn(0.0f, 1.0f)
+
+            val finalScore = (similarityWeight * sim) +
+                    (recencyWeight * recency) +
+                    (importanceWeight * importance)
+
+            scored.add(
+                MemorySearchResult(
+                    id = id,
+                    finalScore = finalScore,
+                    similarityScore = sim,
+                    recencyScore = recency,
+                    importanceScore = importance,
+                    node = node
+                )
+            )
+        }
+
+        scored.sortByDescending { it.finalScore }
+        return if (scored.size <= limit) scored else scored.subList(0, limit)
+    }
+
+    /**
+     * Token-Budgeted Context Window Assembler for On-Device Small Language Models (SLMs).
+     *
+     * Executes a GraphRAG retrieval (with optional MMR diversity reranking via [diversityLambda])
+     * and packs the highest-ranked passages plus their 1-hop knowledge-graph relationships into a
+     * deduplicated, structured prompt context guaranteed not to exceed [maxTokenBudget].
+     *
+     * @param query Query embedding vector.
+     * @param maxTokenBudget Maximum token budget for the assembled context block (default `1024`).
+     * @param candidateLimit Number of initial semantic seed nodes to retrieve (default `10`).
+     * @param maxHops Graph expansion depth (default `1`).
+     * @param includeGraphRelationships Whether to append 1-hop graph edges for included nodes (default `true`).
+     * @param diversityLambda Optional MMR diversity trade-off $\lambda \in [0.0, 1.0]$ (`null` = pure similarity ordering; e.g. `0.5f` balances relevance and diversity).
+     * @param textPropertyKeys Ordered list of node property keys to inspect for passage text.
+     */
+    suspend fun assemblePromptContext(
+        query: FloatArray,
+        maxTokenBudget: Int = 1024,
+        candidateLimit: Int = 10,
+        maxHops: Int = 1,
+        includeGraphRelationships: Boolean = true,
+        diversityLambda: Float? = null,
+        textPropertyKeys: List<String> = listOf("text", "content", "summary", "body")
+    ): PromptContextWindow {
+        require(maxTokenBudget > 0) { "maxTokenBudget must be positive" }
+
+        val rawRagResults = graphRAGQuery(
+            query = query,
+            initialLimit = candidateLimit,
+            maxHops = maxHops,
+            finalLimit = candidateLimit * 3
+        )
+
+        val ragResults = if (diversityLambda != null && rawRagResults.size > 1) {
+            diversifyBridgeResultsWithMMR(rawRagResults, diversityLambda.coerceIn(0.0f, 1.0f))
+        } else {
+            rawRagResults
+        }
+
+        val sb = StringBuilder()
+        val includedIds = ArrayList<String>()
+        val seenTexts = HashSet<String>()
+        var usedTokens = 0
+        var truncatedCount = 0
+
+        for (result in ragResults) {
+            val node = result.node ?: continue
+            // Skip standalone structural Entity nodes that don't carry passage text of their own
+            if ("Entity" in node.labels && textPropertyKeys.none { node.properties.containsKey(it) }) {
+                continue
+            }
+            val rawText = textPropertyKeys.firstNotNullOfOrNull { key ->
+                node.properties[key]?.takeIf { it.isNotBlank() }
+            } ?: node.properties.entries.joinToString(", ") { "${it.key}: ${it.value}" }
+
+            if (rawText.isBlank() || !seenTexts.add(rawText)) continue
+
+            val titlePrefix = node.properties["title"]?.let { "[$it] " } ?: "[${node.id}] "
+            val relationSuffix = if (includeGraphRelationships) {
+                val edges = graph.getAllOutboundEdges(node.id)
+                    .filter { it.type != "NEXT_CHUNK" && it.type != "PREV_CHUNK" && it.type != "HAS_CHUNK" }
+                    .take(5)
+                if (edges.isNotEmpty()) {
+                    "\n  Relations: " + edges.joinToString("; ") { "${node.id} -[${it.type}]-> ${it.targetId}" }
+                } else ""
+            } else ""
+
+            val entryBlock = "- $titlePrefix$rawText$relationSuffix\n"
+            val entryTokens = com.pankaj.koredb.ai.KoreTextChunker.estimateTokens(entryBlock)
+
+            if (usedTokens + entryTokens > maxTokenBudget) {
+                truncatedCount++
+                continue
+            }
+
+            sb.append(entryBlock)
+            usedTokens += entryTokens
+            includedIds.add(node.id)
+        }
+
+        return PromptContextWindow(
+            formattedContext = sb.toString().trimEnd(),
+            includedNodeIds = includedIds,
+            estimatedTokens = usedTokens,
+            maxTokenBudget = maxTokenBudget,
+            truncatedCount = truncatedCount
+        )
+    }
+
+    private suspend fun diversifyBridgeResultsWithMMR(
+        candidates: List<BridgeResult>,
+        lam: Float
+    ): List<BridgeResult> {
+        if (candidates.size <= 1 || lam >= 0.999f) return candidates
+        val vecMap = vectors.getBatchVectors(candidates.map { it.id })
+        val metric = vectors.metric
+        val selected = ArrayList<BridgeResult>(candidates.size)
+        val selectedVectors = ArrayList<FloatArray>(candidates.size)
+        val remaining = candidates.toMutableList()
+
+        val first = remaining.removeAt(0)
+        selected.add(first)
+        vecMap[first.id]?.let { selectedVectors.add(it) }
+
+        while (remaining.isNotEmpty()) {
+            var bestIdx = 0
+            var bestScore = -Float.MAX_VALUE
+            for (i in remaining.indices) {
+                val cand = remaining[i]
+                val candVec = vecMap[cand.id]
+                var maxSimToSelected = 0.0f
+                if (candVec != null && selectedVectors.isNotEmpty()) {
+                    for (selVec in selectedVectors) {
+                        val sim = metric.compute(candVec, selVec)
+                        if (sim > maxSimToSelected) maxSimToSelected = sim
+                    }
+                }
+                val mmr = (lam * cand.similarity) - ((1.0f - lam) * maxSimToSelected)
+                if (mmr > bestScore) {
+                    bestScore = mmr
+                    bestIdx = i
+                }
+            }
+            val picked = remaining.removeAt(bestIdx)
+            selected.add(picked)
+            vecMap[picked.id]?.let { selectedVectors.add(it) }
+        }
+        return selected
+    }
+
+    /**
+     * Symbolic Working Memory Navigation: Navigates from high-level clusters/nodes
+     * down to L0 raw evidence on demand.
+     *
+     * @param rootNodeId Node identifier to start drill-down from (L3, L2, or L1).
+     * @param maxEvidencePerFact Maximum number of raw evidence items to retrieve per atomic fact.
+     * @param pyramid Optional reference to [com.pankaj.koredb.memory.KoreMemoryPyramid] for decompression.
+     * @return Structured [com.pankaj.koredb.memory.DrillDownResult].
+     */
+    suspend fun drillDown(
+        rootNodeId: String,
+        maxEvidencePerFact: Int = 5,
+        pyramid: com.pankaj.koredb.memory.KoreMemoryPyramid? = null
+    ): com.pankaj.koredb.memory.DrillDownResult {
+        val rootNode = graph.getNode(rootNodeId)
+        val rootLevel = when {
+            rootNode == null -> when {
+                rootNodeId.startsWith("l3:persona") -> com.pankaj.koredb.memory.MemoryLevel.L3_PERSONA
+                rootNodeId.startsWith("l3:inv") -> com.pankaj.koredb.memory.MemoryLevel.L3_INVARIANT
+                rootNodeId.startsWith("l2:") -> com.pankaj.koredb.memory.MemoryLevel.L2_SCENARIO
+                rootNodeId.startsWith("l1:") -> com.pankaj.koredb.memory.MemoryLevel.L1_FACT
+                rootNodeId.startsWith("l0:") -> com.pankaj.koredb.memory.MemoryLevel.L0_EVIDENCE
+                else -> com.pankaj.koredb.memory.MemoryLevel.UNKNOWN
+            }
+            rootNode.labels.any { it == "L3_Persona" || it.contains("L3_Persona") } -> com.pankaj.koredb.memory.MemoryLevel.L3_PERSONA
+            rootNode.labels.any { it == "L3_Invariant" || it.contains("L3_Invariant") } -> com.pankaj.koredb.memory.MemoryLevel.L3_INVARIANT
+            rootNode.labels.any { it == "L2_Scenario" || it.contains("L2") } -> com.pankaj.koredb.memory.MemoryLevel.L2_SCENARIO
+            rootNode.labels.any { it == "L1_Fact" || it.contains("L1") } -> com.pankaj.koredb.memory.MemoryLevel.L1_FACT
+            rootNode.labels.any { it == "L0_Evidence" || it.contains("L0") } -> com.pankaj.koredb.memory.MemoryLevel.L0_EVIDENCE
+            rootNodeId.startsWith("l3:persona") -> com.pankaj.koredb.memory.MemoryLevel.L3_PERSONA
+            rootNodeId.startsWith("l3:inv") -> com.pankaj.koredb.memory.MemoryLevel.L3_INVARIANT
+            rootNodeId.startsWith("l2:") -> com.pankaj.koredb.memory.MemoryLevel.L2_SCENARIO
+            rootNodeId.startsWith("l1:") -> com.pankaj.koredb.memory.MemoryLevel.L1_FACT
+            rootNodeId.startsWith("l0:") -> com.pankaj.koredb.memory.MemoryLevel.L0_EVIDENCE
+            else -> com.pankaj.koredb.memory.MemoryLevel.UNKNOWN
+        }
+
+        val scenarioClusters = mutableListOf<com.pankaj.koredb.memory.L2ScenarioCluster>()
+        val targetFactIds = mutableSetOf<String>()
+
+        when (rootLevel) {
+            com.pankaj.koredb.memory.MemoryLevel.L3_PERSONA,
+            com.pankaj.koredb.memory.MemoryLevel.L3_INVARIANT -> {
+                val governedIds = graph.getOutboundTargetIds(rootNodeId, com.pankaj.koredb.memory.MemoryEdgeTypes.GOVERNS).toMutableList()
+                var idx = 0
+                while (idx < governedIds.size) {
+                    val gId = governedIds[idx++]
+                    if (gId.startsWith("l3:")) {
+                        val subGoverned = graph.getOutboundTargetIds(gId, com.pankaj.koredb.memory.MemoryEdgeTypes.GOVERNS)
+                        for (sg in subGoverned) {
+                            if (sg !in governedIds) governedIds.add(sg)
+                        }
+                    } else if (gId.startsWith("l2:") || graph.getNode(gId)?.labels?.any { it.startsWith("L2") } == true) {
+                        val clusterNode = graph.getNode(gId)
+                        val memberFacts = graph.getOutboundTargetIds(gId, com.pankaj.koredb.memory.MemoryEdgeTypes.CLUSTERS_FACT)
+                        targetFactIds.addAll(memberFacts)
+                        scenarioClusters.add(
+                            com.pankaj.koredb.memory.L2ScenarioCluster(
+                                clusterId = gId.removePrefix("l2:cluster_").removePrefix("l2:"),
+                                title = clusterNode?.properties?.get("title") ?: gId,
+                                memberFactIds = memberFacts.map { it.removePrefix("l1:") },
+                                centroidEmbedding = null
+                            )
+                        )
+                    } else if (gId.startsWith("l1:") || graph.getNode(gId)?.labels?.any { it.startsWith("L1") } == true) {
+                        targetFactIds.add(gId)
+                    }
+                }
+            }
+            com.pankaj.koredb.memory.MemoryLevel.L2_SCENARIO -> {
+                val memberFacts = graph.getOutboundTargetIds(rootNodeId, com.pankaj.koredb.memory.MemoryEdgeTypes.CLUSTERS_FACT)
+                targetFactIds.addAll(memberFacts)
+                if (rootNode != null || memberFacts.isNotEmpty()) {
+                    scenarioClusters.add(
+                        com.pankaj.koredb.memory.L2ScenarioCluster(
+                            clusterId = rootNodeId.removePrefix("l2:cluster_").removePrefix("l2:"),
+                            title = rootNode?.properties?.get("title") ?: rootNodeId,
+                            memberFactIds = memberFacts.map { it.removePrefix("l1:") },
+                            centroidEmbedding = null
+                        )
+                    )
+                }
+            }
+            com.pankaj.koredb.memory.MemoryLevel.L1_FACT -> {
+                targetFactIds.add(rootNodeId)
+            }
+            else -> {
+                if (rootNodeId.startsWith("l1:")) targetFactIds.add(rootNodeId)
+            }
+        }
+
+        val factsWithEvidence = mutableListOf<com.pankaj.koredb.memory.FactWithEvidence>()
+        var totalEvidence = 0
+
+        for (fNodeId in targetFactIds) {
+            val fNode = graph.getNode(fNodeId) ?: continue
+            val fText = fNode.properties["text"] ?: ""
+            val fConf = fNode.properties["confidence"]?.toFloatOrNull()
+                ?: fNode.properties["certainty"]?.toFloatOrNull()
+                ?: 1.0f
+
+            val evSourceIds = graph.getInboundSourceIds(fNodeId, com.pankaj.koredb.memory.MemoryEdgeTypes.EVIDENCE_FOR)
+                .take(maxEvidencePerFact)
+
+            val decompressedList = evSourceIds.mapNotNull { evNodeId ->
+                val rawEvId = evNodeId.removePrefix("l0:")
+                if (pyramid != null) {
+                    pyramid.getDecompressedEvidence(rawEvId)
+                } else {
+                    val evNode = graph.getNode(evNodeId)
+                    if (evNode != null) {
+                        val summary = evNode.properties["summary"] ?: ""
+                        com.pankaj.koredb.memory.DecompressedEvidence(
+                            evidenceId = rawEvId,
+                            rawContent = summary,
+                            rawBytes = summary.toByteArray(Charsets.UTF_8),
+                            mimeType = evNode.properties["mimeType"] ?: "text/plain",
+                            timestampMs = evNode.properties["timestampMs"]?.toLongOrNull() ?: System.currentTimeMillis(),
+                            originalSize = evNode.properties["originalSize"]?.toIntOrNull() ?: summary.length,
+                            compressedSize = evNode.properties["compressedSize"]?.toIntOrNull() ?: summary.length,
+                            sourceUri = evNode.properties["sourceUri"],
+                            metadata = evNode.properties
+                        )
+                    } else null
+                }
+            }
+            totalEvidence += decompressedList.size
+            factsWithEvidence.add(
+                com.pankaj.koredb.memory.FactWithEvidence(
+                    factId = fNode.properties["factId"] ?: fNode.properties["id"] ?: fNodeId.removePrefix("l1:"),
+                    text = fText,
+                    confidence = fConf,
+                    properties = fNode.properties,
+                    evidenceList = decompressedList
+                )
+            )
+        }
+
+        return com.pankaj.koredb.memory.DrillDownResult(
+            rootNodeId = rootNodeId,
+            rootLevel = rootLevel,
+            scenarioClusters = scenarioClusters,
+            atomicFacts = factsWithEvidence,
+            totalEvidenceCount = totalEvidence
+        )
+    }
 }
+

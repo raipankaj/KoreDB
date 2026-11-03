@@ -35,6 +35,11 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests.all {
+            it.jvmArgs("-XX:CompileCommand=exclude,android/database/sqlite/SQLiteProgram*.*")
+        }
+    }
 }
 
 dependencies {

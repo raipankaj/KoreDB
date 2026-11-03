@@ -24,6 +24,39 @@ import java.io.File
 import java.util.PriorityQueue
 
 /**
+ * Pluggable filter invoked during SSTable compaction to drop expired or tombstoned entries.
+ */
+fun interface CompactionFilter {
+    /**
+     * Inspects a candidate key-value pair during LSM K-way merge.
+     * Returns true if the entry should be physically purged from the output SSTable.
+     */
+    fun shouldDrop(key: ByteArray, value: ByteArray, nowMs: Long): Boolean
+}
+
+/**
+ * Pluggable [CompactionFilter] that drops expired bi-temporal facts and edges
+ * whose validUntilMs is older than [retentionHorizonMs] relative to compaction time.
+ */
+class BiTemporalCompactionFilter(
+    val retentionHorizonMs: Long = 90L * 24 * 3600 * 1000 // 90 days default
+) : CompactionFilter {
+    override fun shouldDrop(key: ByteArray, value: ByteArray, nowMs: Long): Boolean {
+        if (value.isEmpty()) return false
+        val keyStr = runCatching { String(key, Charsets.UTF_8) }.getOrNull() ?: return false
+        if (keyStr.startsWith("g:v:") || keyStr.startsWith("doc:") || keyStr.startsWith("g:e:")) {
+            val valStr = runCatching { String(value, Charsets.UTF_8) }.getOrNull() ?: return false
+            val match = Regex("\"(?:_validUntilMs|validUntilMs)\"\\s*:\\s*\"?(\\d+)\"?").find(valStr)
+            val untilMs = match?.groupValues?.get(1)?.toLongOrNull()
+            if (untilMs != null && untilMs < nowMs - retentionHorizonMs) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+/**
  * Handles the merging and cleaning of multiple SSTable segments.
  *
  * Compaction is a critical background process in LSM-Trees that maintains performance
@@ -58,13 +91,17 @@ object Compactor {
      * @param truthOracle An optional function to validate if an index entry is still fresh.
      * @param compressionCodec Codec for output payload compression.
      * @param priorities Optional explicit priorities for readers (higher priority = newer data).
+     * @param dropTombstones Whether to drop tombstones during merge.
+     * @param compactionFilter Optional pluggable filter to evaluate candidate key-value pairs.
      */
     fun compact(
         readers: List<SSTableReader>,
         outputFile: File,
         truthOracle: ((ByteArray) -> ByteArray?)? = null,
         compressionCodec: com.pankaj.koredb.compression.CompressionCodec = com.pankaj.koredb.compression.NoOpCompressionCodec,
-        priorities: List<Int>? = null
+        priorities: List<Int>? = null,
+        dropTombstones: Boolean = true,
+        compactionFilter: CompactionFilter? = null
     ) {
         // 1. Initialize Iterators for all input files with level-aware priorities
         val queue = PriorityQueue<SSTableIterator>()
@@ -91,20 +128,50 @@ object Compactor {
                     val candidateValue = topIterator.value() ?: KoreDB.TOMBSTONE
 
                     if (candidateValue.isNotEmpty()) {
-                        // --- INDEX-AWARE COMPACTION ---
+                        // --- INDEX-AWARE COMPACTION & COMPACTION FILTER ---
                         var shouldDrop = false
+                        val nowMs = System.currentTimeMillis()
 
-                        if (truthOracle != null) {
+                        if (compactionFilter != null && compactionFilter.shouldDrop(candidateKey, candidateValue, nowMs)) {
+                            shouldDrop = true
+                        }
+
+                        if (!shouldDrop && truthOracle != null) {
                             if (startsWith(candidateKey, IDX_PREFIX_BYTES)) {
-                                val keyStr = String(candidateKey, Charsets.UTF_8)
-                                val parts = keyStr.split(":")
-                                if (parts.size >= 5) {
-                                    val collName = parts[1]
-                                    val id = parts.last()
-                                    val docKey = "doc:$collName:$id".toByteArray(Charsets.UTF_8)
-                                    val docBytes = truthOracle(docKey)
-                                    if (docBytes == null || docBytes.isEmpty()) {
-                                        shouldDrop = true // Document deleted: purge index entry
+                                val colonByte = ':'.code.toByte()
+                                var c1 = -1
+                                var c2 = -1
+                                var cLast = -1
+                                var colonCount = 0
+                                for (ci in candidateKey.indices) {
+                                    if (candidateKey[ci] == colonByte) {
+                                        colonCount++
+                                        if (colonCount == 1) c1 = ci
+                                        else if (colonCount == 2) c2 = ci
+                                        cLast = ci
+                                    }
+                                }
+                                if (colonCount >= 4 && c1 != -1 && c2 != -1 && cLast != -1) {
+                                    var endId = candidateKey.size
+                                    while (endId > cLast + 1 && candidateKey[endId - 1] == 0.toByte()) {
+                                        endId--
+                                    }
+                                    val collLen = c2 - (c1 + 1)
+                                    val idLen = endId - (cLast + 1)
+                                    if (collLen > 0 && idLen > 0) {
+                                        val docKey = ByteArray(4 + collLen + 1 + idLen)
+                                        docKey[0] = 'd'.code.toByte()
+                                        docKey[1] = 'o'.code.toByte()
+                                        docKey[2] = 'c'.code.toByte()
+                                        docKey[3] = ':'.code.toByte()
+                                        System.arraycopy(candidateKey, c1 + 1, docKey, 4, collLen)
+                                        docKey[4 + collLen] = ':'.code.toByte()
+                                        System.arraycopy(candidateKey, cLast + 1, docKey, 5 + collLen, idLen)
+
+                                        val docBytes = truthOracle(docKey)
+                                        if (docBytes == null || docBytes.isEmpty()) {
+                                            shouldDrop = true // Document deleted: purge index entry
+                                        }
                                     }
                                 }
                             } else if (startsWith(candidateKey, GRAPH_IDX_PREFIX_BYTES)) {
@@ -127,6 +194,13 @@ object Compactor {
                         }
 
                         if (!shouldDrop) {
+                            yield(Pair(candidateKey, candidateValue))
+                        }
+                    } else if (!dropTombstones) {
+                        // Preserve tombstone when deeper SSTable levels exist to prevent deleted data resurrection
+                        val nowMs = System.currentTimeMillis()
+                        val filterDrop = compactionFilter != null && compactionFilter.shouldDrop(candidateKey, candidateValue, nowMs)
+                        if (!filterDrop) {
                             yield(Pair(candidateKey, candidateValue))
                         }
                     }

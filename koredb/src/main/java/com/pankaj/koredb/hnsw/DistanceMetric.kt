@@ -40,13 +40,17 @@ enum class DistanceMetric {
      */
     COSINE {
         override fun compute(a: FloatArray, b: FloatArray): Float {
-            val magA = com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(a)
-            val magB = com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(b)
-            return com.pankaj.koredb.core.SimdVectorMath.cosineSimilarity16(a, magA, b, magB)
+            return com.pankaj.koredb.core.SimdVectorMath.cosineSimilarityFused16(a, b)
         }
 
         override fun computeWithMagnitudes(a: FloatArray, magA: Float, b: FloatArray, magB: Float): Float {
             return com.pankaj.koredb.core.SimdVectorMath.cosineSimilarity16(a, magA, b, magB)
+        }
+
+        override fun computePrefix(a: FloatArray, b: FloatArray, prefixDims: Int): Float {
+            val size = minOf(prefixDims, minOf(a.size, b.size))
+            if (size <= 0) return 0f
+            return com.pankaj.koredb.core.SimdVectorMath.cosineSimilarityFused16(a, b, size)
         }
     },
 
@@ -60,6 +64,13 @@ enum class DistanceMetric {
             val sq = com.pankaj.koredb.core.SimdVectorMath.euclideanDistanceSq16(a, b)
             return -sqrt(sq) // Negate: higher = closer
         }
+
+        override fun computePrefix(a: FloatArray, b: FloatArray, prefixDims: Int): Float {
+            val size = minOf(prefixDims, minOf(a.size, b.size))
+            if (size <= 0) return 0f
+            val sq = com.pankaj.koredb.core.SimdVectorMath.euclideanDistanceSq16(a, b, size)
+            return -sqrt(sq)
+        }
     },
 
     /**
@@ -69,6 +80,12 @@ enum class DistanceMetric {
     INNER_PRODUCT {
         override fun compute(a: FloatArray, b: FloatArray): Float {
             return com.pankaj.koredb.core.SimdVectorMath.dotProduct16(a, b)
+        }
+
+        override fun computePrefix(a: FloatArray, b: FloatArray, prefixDims: Int): Float {
+            val size = minOf(prefixDims, minOf(a.size, b.size))
+            if (size <= 0) return 0f
+            return com.pankaj.koredb.core.SimdVectorMath.dotProduct16(a, b, size)
         }
     },
 
@@ -82,6 +99,13 @@ enum class DistanceMetric {
             val sum = com.pankaj.koredb.core.SimdVectorMath.manhattanDistance16(a, b)
             return -sum // Negate: higher = closer
         }
+
+        override fun computePrefix(a: FloatArray, b: FloatArray, prefixDims: Int): Float {
+            val size = minOf(prefixDims, minOf(a.size, b.size))
+            if (size <= 0) return 0f
+            val sum = com.pankaj.koredb.core.SimdVectorMath.manhattanDistance16(a, b, size)
+            return -sum
+        }
     };
 
     /**
@@ -89,6 +113,12 @@ enum class DistanceMetric {
      * Higher return value = more similar (for all metrics).
      */
     abstract fun compute(a: FloatArray, b: FloatArray): Float
+
+    /**
+     * Computes similarity/distance over only the first [prefixDims] dimensions
+     * without allocating sub-arrays (used by Matryoshka Representation Learning search).
+     */
+    abstract fun computePrefix(a: FloatArray, b: FloatArray, prefixDims: Int): Float
 
     /**
      * Optimized computation with pre-calculated magnitudes.

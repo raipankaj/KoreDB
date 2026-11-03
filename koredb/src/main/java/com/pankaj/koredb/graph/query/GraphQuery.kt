@@ -16,6 +16,7 @@
 
 package com.pankaj.koredb.graph.query
 
+import com.pankaj.koredb.graph.BiTemporalEdge
 import com.pankaj.koredb.graph.GraphStorage
 import com.pankaj.koredb.graph.Node
 
@@ -88,6 +89,19 @@ class GraphQuery(private val storage: GraphStorage) {
      * @return The current [GraphQuery] instance for method chaining.
      */
     fun startingWith(vararg nodeIds: String): GraphQuery {
+        currentIds = nodeIds.toSet()
+        return this
+    }
+
+    /**
+     * Initializes the traversal from explicit Node IDs (unambiguous alias).
+     */
+    fun startingWithIds(vararg nodeIds: String): GraphQuery {
+        currentIds = nodeIds.toSet()
+        return this
+    }
+
+    fun startingWithIds(nodeIds: Collection<String>): GraphQuery {
         currentIds = nodeIds.toSet()
         return this
     }
@@ -229,6 +243,101 @@ class GraphQuery(private val storage: GraphStorage) {
 
         currentIds = result
         return this
+    }
+
+    /**
+     * Filters intermediate nodes to those active at [nowMs] (validFromMs <= nowMs < validUntilMs).
+     */
+    fun activeOnly(nowMs: Long = System.currentTimeMillis()): GraphQuery {
+        return filterNodes { node ->
+            val validFrom = node.properties[BiTemporalEdge.PROP_VALID_FROM]?.toLongOrNull()
+                ?: node.properties["validFromMs"]?.toLongOrNull()
+                ?: 0L
+            val validUntil = node.properties[BiTemporalEdge.PROP_VALID_UNTIL]?.toLongOrNull()
+                ?: node.properties["validUntilMs"]?.toLongOrNull()
+                ?: Long.MAX_VALUE
+            validFrom <= nowMs && nowMs < validUntil
+        }
+    }
+
+    /**
+     * Alias for [activeOnly].
+     */
+    fun queryActive(nowMs: Long = System.currentTimeMillis()): GraphQuery = activeOnly(nowMs)
+
+    /**
+     * Traverses forward across outbound edges that are active at [nowMs].
+     */
+    fun outboundActive(
+        edgeType: String,
+        nowMs: Long = System.currentTimeMillis(),
+        hops: Int = 1
+    ): GraphQuery {
+        require(hops > 0) { "Hops must be at least 1" }
+        for (i in 0 until hops) {
+            val nextIds = mutableSetOf<String>()
+            for (id in currentIds) {
+                val edges = storage.getOutboundEdges(id, edgeType)
+                for (edge in edges) {
+                    val bEdge = BiTemporalEdge.fromEdge(edge)
+                    if (bEdge.isValidAt(nowMs)) {
+                        nextIds.add(edge.targetId)
+                    }
+                }
+            }
+            currentIds = nextIds
+        }
+        return this
+    }
+
+    /**
+     * Traverses backward across inbound edges that are active at [nowMs].
+     */
+    fun inboundActive(
+        edgeType: String,
+        nowMs: Long = System.currentTimeMillis(),
+        hops: Int = 1
+    ): GraphQuery {
+        require(hops > 0) { "Hops must be at least 1" }
+        for (i in 0 until hops) {
+            val nextIds = mutableSetOf<String>()
+            for (id in currentIds) {
+                val edges = storage.getInboundEdges(id, edgeType)
+                for (edge in edges) {
+                    val bEdge = BiTemporalEdge.fromEdge(edge)
+                    if (bEdge.isValidAt(nowMs)) {
+                        nextIds.add(edge.sourceId)
+                    }
+                }
+            }
+            currentIds = nextIds
+        }
+        return this
+    }
+
+    /**
+     * Filters intermediate nodes to those valid as of [validTimeMs],
+     * and known to the system as of [asOfTransactionTimeMs].
+     */
+    fun asOf(
+        validTimeMs: Long,
+        asOfTransactionTimeMs: Long = Long.MAX_VALUE
+    ): GraphQuery {
+        return filterNodes { node ->
+            val validFrom = node.properties[BiTemporalEdge.PROP_VALID_FROM]?.toLongOrNull()
+                ?: node.properties["validFromMs"]?.toLongOrNull()
+                ?: 0L
+            val validUntil = node.properties[BiTemporalEdge.PROP_VALID_UNTIL]?.toLongOrNull()
+                ?: node.properties["validUntilMs"]?.toLongOrNull()
+                ?: Long.MAX_VALUE
+            val ingestedAt = node.properties[BiTemporalEdge.PROP_INGESTED_AT]?.toLongOrNull()
+                ?: node.properties["ingestedAtMs"]?.toLongOrNull()
+                ?: 0L
+
+            val isValidInDomain = validFrom <= validTimeMs && validTimeMs < validUntil
+            val wasRecordedInDb = ingestedAt <= asOfTransactionTimeMs
+            isValidInDomain && wasRecordedInDb
+        }
     }
 
     /**

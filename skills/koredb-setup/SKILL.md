@@ -19,7 +19,7 @@ plugins {
 
 dependencies {
     // KoreDB Core Engine
-    implementation("io.github.raipankaj:koredb:0.2.0")
+    implementation("io.github.raipankaj:koredb:0.2.1")
 
     // Kotlinx Serialization & Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.8.0")

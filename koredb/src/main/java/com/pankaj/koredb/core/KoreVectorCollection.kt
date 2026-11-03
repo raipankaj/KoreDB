@@ -72,6 +72,8 @@ class KoreVectorCollection(
     private val db: KoreDB,
     private val config: VectorCollectionConfig = VectorCollectionConfig()
 ) : Closeable {
+    val metric: DistanceMetric get() = config.metric
+
     private val quantizer = if (config.quantization && config.dimensions > 0) {
         ScalarQuantizer(config.dimensions)
     } else null
@@ -87,8 +89,10 @@ class KoreVectorCollection(
     // Multi-vector: separate HNSW index per vector field
     private val fieldIndices = java.util.concurrent.ConcurrentHashMap<String, HNSWIndex>()
 
+    @Volatile
     private var mmapHnsw: MmapHNSWIndex? = null
 
+    @Synchronized
     private fun ensureMutableHnsw() {
         if (mmapHnsw != null && hnsw.size() == 0) {
             try {
@@ -101,7 +105,15 @@ class KoreVectorCollection(
 
     // Background worker for non-blocking HNSW construction
     private val indexingScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val indexingChannel = Channel<IndexingTask>(Channel.UNLIMITED)
+    private val numWorkers = maxOf(2, Runtime.getRuntime().availableProcessors())
+    private val workerChannels = Array(numWorkers) { Channel<IndexingTask>(Channel.UNLIMITED) }
+    private val inFlightTasks = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile
+    private var hydrationDone = false
+
+    private fun channelFor(id: String): Channel<IndexingTask> {
+        return workerChannels[(id.hashCode() and Int.MAX_VALUE) % numWorkers]
+    }
 
     // Namespace-aware key prefix
     private val keyPrefix = if (config.namespace.isEmpty()) {
@@ -130,35 +142,44 @@ class KoreVectorCollection(
     }
 
     init {
+        val initialKeys = db.getKeysByPrefixRaw(keyPrefix.toByteArray(Charsets.UTF_8))
         indexingScope.launch {
-            hydrateFromDisk()
-            val numWorkers = maxOf(2, Runtime.getRuntime().availableProcessors())
-            val jobs = List(numWorkers) {
+            try {
+                hydrateFromDisk(initialKeys)
+            } finally {
+                hydrationDone = true
+            }
+            val jobs = List(numWorkers) { workerIdx ->
+                val channel = workerChannels[workerIdx]
                 launch(Dispatchers.Default) {
-                    for (task in indexingChannel) {
-                        ensureMutableHnsw()
-                        when (task) {
-                            is IndexingTask.Insert -> {
-                                hnsw.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
-                            }
-                            is IndexingTask.InsertField -> {
-                                val fieldIndex = fieldIndices.getOrPut(task.field) {
-                                    HNSWIndex(
-                                        maxNeighbors = config.maxConnections,
-                                        efConstruction = config.efConstruction,
-                                        efSearch = config.efSearch,
-                                        metric = config.metric
-                                    )
+                    for (task in channel) {
+                        try {
+                            ensureMutableHnsw()
+                            when (task) {
+                                is IndexingTask.Insert -> {
+                                    hnsw.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
                                 }
-                                fieldIndex.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
+                                is IndexingTask.InsertField -> {
+                                    val fieldIndex = fieldIndices.getOrPut(task.field) {
+                                        HNSWIndex(
+                                            maxNeighbors = config.maxConnections,
+                                            efConstruction = config.efConstruction,
+                                            efSearch = config.efSearch,
+                                            metric = config.metric
+                                        )
+                                    }
+                                    fieldIndex.insert(task.id, task.vector, VectorMath.getMagnitude(task.vector), task.meta)
+                                }
+                                is IndexingTask.Delete -> {
+                                    hnsw.delete(task.id)
+                                    fieldIndices.values.forEach { it.delete(task.id) }
+                                }
+                                is IndexingTask.Update -> {
+                                    hnsw.update(task.id, task.vector, task.meta)
+                                }
                             }
-                            is IndexingTask.Delete -> {
-                                hnsw.delete(task.id)
-                                fieldIndices.values.forEach { it.delete(task.id) }
-                            }
-                            is IndexingTask.Update -> {
-                                hnsw.update(task.id, task.vector, task.meta)
-                            }
+                        } finally {
+                            inFlightTasks.decrementAndGet()
                         }
                     }
                 }
@@ -184,10 +205,11 @@ class KoreVectorCollection(
         if (metadata != null) {
             db.putRaw(makeMetaKey(id), serializeMetadata(metadata))
         }
+        inFlightTasks.incrementAndGet()
         if (isUpdate) {
-            indexingChannel.send(IndexingTask.Update(id, vector, metadata))
+            channelFor(id).send(IndexingTask.Update(id, vector, metadata))
         } else {
-            indexingChannel.send(IndexingTask.Insert(id, vector, metadata))
+            channelFor(id).send(IndexingTask.Insert(id, vector, metadata))
         }
     }
 
@@ -226,7 +248,8 @@ class KoreVectorCollection(
         db.writeBatchRaw(batch)
 
         for ((field, vector) in vectors) {
-            indexingChannel.send(IndexingTask.InsertField(id, field, vector, metadata))
+            inFlightTasks.incrementAndGet()
+            channelFor(id).send(IndexingTask.InsertField(id, field, vector, metadata))
         }
     }
 
@@ -256,7 +279,8 @@ class KoreVectorCollection(
 
         // Offload HNSW construction to background
         for ((id, vector) in vectors) {
-            indexingChannel.send(IndexingTask.Insert(id, vector, metadataMap?.get(id)))
+            inFlightTasks.incrementAndGet()
+            channelFor(id).send(IndexingTask.Insert(id, vector, metadataMap?.get(id)))
         }
     }
 
@@ -304,6 +328,110 @@ class KoreVectorCollection(
     }
 
     /**
+     * Executes a Two-Stage Matryoshka Representation Learning (MRL) Search:
+     * 1. **Coarse Traversal**: Navigates the HNSW graph using only the first [coarseDims] dimensions
+     *    (cutting per-comparison FLOPs by $D / d_{\text{coarse}}$, e.g. $12\times$ for $64$ vs $768$ dims)
+     *    to shortlist `limit * oversampleFactor` candidates.
+     * 2. **Fine Rescoring**: Rescores the shortlisted candidates using full $D$-dimensional vectors.
+     *
+     * Ideal for modern Matryoshka embeddings (Gemini Embedding, Nomic v1.5, OpenAI v3, Gemma).
+     */
+    suspend fun searchMatryoshka(
+        query: FloatArray,
+        limit: Int = 10,
+        coarseDims: Int = 64,
+        oversampleFactor: Int = 4,
+        filterBuilder: (VectorFilterBuilder.() -> Unit)? = null
+    ): List<Pair<String, Float>> {
+        val filter = if (filterBuilder != null) {
+            VectorFilterBuilder().apply(filterBuilder).build()
+        } else {
+            VectorFilter.EMPTY
+        }
+
+        ensureMutableHnsw()
+        if (hnsw.size() > 0) {
+            return hnsw.searchMatryoshka(
+                query = query,
+                limit = limit,
+                coarseDims = coarseDims,
+                oversampleFactor = oversampleFactor,
+                filter = filter
+            )
+        }
+
+        return bruteForceFallback(query, limit, filter)
+    }
+
+    /**
+     * Executes a Maximal Marginal Relevance (MMR) Diversity Search.
+     *
+     * Balances query relevance against inter-result redundancy by iteratively selecting
+     * the candidate $i \notin S$ that maximizes:
+     * $$\text{MMR}(i) = \lambda \cdot \text{Sim}(q, v_i) - (1 - \lambda) \cdot \max_{j \in S} \text{Sim}(v_i, v_j)$$
+     *
+     * @param query Query embedding vector.
+     * @param limit Number of diverse results to return.
+     * @param fetchK Initial candidate pool size fetched before MMR selection (default `max(limit * 4, 20)`).
+     * @param diversityLambda Trade-off $\lambda \in [0.0, 1.0]$ (`1.0` = pure relevance, `0.0` = maximum diversity, default `0.5f`).
+     * @param filterBuilder Optional metadata filter DSL.
+     */
+    suspend fun searchMMR(
+        query: FloatArray,
+        limit: Int = 10,
+        fetchK: Int = maxOf(limit * 4, 20),
+        diversityLambda: Float = 0.5f,
+        filterBuilder: (VectorFilterBuilder.() -> Unit)? = null
+    ): List<Pair<String, Float>> {
+        if (limit <= 0) return emptyList()
+        val lam = diversityLambda.coerceIn(0.0f, 1.0f)
+        val candidates = search(query, maxOf(limit, fetchK), filterBuilder)
+        if (candidates.size <= 1 || lam >= 0.999f) {
+            return candidates.take(limit)
+        }
+
+        val vecMap = getBatchVectors(candidates.map { it.first })
+        val selected = ArrayList<Pair<String, Float>>(minOf(limit, candidates.size))
+        val selectedVectors = ArrayList<FloatArray>(minOf(limit, candidates.size))
+        val remaining = candidates.toMutableList()
+
+        // First pick is always the most relevant candidate
+        val first = remaining.removeAt(0)
+        selected.add(first)
+        vecMap[first.first]?.let { selectedVectors.add(it) }
+
+        while (selected.size < limit && remaining.isNotEmpty()) {
+            var bestIdx = 0
+            var bestMmrScore = -Float.MAX_VALUE
+
+            for (i in remaining.indices) {
+                val (candId, querySim) = remaining[i]
+                val candVec = vecMap[candId]
+                var maxSimToSelected = 0.0f
+                if (candVec != null && selectedVectors.isNotEmpty()) {
+                    for (selVec in selectedVectors) {
+                        val sim = metric.compute(candVec, selVec)
+                        if (sim > maxSimToSelected) {
+                            maxSimToSelected = sim
+                        }
+                    }
+                }
+                val mmrScore = (lam * querySim) - ((1.0f - lam) * maxSimToSelected)
+                if (mmrScore > bestMmrScore) {
+                    bestMmrScore = mmrScore
+                    bestIdx = i
+                }
+            }
+
+            val picked = remaining.removeAt(bestIdx)
+            selected.add(picked)
+            vecMap[picked.first]?.let { selectedVectors.add(it) }
+        }
+
+        return selected
+    }
+
+    /**
      * Searches a specific vector field (multi-vector search).
      *
      * ```kotlin
@@ -343,7 +471,8 @@ class KoreVectorCollection(
             makeMetaKey(id) to KoreDB.TOMBSTONE
         )
         db.writeBatchRaw(batch)
-        indexingChannel.send(IndexingTask.Delete(id))
+        inFlightTasks.incrementAndGet()
+        channelFor(id).send(IndexingTask.Delete(id))
     }
 
     /**
@@ -357,7 +486,10 @@ class KoreVectorCollection(
             )
         }
         db.writeBatchRaw(batch)
-        ids.forEach { indexingChannel.send(IndexingTask.Delete(it)) }
+        ids.forEach {
+            inFlightTasks.incrementAndGet()
+            channelFor(it).send(IndexingTask.Delete(it))
+        }
     }
 
     /**
@@ -368,7 +500,8 @@ class KoreVectorCollection(
         if (metadata != null) {
             db.putRaw(makeMetaKey(id), serializeMetadata(metadata))
         }
-        indexingChannel.send(IndexingTask.Update(id, vector, metadata))
+        inFlightTasks.incrementAndGet()
+        channelFor(id).send(IndexingTask.Update(id, vector, metadata))
     }
 
     /**
@@ -376,6 +509,7 @@ class KoreVectorCollection(
      */
     suspend fun updateMetadata(id: String, metadata: Map<String, Any>) {
         db.putRaw(makeMetaKey(id), serializeMetadata(metadata))
+        ensureMutableHnsw()
         hnsw.updateMetadata(id, metadata)
     }
 
@@ -442,11 +576,9 @@ class KoreVectorCollection(
      */
     @OptIn(ExperimentalCoroutinesApi::class)
     suspend fun waitForIndexing() {
-        while (!indexingChannel.isEmpty) {
-            delay(50)
+        while (!hydrationDone || workerChannels.any { !it.isEmpty } || inFlightTasks.get() > 0) {
+            delay(10)
         }
-        // Allow the consumer to process remaining items
-        delay(100)
         
         withContext(Dispatchers.IO) {
             if (hnsw.size() > 0) {
@@ -464,7 +596,7 @@ class KoreVectorCollection(
      * Shuts down the background indexing worker.
      */
     override fun close() {
-        indexingChannel.close()
+        workerChannels.forEach { it.close() }
         indexingScope.cancel()
         mmapHnsw?.close()
     }
@@ -485,7 +617,7 @@ class KoreVectorCollection(
     private fun makeMetaKey(id: String) = "$metaPrefix${escape(id)}".toByteArray(Charsets.UTF_8)
     private fun makeFieldKey(id: String, field: String) = "${keyPrefix}f:${escape(field)}:${escape(id)}".toByteArray(Charsets.UTF_8)
 
-    private suspend fun hydrateFromDisk() = withContext(Dispatchers.IO) {
+    private suspend fun hydrateFromDisk(rawKeys: List<ByteArray>) = withContext(Dispatchers.IO) {
         if (indexFile.exists()) {
             try {
                 mmapHnsw = MmapHNSWIndex(indexFile)
@@ -498,9 +630,7 @@ class KoreVectorCollection(
             }
         }
 
-        // Hydrate any new vectors not yet in the HNSW index
-        val prefix = keyPrefix.toByteArray(Charsets.UTF_8)
-        val rawKeys = db.getKeysByPrefixRaw(prefix)
+        // Hydrate any existing vectors not yet in the HNSW index
         var addedNew = false
 
         for (keyBytes in rawKeys) {

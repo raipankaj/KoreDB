@@ -42,10 +42,7 @@ class BloomFilter(
      * @param key The byte array representing the key to add.
      */
     fun add(key: ByteArray) {
-        val hashes = getHashes(key, 0, key.size)
-        for (hash in hashes) {
-            bitSet.set(hash)
-        }
+        addRange(key, 0, key.size)
     }
 
     /**
@@ -61,9 +58,18 @@ class BloomFilter(
      * @param length The number of bytes to hash.
      */
     fun addRange(data: ByteArray, offset: Int, length: Int) {
-        val hashes = getHashes(data, offset, length)
-        for (hash in hashes) {
-            bitSet.set(hash)
+        var hash1 = 5381
+        var hash2 = 0
+        val end = offset + length
+        for (i in offset until end) {
+            val b = data[i].toInt()
+            hash1 = ((hash1 shl 5) + hash1) xor b
+            hash2 = hash2 * 31 + b
+        }
+
+        for (i in 0 until hashFunctions) {
+            val combinedHash = (hash1 + (i * hash2)) and Int.MAX_VALUE
+            bitSet.set(combinedHash % bitSize)
         }
     }
 
@@ -74,28 +80,20 @@ class BloomFilter(
      * @return true if the key might be present, false if it definitely is not.
      */
     fun mightContain(key: ByteArray): Boolean {
-        val hashes = getHashes(key, 0, key.size)
-        for (hash in hashes) {
-            if (!bitSet.get(hash)) {
-                return false
-            }
-        }
-        return true
+        return mightContainRange(key, 0, key.size)
     }
 
     /**
-     * Generates multiple hash indices for a sub-range of bytes using double hashing.
+     * Checks if a sub-range of bytes might be present in the filter without allocation.
      *
      * @param data The source byte array.
-     * @param offset Starting position in the array.
-     * @param length Number of bytes to hash.
+     * @param offset The starting position in the array.
+     * @param length The number of bytes to check.
+     * @return true if the sub-range might be present, false if it definitely is not.
      */
-    private fun getHashes(data: ByteArray, offset: Int, length: Int): IntArray {
-        val result = IntArray(hashFunctions)
+    fun mightContainRange(data: ByteArray, offset: Int, length: Int): Boolean {
         var hash1 = 5381
         var hash2 = 0
-
-        // DJB2-like hashing for hash1 and a simple shift-based hash for hash2
         val end = offset + length
         for (i in offset until end) {
             val b = data[i].toInt()
@@ -104,10 +102,12 @@ class BloomFilter(
         }
 
         for (i in 0 until hashFunctions) {
-            val combinedHash = abs(hash1 + (i * hash2))
-            result[i] = combinedHash % bitSize
+            val combinedHash = (hash1 + (i * hash2)) and Int.MAX_VALUE
+            if (!bitSet.get(combinedHash % bitSize)) {
+                return false
+            }
         }
-        return result
+        return true
     }
 
     /**

@@ -27,12 +27,19 @@ import kotlin.random.Random
  * @param quantizer Optional scalar quantizer for memory-efficient storage.
  */
 class HNSWIndex(
-    private val maxNeighbors: Int = 16,
-    private val efConstruction: Int = 200,
-    var efSearch: Int = 50,
+    val dimensions: Int = 0,
     val metric: DistanceMetric = DistanceMetric.COSINE,
-    private val quantizer: ScalarQuantizer? = null
+    val m: Int = 16,
+    val efConstruction: Int = 200,
+    var efSearch: Int = 50,
+    private val quantizer: ScalarQuantizer? = null,
+    maxNeighbors: Int = m
 ) {
+    val maxNeighbors: Int = if (maxNeighbors != 16) maxNeighbors else m
+
+    @get:JvmName("getNodeSize")
+    val size: Int get() = nodes.size
+
     private val levelMult = 1.0 / ln(maxNeighbors.toDouble())
 
     private val nodes = ConcurrentHashMap<String, HNSWNode>()
@@ -57,7 +64,8 @@ class HNSWIndex(
         @Volatile var vector: FloatArray?,
         val magnitude: Float,
         val nodeLevel: Int,
-        @Volatile var quantizedVector: ByteArray? = null
+        @Volatile var quantizedVector: ByteArray? = null,
+        val magnitude64: Float = vector?.let { com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(it, minOf(64, it.size)) } ?: 0f
     ) {
         val neighbors = Array(nodeLevel + 1) { ConcurrentHashMap.newKeySet<String>() }
     }
@@ -89,6 +97,14 @@ class HNSWIndex(
     // ========================================================================
 
     /**
+     * Inserts a vector with optional metadata, calculating magnitude automatically.
+     */
+    fun insert(id: String, vector: FloatArray, meta: Map<String, Any>? = null) {
+        val magnitude = VectorMath.getMagnitude(vector)
+        insert(id, vector, magnitude, meta)
+    }
+
+    /**
      * Inserts a vector with optional metadata into the HNSW index.
      *
      * @param id Unique identifier for this vector.
@@ -108,21 +124,35 @@ class HNSWIndex(
         val quantized = if (quantizer != null && quantizer.isTrained()) quantizer.quantize(vector) else null
         val storedVector = if (quantizer != null && quantizer.isTrained()) null else vector
         val newNode = HNSWNode(id, storedVector, magnitude, level, quantized)
-        nodes[id] = newNode
+        val oldNode = nodes.put(id, newNode)
 
         val startNode = entryNode.get()
-        if (startNode == null || startNode.id == id) {
+        if (startNode == null) {
             synchronized(entryNode) {
                 val currentStart = entryNode.get()
-                if (currentStart == null || currentStart.id == id) {
+                if (currentStart == null) {
                     entryNode.set(newNode)
-                    maxLevel.set(maxOf(level, maxLevel.get()))
-                    if (currentStart == null) return
+                    maxLevel.set(level)
+                    return
                 }
             }
         }
 
         var currNode: HNSWNode = entryNode.get()!!
+        if (currNode.id == id) {
+            val altNode = oldNode?.neighbors?.getOrNull(0)
+                ?.firstOrNull { it != id && it !in tombstones }
+                ?.let { nodes[it] }
+                ?: nodes.values.firstOrNull { it.id != id && it.id !in tombstones }
+            if (altNode == null) {
+                synchronized(entryNode) {
+                    entryNode.set(newNode)
+                    maxLevel.set(maxOf(level, maxLevel.get()))
+                }
+                return
+            }
+            currNode = altNode
+        }
         var currDist = distance(vector, magnitude, currNode)
 
         // Navigate upper layers greedily
@@ -133,7 +163,7 @@ class HNSWIndex(
                 // Safety check: only traverse if current node has this level
                 if (l <= currNode.nodeLevel) {
                     for (neighborId in currNode.neighbors[l]) {
-                        if (neighborId in tombstones) continue
+                        if (neighborId == id || neighborId in tombstones) continue
                         val neighborNode = nodes[neighborId] ?: continue
                         val d = distance(vector, magnitude, neighborNode)
                         if (d > currDist) {
@@ -148,16 +178,18 @@ class HNSWIndex(
         for (l in minOf(level, maxLevel.get()) downTo 0) {
             // Ensure entry point for this layer actually exists at this level
             if (l > currNode.nodeLevel) {
-                currNode = entryNode.get()!!
-                while (l > currNode.nodeLevel && currNode.id != newNode.id) {
-                    break 
+                val entry = entryNode.get()!!
+                if (entry.id != id) {
+                    currNode = entry
                 }
             }
 
             val candidates = searchLayer(vector, magnitude, currNode, efConstruction, l, VectorFilter.EMPTY)
+                .filter { it.first != id }
             val neighborsToConnect = selectNeighborsHeuristic(vector, magnitude, candidates, maxNeighbors)
 
             for (candidate in neighborsToConnect) {
+                if (candidate.first == id) continue
                 val neighborNode = nodes[candidate.first] ?: continue
                 if (l <= newNode.nodeLevel && l <= neighborNode.nodeLevel) {
                     connect(newNode, neighborNode, l)
@@ -174,11 +206,11 @@ class HNSWIndex(
             }
         }
 
-        if (level > maxLevel.get()) {
+        if (level > maxLevel.get() || entryNode.get()?.id == id) {
             synchronized(maxLevel) {
-                if (level > maxLevel.get()) {
+                if (level > maxLevel.get() || entryNode.get()?.id == id) {
                     entryNode.set(newNode)
-                    maxLevel.set(level)
+                    maxLevel.set(maxOf(level, maxLevel.get()))
                 }
             }
         }
@@ -211,10 +243,23 @@ class HNSWIndex(
      * @param filter Optional metadata filter (pre-filtering during traversal).
      * @return List of (id, similarity) pairs sorted by descending similarity.
      */
+    /**
+     * Searches for the K most similar vectors, optionally filtered by metadata.
+     * Evaluates truncated 64-dim distance using [computePrefixFast] with cached [magnitude64]
+     * during upper layer navigation ($l \ge 1$), and executes full D-dimensional rescoring
+     * on Layer 0.
+     *
+     * @param query The query vector.
+     * @param limit Number of results to return.
+     * @param filter Optional metadata filter (pre-filtering during traversal).
+     * @param mrlCoarseDims Truncated dimensions for upper-layer greedy search (default: 64).
+     * @return List of (id, similarity) pairs sorted by descending similarity.
+     */
     fun search(
         query: FloatArray,
         limit: Int,
-        filter: VectorFilter = VectorFilter.EMPTY
+        filter: VectorFilter = VectorFilter.EMPTY,
+        mrlCoarseDims: Int = 64
     ): List<Pair<String, Float>> {
         val startNode = entryNode.get() ?: return emptyList()
         val firstNode = nodes.values.firstOrNull()
@@ -224,11 +269,18 @@ class HNSWIndex(
         }
 
         val queryMag = VectorMath.getMagnitude(query)
+        val useMrl = mrlCoarseDims in 1 until query.size
+        val coarseDims = if (useMrl) mrlCoarseDims else query.size
+        val queryMag64 = if (useMrl) com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(query, coarseDims) else queryMag
 
         var currNode = startNode
-        var currDist = distance(query, queryMag, currNode)
+        var currDist = if (useMrl) {
+            computePrefixFast(query, queryMag64, currNode, coarseDims)
+        } else {
+            distance(query, queryMag, currNode)
+        }
 
-        // Navigate upper layers
+        // Navigate upper layers greedily using truncated 64 dimensions
         val currentMaxLevel = maxLevel.get()
         if (currentMaxLevel >= 1) {
             for (l in currentMaxLevel downTo 1) {
@@ -239,7 +291,11 @@ class HNSWIndex(
                         for (neighborId in currNode.neighbors[l]) {
                             if (neighborId in tombstones) continue
                             val neighborNode = nodes[neighborId] ?: continue
-                            val d = distance(query, queryMag, neighborNode)
+                            val d = if (useMrl) {
+                                computePrefixFast(query, queryMag64, neighborNode, coarseDims)
+                            } else {
+                                distance(query, queryMag, neighborNode)
+                            }
                             if (d > currDist) {
                                 currDist = d; currNode = neighborNode; changed = true
                             }
@@ -249,7 +305,7 @@ class HNSWIndex(
             }
         }
 
-        // Comprehensive base-layer search with over-fetching for filtered queries
+        // Transition to Layer 0: Full D-dimensional rescoring of entry node
         val searchEf = if (filter.isEmpty()) {
             maxOf(efSearch, limit)
         } else {
@@ -258,6 +314,86 @@ class HNSWIndex(
 
         val results = searchLayer(query, queryMag, currNode, searchEf, 0, filter)
         return results.take(limit)
+    }
+
+    /** Overload for k nearest neighbors. */
+    fun search(query: FloatArray, k: Int): List<Pair<String, Float>> = search(query, limit = k)
+
+    /**
+     * Executes a Two-Stage Matryoshka Representation Learning (MRL) Search:
+     * 1. **Coarse Traversal**: Navigates the HNSW graph using only the first [coarseDims] dimensions
+     *    (cutting per-comparison FLOPs by $D / d_{\text{coarse}}$, e.g. $12\times$ for $64$ vs $768$ dims)
+     *    to shortlist `limit * oversampleFactor` candidates.
+     * 2. **Fine Rescoring**: Rescores the shortlisted candidates using full $D$-dimensional vectors
+     *    and returns the top [limit] results sorted by exact similarity descending.
+     */
+    fun searchMatryoshka(
+        query: FloatArray,
+        limit: Int,
+        coarseDims: Int = 64,
+        oversampleFactor: Int = 4,
+        filter: VectorFilter = VectorFilter.EMPTY
+    ): List<Pair<String, Float>> {
+        if (limit <= 0) return emptyList()
+        val startNode = entryNode.get() ?: return emptyList()
+        val firstNode = nodes.values.firstOrNull()
+        val indexDim = firstNode?.vector?.size ?: firstNode?.quantizedVector?.size ?: 0
+        if (indexDim > 0 && query.size != indexDim) {
+            return emptyList()
+        }
+
+        val effectiveCoarseDims = coarseDims.coerceIn(1, query.size)
+        if (effectiveCoarseDims >= query.size) {
+            return search(query, limit, filter)
+        }
+
+        val queryMagCoarse = if (effectiveCoarseDims == 64) {
+            com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(query, effectiveCoarseDims)
+        } else VectorMath.getMagnitude(query)
+
+        var currNode = startNode
+        var currDist = computePrefixFast(query, queryMagCoarse, currNode, effectiveCoarseDims)
+
+        val currentMaxLevel = maxLevel.get()
+        if (currentMaxLevel >= 1) {
+            for (l in currentMaxLevel downTo 1) {
+                var changed = true
+                while (changed) {
+                    changed = false
+                    if (l <= currNode.nodeLevel) {
+                        for (neighborId in currNode.neighbors[l]) {
+                            if (neighborId in tombstones) continue
+                            val neighborNode = nodes[neighborId] ?: continue
+                            val d = computePrefixFast(query, queryMagCoarse, neighborNode, effectiveCoarseDims)
+                            if (d > currDist) {
+                                currDist = d; currNode = neighborNode; changed = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val shortlistSize = (limit * oversampleFactor.coerceAtLeast(1)).coerceAtLeast(limit)
+        val searchEf = if (filter.isEmpty()) {
+            maxOf(efSearch, shortlistSize)
+        } else {
+            maxOf(efSearch, shortlistSize * 2)
+        }
+
+        val coarseCandidates = searchLayerPrefix(query, currNode, searchEf, 0, filter, effectiveCoarseDims)
+            .take(shortlistSize)
+
+        val fullQueryMag = VectorMath.getMagnitude(query)
+        val rescored = ArrayList<Pair<String, Float>>(coarseCandidates.size)
+        for ((id, _) in coarseCandidates) {
+            val node = nodes[id] ?: continue
+            val exactScore = distance(query, fullQueryMag, node)
+            rescored.add(id to exactScore)
+        }
+
+        rescored.sortByDescending { it.second }
+        return if (rescored.size <= limit) rescored else rescored.subList(0, limit)
     }
 
     // ========================================================================
@@ -385,7 +521,7 @@ class HNSWIndex(
                 val neighborNode = nodes[neighborId] ?: continue
                 val dist = distance(query, queryMag, neighborNode)
 
-                val worstResult = if (results.size >= ef) results.peek()!!.second else Float.MIN_VALUE
+                val worstResult = if (results.size >= ef) results.peek()!!.second else -Float.MAX_VALUE
 
                 if (results.size < ef || dist > worstResult) {
                     candidates.add(neighborId to dist)
@@ -399,6 +535,83 @@ class HNSWIndex(
         }
 
         return results.toList().sortedByDescending { it.second }
+    }
+
+    private fun searchLayerPrefix(
+        query: FloatArray,
+        entryPoint: HNSWNode,
+        ef: Int,
+        level: Int,
+        filter: VectorFilter,
+        prefixDims: Int
+    ): List<Pair<String, Float>> {
+        val visited = mutableSetOf<String>()
+        val candidates = PriorityQueue<Pair<String, Float>>(compareByDescending { it.second })
+        val results = PriorityQueue<Pair<String, Float>>(compareBy { it.second })
+
+        val initialDist = distancePrefix(query, entryPoint, prefixDims)
+        val entryPassesFilter = entryPoint.id !in tombstones && filter.matches(metadata[entryPoint.id])
+
+        candidates.add(entryPoint.id to initialDist)
+        if (entryPassesFilter) {
+            results.add(entryPoint.id to initialDist)
+        }
+        visited.add(entryPoint.id)
+
+        while (candidates.isNotEmpty()) {
+            val (currId, currDist) = candidates.poll()!!
+            if (results.size >= ef && currDist < results.peek()!!.second) break
+
+            val currNode = nodes[currId] ?: continue
+            if (level > currNode.nodeLevel) continue
+
+            for (neighborId in currNode.neighbors[level]) {
+                if (neighborId in visited) continue
+                visited.add(neighborId)
+                if (neighborId in tombstones) continue
+
+                val neighborNode = nodes[neighborId] ?: continue
+                val dist = distancePrefix(query, neighborNode, prefixDims)
+
+                val worstResult = if (results.size >= ef) results.peek()!!.second else -Float.MAX_VALUE
+
+                if (results.size < ef || dist > worstResult) {
+                    candidates.add(neighborId to dist)
+                    if (filter.matches(metadata[neighborId])) {
+                        results.add(neighborId to dist)
+                        if (results.size > ef) results.poll()
+                    }
+                }
+            }
+        }
+
+        return results.toList().sortedByDescending { it.second }
+    }
+
+    private fun distancePrefix(v: FloatArray, node: HNSWNode, prefixDims: Int): Float {
+        val rawVec = node.vector
+        if (rawVec != null) {
+            return metric.computePrefix(v, rawVec, prefixDims)
+        }
+        val qVec = node.quantizedVector
+        val quant = quantizer
+        if (qVec != null && quant != null) {
+            return quant.computeDistancePrefix(v, qVec, metric, prefixDims)
+        }
+        return -Float.MAX_VALUE
+    }
+
+    private fun computePrefixFast(query: FloatArray, queryMag64: Float, node: HNSWNode, prefixDims: Int): Float {
+        val rawVec = node.vector
+        if (rawVec != null) {
+            return if (metric == DistanceMetric.COSINE && prefixDims == 64 && node.magnitude64 > 0f && queryMag64 > 0f) {
+                val dot = com.pankaj.koredb.core.SimdVectorMath.dotProduct16(query, rawVec, prefixDims)
+                dot / (queryMag64 * node.magnitude64)
+            } else {
+                metric.computePrefix(query, rawVec, prefixDims)
+            }
+        }
+        return distancePrefix(query, node, prefixDims)
     }
 
     /**
@@ -458,14 +671,16 @@ class HNSWIndex(
     }
 
     private fun distance(v: FloatArray, mag: Float, node: HNSWNode): Float {
-        val qVec = node.quantizedVector
+        // Read vector BEFORE quantizedVector to match write order in trainQuantizerIfNeeded
         val rawVec = node.vector
-        return if (qVec != null && quantizer != null) {
-            quantizer.computeDistance(v, qVec, metric)
+        val qVec = node.quantizedVector
+        val quant = quantizer
+        return if (qVec != null && quant != null) {
+            quant.computeDistance(v, qVec, metric)
         } else if (rawVec != null) {
             metric.computeWithMagnitudes(v, mag, rawVec, node.magnitude)
         } else {
-            val decompressed = quantizer?.dequantize(qVec!!) ?: FloatArray(0)
+            val decompressed = if (qVec != null && quant != null) quant.dequantize(qVec) else FloatArray(0)
             metric.compute(v, decompressed)
         }
     }
@@ -481,10 +696,7 @@ class HNSWIndex(
             v1 != null && v2 != null -> metric.computeWithMagnitudes(v1, n1.magnitude, v2, n2.magnitude)
             v1 != null && q2 != null && quant != null -> quant.computeDistance(v1, q2, metric)
             v2 != null && q1 != null && quant != null -> quant.computeDistance(v2, q1, metric)
-            q1 != null && q2 != null && quant != null -> {
-                val decompressed = quant.dequantize(q1)
-                quant.computeDistance(decompressed, q2, metric)
-            }
+            q1 != null && q2 != null && quant != null -> quant.computeDistanceQuantized(q1, q2, metric)
             else -> {
                 val raw1 = v1 ?: quant?.dequantize(q1!!) ?: FloatArray(0)
                 val raw2 = v2 ?: quant?.dequantize(q2!!) ?: FloatArray(0)
@@ -845,4 +1057,9 @@ class HNSWIndex(
         }
     }
 }
+
+/** Convenience extension properties for Pair<String, Float> search results. */
+val Pair<String, Float>.id: String get() = first
+val Pair<String, Float>.distance: Float get() = second
+val Pair<String, Float>.score: Float get() = second
 

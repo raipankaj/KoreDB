@@ -41,6 +41,7 @@ class KoreQuery<T>(
 ) {
     private val filters = mutableListOf<(T) -> Boolean>()
     private val equalityFilters = mutableMapOf<String, String>()
+    private val inFilters = mutableMapOf<String, Set<String>>()
     private val numericRangeFilters = mutableMapOf<String, Pair<Double, Double>>()
     private var sortKey: ((T) -> Comparable<*>)? = null
     private var sortDescending = false
@@ -54,9 +55,67 @@ class KoreQuery<T>(
      */
     fun whereEq(propertyName: String, value: String): KoreQuery<T> {
         equalityFilters[propertyName] = value
+        val multiExtractor = collection.getMultiValueExtractor(propertyName)
+        if (multiExtractor != null) {
+            filters.add { doc -> multiExtractor(doc).any { it == value } }
+        } else {
+            val extractor = propertyExtractors[propertyName]
+            if (extractor != null) {
+                filters.add { doc -> extractor(doc) == value }
+            }
+        }
+        return this
+    }
+
+    /**
+     * Filters documents where the property value is contained in [values].
+     * If a secondary index exists on [propertyName], KoreDB pushes down the multi-point
+     * lookup directly to the index instead of scanning the entire collection.
+     */
+    fun whereIn(propertyName: String, values: Collection<String>): KoreQuery<T> {
+        val valueSet = if (values is Set<String>) values else values.toHashSet()
+        inFilters[propertyName] = valueSet
+        val multiExtractor = collection.getMultiValueExtractor(propertyName)
+        if (multiExtractor != null) {
+            filters.add { doc -> multiExtractor(doc).any { it in valueSet } }
+        } else {
+            val extractor = propertyExtractors[propertyName]
+            if (extractor != null) {
+                filters.add { doc -> extractor(doc) in valueSet }
+            }
+        }
+        return this
+    }
+
+    /**
+     * Filters documents where the property does not equal [value].
+     */
+    fun whereNotEq(propertyName: String, value: String): KoreQuery<T> {
         val extractor = propertyExtractors[propertyName]
         if (extractor != null) {
-            filters.add { doc -> extractor(doc) == value }
+            filters.add { doc -> extractor(doc) != value }
+        }
+        return this
+    }
+
+    /**
+     * Filters documents where the property starts with [prefix].
+     */
+    fun whereStartsWith(propertyName: String, prefix: String, ignoreCase: Boolean = false): KoreQuery<T> {
+        val extractor = propertyExtractors[propertyName]
+        if (extractor != null) {
+            filters.add { doc -> extractor(doc).startsWith(prefix, ignoreCase = ignoreCase) }
+        }
+        return this
+    }
+
+    /**
+     * Filters documents where the property contains [substring].
+     */
+    fun whereContains(propertyName: String, substring: String, ignoreCase: Boolean = true): KoreQuery<T> {
+        val extractor = propertyExtractors[propertyName]
+        if (extractor != null) {
+            filters.add { doc -> extractor(doc).contains(substring, ignoreCase = ignoreCase) }
         }
         return this
     }
@@ -93,10 +152,10 @@ class KoreQuery<T>(
     fun whereGte(propertyName: String, min: Double): KoreQuery<T> = whereBetween(propertyName, min, Double.MAX_VALUE)
 
     /** Filters documents where numeric property is strictly less than [max]. */
-    fun whereLt(propertyName: String, max: Double): KoreQuery<T> = whereBetween(propertyName, -Double.MAX_VALUE, Math.nextDown(max))
+    fun whereLt(propertyName: String, max: Double): KoreQuery<T> = whereBetween(propertyName, Double.NEGATIVE_INFINITY, Math.nextDown(max))
 
     /** Filters documents where numeric property is less than or equal to [max]. */
-    fun whereLte(propertyName: String, max: Double): KoreQuery<T> = whereBetween(propertyName, -Double.MAX_VALUE, max)
+    fun whereLte(propertyName: String, max: Double): KoreQuery<T> = whereBetween(propertyName, Double.NEGATIVE_INFINITY, max)
 
     /**
      * Filters documents where the extracted property value matches the predicate.
@@ -148,35 +207,82 @@ class KoreQuery<T>(
     /** Skips the first [n] results. */
     fun offset(n: Int): KoreQuery<T> { offsetCount = n; return this }
 
+    private fun resolveIndexedCandidates(effectiveLimitForIndex: Int? = null): List<T>? {
+        // 1. Composite Index Pushdown (highest selectivity when 2+ equality filters match a composite index)
+        if (equalityFilters.size >= 2) {
+            var bestCompName: String? = null
+            var bestCompFields: List<String>? = null
+            for ((compName, fields) in collection.getCompositeIndexes()) {
+                if (fields.all { equalityFilters.containsKey(it) }) {
+                    if (bestCompFields == null || fields.size > bestCompFields.size) {
+                        bestCompName = compName
+                        bestCompFields = fields
+                    }
+                }
+            }
+            if (bestCompName != null && bestCompFields != null) {
+                val values = bestCompFields.map { equalityFilters[it]!! }
+                return collection.getByCompositeIndex(bestCompName, values, effectiveLimitForIndex)
+            }
+        }
+
+        // 2. Single-Field or Multi-Value Equality Index Pushdown
+        for ((propName, propVal) in equalityFilters) {
+            if (collection.hasIndex(propName)) {
+                return collection.getByIndex(propName, propVal, effectiveLimitForIndex)
+            }
+        }
+
+        // 3. Multi-Point IN Index Pushdown
+        for ((propName, values) in inFilters) {
+            if (collection.hasIndex(propName)) {
+                if (values.isEmpty()) return emptyList()
+                val isMultiValue = collection.hasMultiValueIndex(propName)
+                if (isMultiValue) {
+                    val deduplicated = LinkedHashSet<T>()
+                    for (v in values) {
+                        val remaining = if (effectiveLimitForIndex != null) {
+                            (effectiveLimitForIndex - deduplicated.size).coerceAtLeast(0)
+                        } else null
+                        if (remaining != null && remaining == 0) break
+                        deduplicated.addAll(collection.getByIndex(propName, v, null))
+                        if (effectiveLimitForIndex != null && deduplicated.size >= effectiveLimitForIndex) break
+                    }
+                    return deduplicated.toList()
+                } else {
+                    val combined = ArrayList<T>()
+                    for (v in values) {
+                        val remaining = if (effectiveLimitForIndex != null) {
+                            (effectiveLimitForIndex - combined.size).coerceAtLeast(0)
+                        } else null
+                        if (remaining != null && remaining == 0) break
+                        combined.addAll(collection.getByIndex(propName, v, remaining))
+                    }
+                    return combined
+                }
+            }
+        }
+
+        // 4. Numeric Range Index Pushdown
+        for ((propName, range) in numericRangeFilters) {
+            if (collection.hasNumericIndex(propName)) {
+                return collection.getByNumericRange(propName, range.first, range.second, effectiveLimitForIndex)
+            }
+        }
+        return null
+    }
+
     /**
      * Executes the query and returns matching documents with early-termination streaming.
-     * Leverages index pushdown when equality filters match secondary indexes.
+     * Leverages index pushdown when equality, IN, or numeric range filters match secondary indexes.
      */
     fun execute(): List<T> {
-        // Calculate whether there are non-index filters that require post-filtering
         val canPushDownLimit = sortKey == null && limitCount != null
         val effectiveLimitForIndex = if (canPushDownLimit && filters.size <= 1) {
             offsetCount + limitCount!!
         } else null
 
-        // Index Pushdown Optimization (Equality or Numeric Range)
-        var indexedCandidates: List<T>? = null
-        for ((propName, propVal) in equalityFilters) {
-            if (collection.hasIndex(propName)) {
-                indexedCandidates = collection.getByIndex(propName, propVal, effectiveLimitForIndex)
-                break
-            }
-        }
-
-        if (indexedCandidates == null) {
-            for ((propName, range) in numericRangeFilters) {
-                if (collection.hasNumericIndex(propName)) {
-                    indexedCandidates = collection.getByNumericRange(propName, range.first, range.second, effectiveLimitForIndex)
-                    break
-                }
-            }
-        }
-
+        val indexedCandidates = resolveIndexedCandidates(effectiveLimitForIndex)
         var seq: Sequence<T> = indexedCandidates?.asSequence() ?: collection.asSequence()
 
         // Apply filters lazily
@@ -207,6 +313,40 @@ class KoreQuery<T>(
     }
 
     /**
+     * Returns the first matching document, or `null` if no document matches.
+     * Uses early termination when no sorting is specified.
+     */
+    fun firstOrNull(): T? {
+        val prevLimit = limitCount
+        return try {
+            limitCount = 1
+            execute().firstOrNull()
+        } finally {
+            limitCount = prevLimit
+        }
+    }
+
+    /**
+     * Returns `true` if at least one document matches the query predicates.
+     * Bypasses sorting and terminates on the first matching record.
+     */
+    fun exists(): Boolean {
+        val prevLimit = limitCount
+        val prevOffset = offsetCount
+        val prevSort = sortKey
+        return try {
+            limitCount = 1
+            offsetCount = 0
+            sortKey = null
+            execute().isNotEmpty()
+        } finally {
+            limitCount = prevLimit
+            offsetCount = prevOffset
+            sortKey = prevSort
+        }
+    }
+
+    /**
      * Converts this query into a cold [kotlinx.coroutines.flow.Flow] that emits the matching result list immediately,
      * and subsequently re-evaluates and emits whenever relevant collection mutations occur.
      */
@@ -224,23 +364,7 @@ class KoreQuery<T>(
         val builder = AggregationBuilder<T>(propertyExtractors)
         builder.block()
 
-        var indexedCandidates: List<T>? = null
-        for ((propName, propVal) in equalityFilters) {
-            if (collection.hasIndex(propName)) {
-                indexedCandidates = collection.getByIndex(propName, propVal)
-                break
-            }
-        }
-
-        if (indexedCandidates == null) {
-            for ((propName, range) in numericRangeFilters) {
-                if (collection.hasNumericIndex(propName)) {
-                    indexedCandidates = collection.getByNumericRange(propName, range.first, range.second)
-                    break
-                }
-            }
-        }
-
+        val indexedCandidates = resolveIndexedCandidates()
         var seq: Sequence<T> = indexedCandidates?.asSequence() ?: collection.asSequence()
         for (filter in filters) seq = seq.filter(filter)
 
@@ -249,29 +373,12 @@ class KoreQuery<T>(
 
     /** Returns the count of matching documents. */
     fun count(): Int {
-        if (filters.isEmpty() && equalityFilters.isEmpty() && numericRangeFilters.isEmpty()) {
+        if (filters.isEmpty() && equalityFilters.isEmpty() && inFilters.isEmpty() && numericRangeFilters.isEmpty()) {
             return collection.count()
         }
-        var indexedCandidates: List<T>? = null
-        for ((propName, propVal) in equalityFilters) {
-            if (collection.hasIndex(propName)) {
-                indexedCandidates = collection.getByIndex(propName, propVal)
-                if (filters.size <= 1) {
-                    return indexedCandidates.size
-                }
-                break
-            }
-        }
-        if (indexedCandidates == null) {
-            for ((propName, range) in numericRangeFilters) {
-                if (collection.hasNumericIndex(propName)) {
-                    indexedCandidates = collection.getByNumericRange(propName, range.first, range.second)
-                    if (filters.size <= 1) {
-                        return indexedCandidates.size
-                    }
-                    break
-                }
-            }
+        val indexedCandidates = resolveIndexedCandidates()
+        if (indexedCandidates != null && filters.size <= 1) {
+            return indexedCandidates.size
         }
         var seq: Sequence<T> = indexedCandidates?.asSequence() ?: collection.asSequence()
         for (filter in filters) seq = seq.filter(filter)

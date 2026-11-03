@@ -17,6 +17,7 @@
 package com.pankaj.koredb.graph
 
 import com.pankaj.koredb.engine.KoreDB
+import com.pankaj.koredb.memory.AtomicFact
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
@@ -65,25 +66,60 @@ class GraphStorage(val db: KoreDB) {
      */
     suspend fun putNode(node: Node) {
         val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
-        
-        val nodeKey = "g:v:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+        val escapedNodeId = escape(node.id)
+        val nodeKey = "g:v:$escapedNodeId".toByteArray(Charsets.UTF_8)
+
+        // If updating an existing node, clean up removed labels or property index entries
+        val existingBytes = db.getRaw(nodeKey)
+        if (existingBytes != null && existingBytes.isNotEmpty()) {
+            try {
+                val oldNode = json.decodeFromString<Node>(String(existingBytes, Charsets.UTF_8))
+                for (oldLabel in oldNode.labels) {
+                    val escapedOldLabel = escape(oldLabel)
+                    if (oldLabel !in node.labels) {
+                        val oldLabelKey = "g:idx:v:$escapedOldLabel:$escapedNodeId".toByteArray(Charsets.UTF_8)
+                        batch.add(Pair(oldLabelKey, KoreDB.TOMBSTONE))
+                        for ((oldPropKey, oldPropVal) in oldNode.properties) {
+                            val propKey = "g:idx:v_prop:$escapedOldLabel:${escape(oldPropKey)}:${escape(oldPropVal)}:$escapedNodeId".toByteArray(Charsets.UTF_8)
+                            val rptrKey = "g:rptr:v_prop:$escapedOldLabel:${escape(oldPropKey)}:$escapedNodeId".toByteArray(Charsets.UTF_8)
+                            batch.add(Pair(propKey, KoreDB.TOMBSTONE))
+                            batch.add(Pair(rptrKey, KoreDB.TOMBSTONE))
+                        }
+                    } else {
+                        for ((oldPropKey, oldPropVal) in oldNode.properties) {
+                            val newPropVal = node.properties[oldPropKey]
+                            if (newPropVal != oldPropVal) {
+                                val propKey = "g:idx:v_prop:$escapedOldLabel:${escape(oldPropKey)}:${escape(oldPropVal)}:$escapedNodeId".toByteArray(Charsets.UTF_8)
+                                batch.add(Pair(propKey, KoreDB.TOMBSTONE))
+                                if (newPropVal == null) {
+                                    val rptrKey = "g:rptr:v_prop:$escapedOldLabel:${escape(oldPropKey)}:$escapedNodeId".toByteArray(Charsets.UTF_8)
+                                    batch.add(Pair(rptrKey, KoreDB.TOMBSTONE))
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
         val nodeValue = json.encodeToString(node).toByteArray(Charsets.UTF_8)
-        
         batch.add(Pair(nodeKey, nodeValue))
         
         for (label in node.labels) {
+            val escapedLabel = escape(label)
             // Index nodes by their labels for category-based scans.
-            val labelKey = "g:idx:v:${escape(label)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+            val labelKey = "g:idx:v:$escapedLabel:$escapedNodeId".toByteArray(Charsets.UTF_8)
             batch.add(Pair(labelKey, PRESENCE_MARKER))
             
             // Build indices for equality-based property lookups.
             for ((key, value) in node.properties) {
+                val escapedKey = escape(key)
                 // 1. Forward Index (sidx)
-                val propKey = "g:idx:v_prop:${escape(label)}:${escape(key)}:${escape(value)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+                val propKey = "g:idx:v_prop:$escapedLabel:$escapedKey:${escape(value)}:$escapedNodeId".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(propKey, PRESENCE_MARKER))
 
                 // 2. Reverse Pointer (Truth Oracle)
-                val rptrKey = "g:rptr:v_prop:${escape(label)}:${escape(key)}:${escape(node.id)}".toByteArray(Charsets.UTF_8)
+                val rptrKey = "g:rptr:v_prop:$escapedLabel:$escapedKey:$escapedNodeId".toByteArray(Charsets.UTF_8)
                 batch.add(Pair(rptrKey, value.toByteArray(Charsets.UTF_8)))
             }
         }
@@ -384,7 +420,7 @@ class GraphStorage(val db: KoreDB) {
         val prefix = "g:idx:v:${escape(label)}:".toByteArray(Charsets.UTF_8)
         return db.getKeysByPrefixRaw(prefix).mapNotNull { keyBytes ->
             val nodeId = unescape(String(keyBytes, Charsets.UTF_8).substringAfterLast(":"))
-            getNode(nodeId)
+            getNode(nodeId)?.takeIf { label in it.labels }
         }
     }
 
@@ -420,6 +456,174 @@ class GraphStorage(val db: KoreDB) {
         return rawValues.mapNotNull { bytes ->
             if (bytes.isEmpty()) null
             else json.decodeFromString<Edge>(String(bytes, Charsets.UTF_8))
+        }
+    }
+
+    /**
+     * Traces the complete historical ancestry of a fact backward through time,
+     * following outbound [BiTemporalEdge.TYPE_SUPERSEDES] edges.
+     *
+     * @param factNodeId ID of the fact node (e.g. "l1:f1" or "f1").
+     * @return Ordered list of [Node] objects from the starting fact down to its oldest ancestor.
+     */
+    fun traceFactLineage(factNodeId: String): List<Node> {
+        val lineage = mutableListOf<Node>()
+        val startId = if (getNode(factNodeId) != null) {
+            factNodeId
+        } else if (getNode("l1:$factNodeId") != null) {
+            "l1:$factNodeId"
+        } else {
+            factNodeId
+        }
+
+        var currId: String? = startId
+        val visited = mutableSetOf<String>()
+
+        while (currId != null && visited.add(currId)) {
+            val node = getNode(currId) ?: break
+            lineage.add(node)
+            val supersededEdges = getOutboundEdges(currId, BiTemporalEdge.TYPE_SUPERSEDES)
+            currId = supersededEdges.firstOrNull()?.targetId
+        }
+        return lineage
+    }
+
+    /**
+     * Atomically invalidates an existing active fact and inserts a new superseding fact,
+     * linking them with directed [BiTemporalEdge.TYPE_SUPERSEDES] and reciprocal
+     * [BiTemporalEdge.TYPE_SUPERSEDED_BY] edges in a single atomic WAL batch.
+     *
+     * @param oldFactId Node ID or Fact ID of the fact being invalidated.
+     * @param newFact The supervening new [AtomicFact].
+     * @param nowMs Invalidation timestamp (defaults to current system time).
+     * @return The newly persisted [AtomicFact] with updated validFromMs.
+     */
+    suspend fun invalidateAndSupersedeFact(
+        oldFactId: String,
+        newFact: AtomicFact,
+        nowMs: Long = System.currentTimeMillis()
+    ): AtomicFact {
+        val resolvedOldId = if (getNode(oldFactId) != null) oldFactId else "l1:$oldFactId"
+        val oldNode = getNode(resolvedOldId)
+
+        val batch = mutableListOf<Pair<ByteArray, ByteArray>>()
+
+        // 1. Update old fact if present
+        if (oldNode != null) {
+            val updatedOldProps = oldNode.properties.toMutableMap()
+            updatedOldProps["validUntilMs"] = nowMs.toString()
+            updatedOldProps[BiTemporalEdge.PROP_VALID_UNTIL] = nowMs.toString()
+            updatedOldProps["isActive"] = "false"
+            updatedOldProps[BiTemporalEdge.PROP_IS_ACTIVE] = "false"
+            updatedOldProps["supersededByFactId"] = newFact.id
+            updatedOldProps["supersededBy"] = newFact.id
+
+            val updatedOldNode = oldNode.copy(properties = updatedOldProps)
+            val oldNodeKey = "g:v:${escape(oldNode.id)}".toByteArray(Charsets.UTF_8)
+            val oldNodeVal = json.encodeToString(updatedOldNode).toByteArray(Charsets.UTF_8)
+            batch.add(Pair(oldNodeKey, oldNodeVal))
+        }
+
+        // 2. Prepare new fact
+        val persistedNewFact = newFact.copy(
+            validFromMs = nowMs,
+            validUntilMs = Long.MAX_VALUE
+        )
+        val newNode = persistedNewFact.toGraphNode()
+        val escapedNewId = escape(newNode.id)
+        val newNodeKey = "g:v:$escapedNewId".toByteArray(Charsets.UTF_8)
+        val newNodeVal = json.encodeToString(newNode).toByteArray(Charsets.UTF_8)
+        batch.add(Pair(newNodeKey, newNodeVal))
+
+        // Index new node labels and properties
+        for (label in newNode.labels) {
+            val escapedLabel = escape(label)
+            val labelKey = "g:idx:v:$escapedLabel:$escapedNewId".toByteArray(Charsets.UTF_8)
+            batch.add(Pair(labelKey, PRESENCE_MARKER))
+
+            for ((key, value) in newNode.properties) {
+                val escapedKey = escape(key)
+                val propKey = "g:idx:v_prop:$escapedLabel:$escapedKey:${escape(value)}:$escapedNewId".toByteArray(Charsets.UTF_8)
+                batch.add(Pair(propKey, PRESENCE_MARKER))
+
+                val rptrKey = "g:rptr:v_prop:$escapedLabel:$escapedKey:$escapedNewId".toByteArray(Charsets.UTF_8)
+                batch.add(Pair(rptrKey, value.toByteArray(Charsets.UTF_8)))
+            }
+        }
+
+        // 3. Establish SUPERSEDES and SUPERSEDED_BY edges if old node exists
+        if (oldNode != null) {
+            val supersedesEdge = BiTemporalEdge(
+                sourceId = newNode.id,
+                targetId = oldNode.id,
+                type = BiTemporalEdge.TYPE_SUPERSEDES,
+                ingestedAtMs = nowMs,
+                validFromMs = nowMs,
+                validUntilMs = Long.MAX_VALUE,
+                properties = mapOf("reason" to "contradiction", "key" to newFact.contradictionKey)
+            ).toEdge()
+
+            val supersededByEdge = BiTemporalEdge(
+                sourceId = oldNode.id,
+                targetId = newNode.id,
+                type = BiTemporalEdge.TYPE_SUPERSEDED_BY,
+                ingestedAtMs = nowMs,
+                validFromMs = nowMs,
+                validUntilMs = Long.MAX_VALUE,
+                properties = mapOf("reason" to "contradiction", "key" to newFact.contradictionKey)
+            ).toEdge()
+
+            val seVal = json.encodeToString(supersedesEdge).toByteArray(Charsets.UTF_8)
+            val sbeVal = json.encodeToString(supersededByEdge).toByteArray(Charsets.UTF_8)
+
+            // Forward SUPERSEDES
+            val sOutKey = "g:e:out:${escape(supersedesEdge.sourceId)}:${escape(supersedesEdge.type)}:${escape(supersedesEdge.targetId)}".toByteArray(Charsets.UTF_8)
+            val sInKey  = "g:e:in:${escape(supersedesEdge.targetId)}:${escape(supersedesEdge.type)}:${escape(supersedesEdge.sourceId)}".toByteArray(Charsets.UTF_8)
+            batch.add(Pair(sOutKey, seVal))
+            batch.add(Pair(sInKey, seVal))
+
+            // Reciprocal SUPERSEDED_BY
+            val sbOutKey = "g:e:out:${escape(supersededByEdge.sourceId)}:${escape(supersededByEdge.type)}:${escape(supersededByEdge.targetId)}".toByteArray(Charsets.UTF_8)
+            val sbInKey  = "g:e:in:${escape(supersededByEdge.targetId)}:${escape(supersededByEdge.type)}:${escape(supersededByEdge.sourceId)}".toByteArray(Charsets.UTF_8)
+            batch.add(Pair(sbOutKey, sbeVal))
+            batch.add(Pair(sbInKey, sbeVal))
+        }
+
+        db.writeBatchRaw(batch)
+        return persistedNewFact
+    }
+
+    /**
+     * Ingests an [AtomicFact] into the property graph.
+     * If [detectContradictions] is true, checks for existing active facts matching the same
+     * contradictionKey ("$subject:$predicate"). If an existing active fact asserts a different object,
+     * atomically invalidates it and establishes SUPERSEDES edges in a single atomic batch.
+     */
+    suspend fun putFact(
+        fact: AtomicFact,
+        detectContradictions: Boolean = true,
+        nowMs: Long = System.currentTimeMillis()
+    ): AtomicFact {
+        if (!detectContradictions) {
+            putNode(fact.toGraphNode())
+            return fact
+        }
+
+        // Look for existing active facts with matching contradictionKey
+        val candidates = getNodesByProperty("L1_Fact", "contradictionKey", fact.contradictionKey)
+        val activeContradiction = candidates.firstOrNull { node ->
+            val nodeActive = node.properties["isActive"] != "false" && node.properties[BiTemporalEdge.PROP_IS_ACTIVE] != "false"
+            val validUntil = node.properties["validUntilMs"]?.toLongOrNull() ?: node.properties[BiTemporalEdge.PROP_VALID_UNTIL]?.toLongOrNull() ?: Long.MAX_VALUE
+            val isActive = nodeActive && validUntil > nowMs
+            val obj = node.properties["object"] ?: ""
+            isActive && obj != fact.`object`
+        }
+
+        return if (activeContradiction != null) {
+            invalidateAndSupersedeFact(activeContradiction.id, fact, nowMs)
+        } else {
+            putNode(fact.toGraphNode())
+            fact
         }
     }
 }

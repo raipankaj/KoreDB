@@ -185,13 +185,15 @@ class Lz4CompressionCodec : CompressionCodec {
 
             // Copy literals
             if (litLen > 0) {
-                val toCopy = minOf(litLen, origSize - destPtr)
+                val availableSrc = data.size - srcPtr
+                if (availableSrc <= 0) break
+                val toCopy = minOf(litLen, minOf(origSize - destPtr, availableSrc))
                 System.arraycopy(data, srcPtr, dest, destPtr, toCopy)
-                srcPtr += litLen
+                srcPtr += toCopy
                 destPtr += toCopy
             }
 
-            if (destPtr >= origSize || srcPtr >= data.size) break
+            if (destPtr >= origSize || srcPtr + 2 > data.size) break
 
             // Read offset
             val offset = (data[srcPtr++].toInt() and 0xFF) or ((data[srcPtr++].toInt() and 0xFF) shl 8)
@@ -219,5 +221,11 @@ class Lz4CompressionCodec : CompressionCodec {
         }
 
         return dest
+    }
+
+    companion object {
+        private val INSTANCE = Lz4CompressionCodec()
+        fun compress(data: ByteArray): ByteArray = INSTANCE.compress(data)
+        fun decompress(data: ByteArray): ByteArray = INSTANCE.decompress(data)
     }
 }

@@ -179,6 +179,7 @@ class KoreDatabase(
             val koreSerializer = KotlinxKoreSerializer(serializer)
             val col = KoreCollection(name, engine, koreSerializer)
             col.cdcManager = cdcManager
+            com.pankaj.koredb.core.KoreAnnotationIndexer.autoConfigure(col, serializer)
             col
         } as KoreCollection<T>
     }
@@ -202,6 +203,7 @@ class KoreDatabase(
             val koreSerializer = com.pankaj.koredb.core.CborKoreSerializer(serializer)
             val col = KoreCollection(name, engine, koreSerializer)
             col.cdcManager = cdcManager
+            com.pankaj.koredb.core.KoreAnnotationIndexer.autoConfigure(col, serializer)
             col
         } as KoreCollection<T>
     }
@@ -318,6 +320,18 @@ class KoreDatabase(
         }
     }
 
+    /**
+     * Creates or retrieves a [KoreVectorCollection] specifying dimensions and metric.
+     */
+    fun vectorCollection(
+        name: String,
+        dimensions: Int = 0,
+        metric: com.pankaj.koredb.hnsw.DistanceMetric = com.pankaj.koredb.hnsw.DistanceMetric.COSINE
+    ): KoreVectorCollection = vectorCollection(name) {
+        if (dimensions > 0) this.dimensions = dimensions
+        this.metric = metric
+    }
+
     val mvccManager = com.pankaj.koredb.engine.mvcc.MvccManager()
 
     /**
@@ -395,6 +409,85 @@ class KoreDatabase(
      */
     fun graphVectorBridge(vectorCollection: com.pankaj.koredb.core.KoreVectorCollection): com.pankaj.koredb.bridge.GraphVectorBridge {
         return com.pankaj.koredb.bridge.GraphVectorBridge(graph(), vectorCollection)
+    }
+
+    /**
+     * Creates or retrieves a 4-Layer Cognitive Memory Pyramid ([com.pankaj.koredb.memory.KoreMemoryPyramid]).
+     * Coordinates L0 raw LZ4 evidence, L1 dual-indexed atomic facts, L2 scenario clusters, and L3 persona/invariants.
+     */
+    fun memoryPyramid(
+        name: String = "default"
+    ): com.pankaj.koredb.memory.KoreMemoryPyramid {
+        val evidenceCol = binaryCollection<com.pankaj.koredb.memory.L0Evidence>("koredb_memory_${name}_l0_evidence")
+        val vecCol = vectorCollection("koredb_memory_${name}_vectors") {
+            dimensions = 0
+            metric = com.pankaj.koredb.hnsw.DistanceMetric.COSINE
+        }
+        val fts = com.pankaj.koredb.fts.FtsIndex("koredb_memory_${name}_facts", engine)
+        return com.pankaj.koredb.memory.KoreMemoryPyramid(
+            db = this,
+            graph = graph(),
+            evidenceCollection = evidenceCol,
+            vectorCollection = vecCol,
+            ftsIndex = fts
+        )
+    }
+
+    /**
+     * Creates an Inspection Mirror ([com.pankaj.koredb.memory.KoreMemoryInspector]) for generating Markdown reports
+     * and live Mermaid visualizations of the cognitive memory state.
+     */
+    fun memoryInspector(
+        pyramid: com.pankaj.koredb.memory.KoreMemoryPyramid? = null
+    ): com.pankaj.koredb.memory.KoreMemoryInspector {
+        return com.pankaj.koredb.memory.KoreMemoryInspector(pyramid ?: memoryPyramid())
+    }
+
+    /**
+     * Creates or retrieves an On-Device Semantic LLM Response Cache ([com.pankaj.koredb.ai.KoreSemanticCache]).
+     *
+     * @param name Logical name for the semantic cache (default `"semantic_cache"`).
+     * @param dimensions Embedding dimensionality (optional; required if `quantization = true`).
+     * @param similarityThreshold Minimum cosine similarity for a cache hit (default `0.90f`).
+     * @param defaultTtlMs Optional default TTL in milliseconds for cached LLM responses.
+     */
+    fun semanticCache(
+        name: String = "semantic_cache",
+        dimensions: Int = 0,
+        similarityThreshold: Float = 0.90f,
+        defaultTtlMs: Long? = null
+    ): com.pankaj.koredb.ai.KoreSemanticCache {
+        val entryCol = binaryCollection<com.pankaj.koredb.ai.SemanticCacheEntry>("scache_doc_$name")
+        val vecCol = vectorCollection("scache_vec_$name") {
+            this.dimensions = dimensions
+            this.metric = com.pankaj.koredb.hnsw.DistanceMetric.COSINE
+        }
+        return com.pankaj.koredb.ai.KoreSemanticCache(
+            entryCollection = entryCol,
+            vectorCollection = vecCol,
+            defaultSimilarityThreshold = similarityThreshold,
+            defaultTtlMs = defaultTtlMs
+        )
+    }
+
+    /**
+     * Creates a zero-dependency On-Device Embedding Pipeline ([com.pankaj.koredb.ai.KoreEmbeddingPipeline])
+     * with LRU caching, Matryoshka (MRL) dimension slicing, and 16-lane L2 normalization.
+     */
+    fun embeddingPipeline(
+        targetDimensions: Int? = null,
+        normalizeL2: Boolean = true,
+        maxCacheEntries: Int = 2048,
+        batchEmbedder: (suspend (List<String>) -> List<FloatArray>)? = null,
+        embedder: suspend (String) -> FloatArray
+    ): com.pankaj.koredb.ai.KoreEmbeddingPipeline {
+        return com.pankaj.koredb.ai.KoreEmbeddingPipeline(
+            targetDimensions = targetDimensions,
+            normalizeL2 = normalizeL2,
+            maxCacheEntries = maxCacheEntries,
+            batchEmbedder = batchEmbedder,
+            embedder = embedder
+        )
     }
 
     /**

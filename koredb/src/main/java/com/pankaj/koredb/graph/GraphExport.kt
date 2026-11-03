@@ -155,6 +155,117 @@ object GraphExport {
         return sb.toString()
     }
 
+    /**
+     * Exports a subgraph to valid Mermaid markdown syntax.
+     *
+     * @param storage The graph storage engine.
+     * @param nodeIds Nodes to include in the diagram.
+     * @param edgeType Optional edge type filter (null = all edge types).
+     * @param direction Diagram direction: "TD" (Top-Down), "LR" (Left-Right), "BT", "RL".
+     * @param groupBySubgraphs Whether to group nodes into subgraphs by their layer/label.
+     * @param maxLabelLength Maximum character length for node labels before truncation.
+     * @return Valid Mermaid markdown code block string.
+     */
+    fun toMermaid(
+        storage: GraphStorage,
+        nodeIds: List<String>,
+        edgeType: String? = null,
+        direction: String = "TD",
+        groupBySubgraphs: Boolean = true,
+        maxLabelLength: Int = 40
+    ): String {
+        if (nodeIds.isEmpty()) {
+            return "graph $direction\n  %% empty"
+        }
+
+        val sb = StringBuilder()
+        sb.appendLine("graph $direction")
+        val nodeSet = nodeIds.toSet()
+
+        fun sanitizeId(id: String): String = id.replace(Regex("[^a-zA-Z0-9_]"), "_")
+        fun escapeLabel(text: String): String {
+            val truncated = if (text.length > maxLabelLength) text.substring(0, maxLabelLength) + "..." else text
+            return truncated
+                .replace("\"", "#quot;")
+                .replace("<", "#lt;")
+                .replace(">", "#gt;")
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .replace("\t", " ")
+        }
+
+        val nodes = nodeIds.map { id -> id to storage.getNode(id) }
+
+        if (groupBySubgraphs) {
+            val groups = nodes.groupBy { (id, node) ->
+                when {
+                    node?.labels?.any { it == "L3_Persona" || it.startsWith("L3_Persona") } == true || id.startsWith("l3:persona") ->
+                        "L3_Persona" to "L3: Persona"
+                    node?.labels?.any { it == "L3_Invariant" || it.startsWith("L3_Invariant") } == true || id.startsWith("l3:inv") ->
+                        "L3_Invariant" to "L3: Invariants"
+                    node?.labels?.any { it.startsWith("L3") } == true || id.startsWith("l3:") ->
+                        "L3_Persona_Invariants" to "L3: Persona & Invariants"
+                    node?.labels?.any { it.startsWith("L2") } == true || id.startsWith("l2:") ->
+                        "L2_Scenario" to "L2: Scenario Clusters"
+                    node?.labels?.any { it.startsWith("L1") } == true || id.startsWith("l1:") ->
+                        "L1_Fact" to "L1: Atomic Facts"
+                    node?.labels?.any { it.startsWith("L0") } == true || id.startsWith("l0:") ->
+                        "L0_Evidence" to "L0: Raw Evidence"
+                    node != null && node.labels.isNotEmpty() ->
+                        sanitizeId(node.labels.first()) to node.labels.first()
+                    else -> "General" to "Nodes"
+                }
+            }
+
+            for ((groupKey, groupNodes) in groups) {
+                val (groupId, groupTitle) = groupKey
+                sb.appendLine("  subgraph $groupId[\"$groupTitle\"]")
+                for ((id, node) in groupNodes) {
+                    val rawText = node?.properties?.get("text")
+                        ?: node?.properties?.get("title")
+                        ?: node?.properties?.get("statement")
+                        ?: node?.properties?.get("name")
+                        ?: id
+                    val safeId = sanitizeId(id)
+                    val label = escapeLabel(rawText)
+                    sb.appendLine("    $safeId[\"$label\"]")
+                }
+                sb.appendLine("  end")
+            }
+        } else {
+            for ((id, node) in nodes) {
+                val rawText = node?.properties?.get("text")
+                    ?: node?.properties?.get("title")
+                    ?: node?.properties?.get("statement")
+                    ?: node?.properties?.get("name")
+                    ?: id
+                val safeId = sanitizeId(id)
+                val label = escapeLabel(rawText)
+                sb.appendLine("  $safeId[\"$label\"]")
+            }
+        }
+
+        // Edges
+        for (sourceId in nodeIds) {
+            val edges = if (edgeType != null) {
+                storage.getOutboundEdges(sourceId, edgeType)
+            } else {
+                storage.getAllOutboundEdges(sourceId)
+            }
+            for (edge in edges) {
+                if (edge.targetId !in nodeSet) continue
+                val safeSource = sanitizeId(edge.sourceId)
+                val safeTarget = sanitizeId(edge.targetId)
+                val weight = edge.properties["weight"]
+                val edgeLabel = if (weight != null) "${edge.type} ($weight)" else edge.type
+                val cleanEdgeLabel = edgeLabel.replace("\"", "")
+                sb.appendLine("  $safeSource -->|$cleanEdgeLabel| $safeTarget")
+            }
+        }
+
+        return sb.toString()
+    }
+
     private fun escapeXml(s: String): String = s
         .replace("&", "&amp;")
         .replace("<", "&lt;")

@@ -232,6 +232,185 @@ object GraphAlgorithms {
         return ranks
     }
 
+    /**
+     * Executes HippoRAG 2 Personalized PageRank (PPR) with hub-noise elimination.
+     *
+     * Propagates activation from [seedScores] across the graph, damping transitions into
+     * high-degree hub nodes to prevent generic concepts from drowning out multi-hop reasoning.
+     *
+     * @param storage The graph storage engine.
+     * @param seedScores Initial relevance scores from RRF (seedNodeId -> score).
+     * @param edgeTypes Optional filter for edge types (null = traverse all edges).
+     * @param maxHops Subgraph BFS depth from seeds (default 2).
+     * @param iterations Maximum power iteration steps (default 20).
+     * @param dampingFactor Probability of traversing links vs teleporting to seeds (default 0.85).
+     * @param hubDampingBeta Degree normalization exponent β in [0.0, 1.0] (default 0.5 for symmetric damping).
+     * @param tolerance L1 convergence threshold (default 1e-5).
+     * @param bidirectional If true, traverses both outbound and inbound edges as candidate transitions.
+     * @return Map of nodeId to converged personalized PageRank score, sorted descending.
+     */
+    fun personalizedPageRank(
+        storage: GraphStorage,
+        seedScores: Map<String, Double>,
+        edgeTypes: Collection<String>? = null,
+        maxHops: Int = 2,
+        iterations: Int = 20,
+        dampingFactor: Double = 0.85,
+        hubDampingBeta: Double = 0.5,
+        tolerance: Double = 1e-5,
+        bidirectional: Boolean = false
+    ): Map<String, Double> {
+        if (seedScores.isEmpty()) return emptyMap()
+
+        // 1. Normalize seed scores into teleportation probability vector p_0
+        val totalSeedScore = seedScores.values.sum()
+        if (totalSeedScore <= 0.0) return emptyMap()
+        val p0 = seedScores.mapValues { it.value / totalSeedScore }
+
+        // 2. Extract active H-hop subgraph around seed nodes via BFS
+        val activeNodes = mutableSetOf<String>()
+        activeNodes.addAll(seedScores.keys)
+
+        val edgeTypeSet = edgeTypes?.toSet()
+        var frontier = seedScores.keys.toSet()
+        for (h in 0 until maxHops) {
+            val nextFrontier = mutableSetOf<String>()
+            for (id in frontier) {
+                val outTargets = if (edgeTypeSet == null) {
+                    storage.getAllOutboundEdges(id).map { it.targetId }
+                } else {
+                    edgeTypeSet.flatMap { storage.getOutboundTargetIds(id, it) }
+                }
+                val inSources = if (edgeTypeSet == null) {
+                    storage.getAllInboundEdges(id).map { it.sourceId }
+                } else {
+                    edgeTypeSet.flatMap { storage.getInboundSourceIds(id, it) }
+                }
+                for (neighbor in (outTargets + inSources)) {
+                    if (activeNodes.add(neighbor)) {
+                        nextFrontier.add(neighbor)
+                    }
+                }
+            }
+            frontier = nextFrontier
+            if (frontier.isEmpty()) break
+        }
+
+        val n = activeNodes.size
+        if (n == 0) return emptyMap()
+
+        // 3. Compute in-degree and adjacency within active subgraph
+        val inDegree = mutableMapOf<String, Int>()
+        val adjacency = mutableMapOf<String, List<Pair<String, Double>>>()
+
+        for (nodeId in activeNodes) {
+            val outbound = if (edgeTypeSet == null) {
+                storage.getAllOutboundEdges(nodeId).filter { it.targetId in activeNodes }
+            } else {
+                edgeTypeSet.flatMap { storage.getOutboundEdges(nodeId, it) }.filter { it.targetId in activeNodes }
+            }
+
+            val edges = if (bidirectional) {
+                val inbound = if (edgeTypeSet == null) {
+                    storage.getAllInboundEdges(nodeId).filter { it.sourceId in activeNodes }
+                } else {
+                    edgeTypeSet.flatMap { storage.getInboundEdges(nodeId, it) }.filter { it.sourceId in activeNodes }
+                }
+                val mappedInbound = inbound.map { Edge(sourceId = nodeId, targetId = it.sourceId, type = it.type, properties = it.properties) }
+                outbound + mappedInbound
+            } else {
+                outbound
+            }
+
+            val edgePairs = edges.map { edge ->
+                val w = edge.properties["weight"]?.toDoubleOrNull() ?: 1.0
+                edge.targetId to w
+            }
+            adjacency[nodeId] = edgePairs
+            for ((target, _) in edgePairs) {
+                inDegree[target] = (inDegree[target] ?: 0) + 1
+            }
+        }
+
+        // 4. Construct hub-noise damped transition matrix T
+        // W(u -> v) = A_uv / (d_in(v)^beta)
+        // T_vu = W(u -> v) / sum_v' W(u -> v')
+        val transitionProb = mutableMapOf<String, MutableMap<String, Double>>()
+        val danglingNodes = mutableSetOf<String>()
+
+        for (u in activeNodes) {
+            val outEdges = adjacency[u] ?: emptyList()
+            if (outEdges.isEmpty()) {
+                danglingNodes.add(u)
+                continue
+            }
+
+            var weightSum = 0.0
+            val weights = mutableMapOf<String, Double>()
+            for ((v, rawWeight) in outEdges) {
+                val degV = (inDegree[v] ?: 1).coerceAtLeast(1)
+                val dampedW = rawWeight / Math.pow(degV.toDouble(), hubDampingBeta)
+                weights[v] = (weights[v] ?: 0.0) + dampedW
+                weightSum += dampedW
+            }
+
+            if (weightSum > 0.0) {
+                val probs = mutableMapOf<String, Double>()
+                for ((v, w) in weights) {
+                    probs[v] = w / weightSum
+                }
+                transitionProb[u] = probs
+            } else {
+                danglingNodes.add(u)
+            }
+        }
+
+        // Invert transition matrix for fast pull-based PageRank: v -> list of (u, T_vu)
+        val incomingTransitions = mutableMapOf<String, MutableList<Pair<String, Double>>>()
+        for ((u, targets) in transitionProb) {
+            for ((v, prob) in targets) {
+                incomingTransitions.getOrPut(v) { mutableListOf() }.add(u to prob)
+            }
+        }
+
+        // 5. Power iteration
+        var p = HashMap<String, Double>(n)
+        for (node in activeNodes) {
+            p[node] = p0[node] ?: 0.0
+        }
+
+        for (iter in 0 until iterations) {
+            val nextP = HashMap<String, Double>(n)
+            var danglingSum = 0.0
+            for (u in danglingNodes) {
+                danglingSum += p[u] ?: 0.0
+            }
+
+            var diff = 0.0
+            for (v in activeNodes) {
+                var inSum = 0.0
+                val inList = incomingTransitions[v]
+                if (inList != null) {
+                    for (edge in inList) {
+                        val u = edge.first
+                        val prob = edge.second
+                        inSum += (p[u] ?: 0.0) * prob
+                    }
+                }
+
+                val tele = p0[v] ?: 0.0
+                val newRank = (dampingFactor * (inSum + (danglingSum * tele))) + ((1.0 - dampingFactor) * tele)
+                nextP[v] = newRank
+                diff += kotlin.math.abs(newRank - (p[v] ?: 0.0))
+            }
+
+            p = nextP
+            if (diff < tolerance) break
+        }
+
+        return p.entries.sortedByDescending { it.value }.associate { it.key to it.value }
+    }
+
     // ========================================================================
     // A* PATHFINDING
     // ========================================================================
@@ -378,47 +557,72 @@ object GraphAlgorithms {
      * @param edgeType The relationship type defining connections.
      * @param iterations Maximum number of optimization passes.
      * @return A map of nodeId to communityId.
+     * Detects communities within a set of nodes using a Louvain-inspired algorithm,
+     * supporting multi-relational graphs and weighted edges.
+     *
+     * The algorithm iteratively moves nodes between communities to maximize connectivity.
+     *
+     * @param storage The graph storage engine.
+     * @param nodeIds The nodes to partition into communities.
+     * @param edgeTypes The relationship types to consider (null = all relationship types).
+     * @param weightProperty The edge property to use as connection weight (default: "weight", null = 1.0).
+     * @param iterations Maximum number of optimization passes.
+     * @return A map of nodeId to communityId (0-indexed).
      */
     fun detectCommunities(
         storage: GraphStorage,
         nodeIds: List<String>,
-        edgeType: String,
+        edgeTypes: Collection<String>? = null,
+        weightProperty: String? = "weight",
         iterations: Int = 10
     ): Map<String, Int> {
         if (nodeIds.isEmpty()) return emptyMap()
 
         val nodeSet = nodeIds.toSet()
-        // Initialize: each node in its own community
         val community = mutableMapOf<String, Int>()
         nodeIds.forEachIndexed { i, id -> community[id] = i }
 
-        // Pre-compute adjacency (only within the node set)
-        val adjacency = mutableMapOf<String, List<String>>()
-        for (nodeId in nodeIds) {
-            val neighbors = storage.getOutboundTargetIds(nodeId, edgeType).filter { it in nodeSet } +
-                            storage.getInboundSourceIds(nodeId, edgeType).filter { it in nodeSet }
-            adjacency[nodeId] = neighbors.distinct()
-        }
+        val edgeTypeSet = edgeTypes?.toSet()
 
-        val totalEdges = adjacency.values.sumOf { it.size }.toDouble().coerceAtLeast(1.0)
+        // Pre-compute weighted adjacency (bidirectional connectivity within nodeSet)
+        val adjacency = mutableMapOf<String, MutableMap<String, Double>>()
+        for (nodeId in nodeIds) {
+            val neighborWeights = adjacency.getOrPut(nodeId) { mutableMapOf() }
+
+            val outEdges = if (edgeTypeSet == null) {
+                storage.getAllOutboundEdges(nodeId).filter { it.targetId in nodeSet }
+            } else {
+                edgeTypeSet.flatMap { storage.getOutboundEdges(nodeId, it) }.filter { it.targetId in nodeSet }
+            }
+
+            for (edge in outEdges) {
+                val w = if (weightProperty != null) {
+                    edge.properties[weightProperty]?.toDoubleOrNull() ?: 1.0
+                } else 1.0
+                neighborWeights[edge.targetId] = (neighborWeights[edge.targetId] ?: 0.0) + w
+                val revWeights = adjacency.getOrPut(edge.targetId) { mutableMapOf() }
+                revWeights[nodeId] = (revWeights[nodeId] ?: 0.0) + w
+            }
+        }
 
         for (iter in 0 until iterations) {
             var changed = false
 
             for (nodeId in nodeIds.shuffled()) {
                 val neighbors = adjacency[nodeId] ?: continue
-                val currentComm = community[nodeId]!!
+                if (neighbors.isEmpty()) continue
+                val currentComm = community[nodeId] ?: continue
 
-                // Count connections to each neighboring community
-                val commConnections = mutableMapOf<Int, Int>()
-                for (neighbor in neighbors) {
+                // Sum connection weights to each neighboring community
+                val commConnections = mutableMapOf<Int, Double>()
+                for ((neighbor, weight) in neighbors) {
                     val neighborComm = community[neighbor] ?: continue
-                    commConnections[neighborComm] = (commConnections[neighborComm] ?: 0) + 1
+                    commConnections[neighborComm] = (commConnections[neighborComm] ?: 0.0) + weight
                 }
 
-                // Find the community with the most connections
+                val currentCommWeight = commConnections[currentComm] ?: 0.0
                 val bestComm = commConnections.maxByOrNull { it.value }
-                if (bestComm != null && bestComm.key != currentComm && bestComm.value > (commConnections[currentComm] ?: 0)) {
+                if (bestComm != null && bestComm.key != currentComm && bestComm.value > currentCommWeight) {
                     community[nodeId] = bestComm.key
                     changed = true
                 }
@@ -430,8 +634,24 @@ object GraphAlgorithms {
         // Normalize community IDs to 0..N
         val uniqueComms = community.values.distinct().sorted()
         val commMap = uniqueComms.mapIndexed { i, c -> c to i }.toMap()
-        return community.mapValues { commMap[it.value]!! }
+        return community.mapValues { commMap[it.value] ?: 0 }
     }
+
+    /**
+     * Backward-compatible overload for single edge type.
+     */
+    fun detectCommunities(
+        storage: GraphStorage,
+        nodeIds: List<String>,
+        edgeType: String,
+        iterations: Int = 10
+    ): Map<String, Int> = detectCommunities(
+        storage = storage,
+        nodeIds = nodeIds,
+        edgeTypes = listOf(edgeType),
+        weightProperty = null,
+        iterations = iterations
+    )
 
     // ========================================================================
     // CONNECTED COMPONENTS

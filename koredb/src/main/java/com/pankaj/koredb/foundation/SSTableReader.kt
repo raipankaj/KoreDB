@@ -54,6 +54,7 @@ class SSTableReader(val file: File, var blockCache: BlockCache? = null) : Closea
     private val blockKeys = mutableListOf<ByteArray>()
     private val blockOffsets = mutableListOf<Int>()
     val compressionCodec: com.pankaj.koredb.compression.CompressionCodec
+    private val fileCachePrefix: String = "${file.name}:"
 
     init {
         raf = RandomAccessFile(file, "r")
@@ -160,61 +161,107 @@ class SSTableReader(val file: File, var blockCache: BlockCache? = null) : Closea
 
     fun find(targetKey: ByteArray): ByteArray? {
         if (!bloomFilter.mightContain(targetKey)) return null
-        val localBuffer = getBufferSnapshot()
-        val startOffset = findBlockStartOffset(targetKey)
-        localBuffer.position(startOffset)
+        if (!retain()) return null
+        try {
+            val localBuffer = getBufferSnapshot()
+            val startOffset = findBlockStartOffset(targetKey)
+            localBuffer.position(startOffset)
 
-        while (localBuffer.position() < dataEndOffset) {
-            val recordPos = localBuffer.position()
-            val keySize = localBuffer.getInt()
-            val valueSize = localBuffer.getInt()
-            val keyOffset = recordPos + 8
+            while (localBuffer.position() < dataEndOffset) {
+                val recordPos = localBuffer.position()
+                val keySize = localBuffer.getInt()
+                val valueSize = localBuffer.getInt()
+                val keyOffset = recordPos + 8
 
-            val cmp = compareBufferWithKey(localBuffer, keyOffset, keySize, targetKey)
-            if (cmp == 0) {
-                val cacheKey = "${file.name}:$recordPos"
-                val cached = blockCache?.get(cacheKey)
-                if (cached != null) return cached
+                val cmp = compareBufferWithKey(localBuffer, keyOffset, keySize, targetKey)
+                if (cmp == 0) {
+                    val cacheKey = "$fileCachePrefix$recordPos"
+                    val cached = blockCache?.get(cacheKey)
+                    if (cached != null) return cached
 
-                localBuffer.position(keyOffset + keySize)
-                val valueBytes = ByteArray(valueSize)
-                localBuffer.get(valueBytes)
-                val decompressed = if (SSTable.isVectorKey(targetKey)) valueBytes else decompressValue(valueBytes)
-                blockCache?.put(cacheKey, decompressed)
-                return decompressed
-            } else if (cmp > 0) {
-                break
-            } else {
-                localBuffer.position(keyOffset + keySize + valueSize)
+                    localBuffer.position(keyOffset + keySize)
+                    val valueBytes = ByteArray(valueSize)
+                    localBuffer.get(valueBytes)
+                    val decompressed = if (SSTable.isVectorKey(targetKey)) valueBytes else decompressValue(valueBytes)
+                    blockCache?.put(cacheKey, decompressed)
+                    return decompressed
+                } else if (cmp > 0) {
+                    break
+                } else {
+                    localBuffer.position(keyOffset + keySize + valueSize)
+                }
             }
+            return null
+        } finally {
+            release()
         }
-        return null
     }
 
     /**
-     * Compares two sections of different buffers without allocations.
+     * Compares two sections of different buffers without allocations using 8-byte word comparisons.
      */
     fun compareBuffers(b1: java.nio.ByteBuffer, off1: Int, len1: Int, b2: java.nio.ByteBuffer, off2: Int, len2: Int): Int {
         val minLen = minOf(len1, len2)
-        for (i in 0 until minLen) {
+        var i = 0
+        val longLimit = minLen - 7
+        while (i < longLimit) {
+            val v1 = java.lang.Long.reverseBytes(b1.getLong(off1 + i))
+            val v2 = java.lang.Long.reverseBytes(b2.getLong(off2 + i))
+            if (v1 != v2) {
+                val xor = v1 xor v2
+                val diffByteIndex = java.lang.Long.numberOfLeadingZeros(xor) ushr 3
+                val a = b1.get(off1 + i + diffByteIndex).toInt() and 0xFF
+                val b = b2.get(off2 + i + diffByteIndex).toInt() and 0xFF
+                return a - b
+            }
+            i += 8
+        }
+        while (i < minLen) {
             val v1 = b1.get(off1 + i).toInt() and 0xFF
             val v2 = b2.get(off2 + i).toInt() and 0xFF
             if (v1 != v2) return v1 - v2
+            i++
         }
         return len1 - len2
     }
 
     /**
-     * Compares a section of the buffer with a given key without allocations.
+     * Compares a section of the buffer with a given key without allocations using 8-byte word comparisons.
      */
     fun compareBufferWithKey(buffer: java.nio.ByteBuffer, offset: Int, size: Int, key: ByteArray): Int {
         val minLen = minOf(size, key.size)
-        for (i in 0 until minLen) {
+        var i = 0
+        val longLimit = minLen - 7
+        while (i < longLimit) {
+            val lv = java.lang.Long.reverseBytes(buffer.getLong(offset + i))
+            val rv = readLongBigEndian(key, i)
+            if (lv != rv) {
+                val xor = lv xor rv
+                val diffByteIndex = java.lang.Long.numberOfLeadingZeros(xor) ushr 3
+                val a = buffer.get(offset + i + diffByteIndex).toInt() and 0xFF
+                val b = key[i + diffByteIndex].toInt() and 0xFF
+                return a.compareTo(b)
+            }
+            i += 8
+        }
+        while (i < minLen) {
             val a = buffer.get(offset + i).toInt() and 0xFF
             val b = key[i].toInt() and 0xFF
             if (a != b) return a.compareTo(b)
+            i++
         }
         return size.compareTo(key.size)
+    }
+
+    private fun readLongBigEndian(bytes: ByteArray, offset: Int): Long {
+        return ((bytes[offset].toLong() and 0xFFL) shl 56) or
+                ((bytes[offset + 1].toLong() and 0xFFL) shl 48) or
+                ((bytes[offset + 2].toLong() and 0xFFL) shl 40) or
+                ((bytes[offset + 3].toLong() and 0xFFL) shl 32) or
+                ((bytes[offset + 4].toLong() and 0xFFL) shl 24) or
+                ((bytes[offset + 5].toLong() and 0xFFL) shl 16) or
+                ((bytes[offset + 6].toLong() and 0xFFL) shl 8) or
+                (bytes[offset + 7].toLong() and 0xFFL)
     }
 
     fun getBufferSnapshot(): java.nio.ByteBuffer {
@@ -226,53 +273,58 @@ class SSTableReader(val file: File, var blockCache: BlockCache? = null) : Closea
     }
 
     fun findTopVectors(prefix: ByteArray, query: FloatArray, limit: Int): List<Pair<ByteArray, Float>> {
-        val topKHeap = PriorityQueue<Pair<Int, Float>>(compareBy { it.second })
-        val queryMag = VectorMath.getMagnitude(query)
-        val prefixLen = prefix.size
+        if (!retain()) return emptyList()
+        try {
+            val topKHeap = PriorityQueue<Pair<Int, Float>>(compareBy { it.second })
+            val queryMag = VectorMath.getMagnitude(query)
+            val prefixLen = prefix.size
 
-        val localBuffer = getBufferSnapshot()
-        val startOffset = findBlockStartOffset(prefix)
-        localBuffer.position(startOffset)
+            val localBuffer = getBufferSnapshot()
+            val startOffset = findBlockStartOffset(prefix)
+            localBuffer.position(startOffset)
 
-        while (localBuffer.position() < dataEndOffset) {
-            val startPos = localBuffer.position()
-            val keySize = localBuffer.getInt()
-            val valueSize = localBuffer.getInt()
-            
-            var match = keySize >= prefixLen
-            if (match) {
-                for (i in 0 until prefixLen) {
-                    val bFile = localBuffer.get()
-                    if (bFile != prefix[i]) {
-                        match = false
-                        if ((bFile.toInt() and 0xFF) > (prefix[i].toInt() and 0xFF)) {
-                             return finalizeResults(topKHeap, localBuffer)
-                        }
-                        break
-                    }
-                }
-            }
-            if (match) {
-                val valueOffset = startPos + 8 + keySize
-                val storedMag = localBuffer.getFloat(valueOffset)
-                val vectorLength = (valueSize - 4) / 4
-                if (query.size == vectorLength) {
-                    val dot = VectorMath.dotProduct(query, localBuffer, valueOffset + 4, vectorLength)
-                    val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
-
-                    if (score > -1.5f) {
-                        if (topKHeap.size < limit) {
-                            topKHeap.add(Pair(startPos, score))
-                        } else if (score > topKHeap.peek()!!.second) {
-                            topKHeap.poll()
-                            topKHeap.add(Pair(startPos, score))
+            while (localBuffer.position() < dataEndOffset) {
+                val startPos = localBuffer.position()
+                val keySize = localBuffer.getInt()
+                val valueSize = localBuffer.getInt()
+                
+                var match = keySize >= prefixLen
+                if (match) {
+                    for (i in 0 until prefixLen) {
+                        val bFile = localBuffer.get()
+                        if (bFile != prefix[i]) {
+                            match = false
+                            if ((bFile.toInt() and 0xFF) > (prefix[i].toInt() and 0xFF)) {
+                                 return finalizeResults(topKHeap, localBuffer)
+                            }
+                            break
                         }
                     }
                 }
+                if (match) {
+                    val valueOffset = startPos + 8 + keySize
+                    val storedMag = localBuffer.getFloat(valueOffset)
+                    val vectorLength = (valueSize - 4) / 4
+                    if (query.size == vectorLength) {
+                        val dot = VectorMath.dotProduct(query, localBuffer, valueOffset + 4, vectorLength)
+                        val score = if (queryMag == 0f || storedMag == 0f) 0f else dot / (queryMag * storedMag)
+
+                        if (score > -1.5f) {
+                            if (topKHeap.size < limit) {
+                                topKHeap.add(Pair(startPos, score))
+                            } else if (score > topKHeap.peek()!!.second) {
+                                topKHeap.poll()
+                                topKHeap.add(Pair(startPos, score))
+                            }
+                        }
+                    }
+                }
+                localBuffer.position(startPos + 8 + keySize + valueSize)
             }
-            localBuffer.position(startPos + 8 + keySize + valueSize)
+            return finalizeResults(topKHeap, localBuffer)
+        } finally {
+            release()
         }
-        return finalizeResults(topKHeap, localBuffer)
     }
 
     private fun finalizeResults(
@@ -292,13 +344,123 @@ class SSTableReader(val file: File, var blockCache: BlockCache? = null) : Closea
         return finalResults.reversed()
     }
 
+    /**
+     * Atomic reference counter managing off-heap MappedByteBuffer lifetime.
+     * Initialized to 1, representing the database engine's ownership reference.
+     */
+    private val refCount = java.util.concurrent.atomic.AtomicInteger(1)
+
+    /**
+     * Flag indicating whether this SSTable has been obsoleted by compaction.
+     * When true, the physical file will be deleted when refCount reaches 0.
+     */
+    private val isObsolete = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Guard ensuring close() decrements the database reference at most once.
+     */
+    private val isClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Guard ensuring off-heap buffer unmapping and file deletion execute at most once.
+     */
+    private val isDisposed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Acquires a lease on this reader.
+     *
+     * @return true if the lease was acquired; false if this reader has already been disposed.
+     */
+    fun retain(): Boolean {
+        while (true) {
+            val current = refCount.get()
+            if (current <= 0) {
+                return false
+            }
+            if (refCount.compareAndSet(current, current + 1)) {
+                return true
+            }
+        }
+    }
+
+    /**
+     * Releases a lease on this reader. When all leases are released (refCount reaches 0),
+     * off-heap memory is unmapped, file channels are closed, and if marked obsolete,
+     * the underlying file is deleted from disk.
+     */
+    fun release() {
+        val remaining = refCount.decrementAndGet()
+        if (remaining == 0) {
+            dispose()
+        } else if (remaining < 0) {
+            refCount.set(0)
+        }
+    }
+
+    /**
+     * Marks this SSTable as obsolete (superseded by a newly compacted segment).
+     * When refCount reaches 0, the physical file will be deleted from disk.
+     */
+    fun markObsolete() {
+        isObsolete.set(true)
+    }
+
+    val isObsoleteReader: Boolean
+        get() = isObsolete.get()
+
+    private fun dispose() {
+        if (isDisposed.compareAndSet(false, true)) {
+            unmapBuffer(buffer)
+            try {
+                channel.close()
+            } catch (_: Exception) {}
+            try {
+                raf.close()
+            } catch (_: Exception) {}
+            if (isObsolete.get()) {
+                try {
+                    file.delete()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     override fun close() {
-        try {
-            channel.close()
-        } catch (_: Exception) {}
-        try {
-            raf.close()
-        } catch (_: Exception) {}
+        if (isClosed.compareAndSet(false, true)) {
+            release()
+        }
+    }
+
+    companion object {
+        /**
+         * Safely unmaps a [MappedByteBuffer] off-heap across JVM and Android runtimes.
+         */
+        fun unmapBuffer(buffer: MappedByteBuffer?) {
+            if (buffer == null) return
+            try {
+                // Java 9+ Unsafe.invokeCleaner
+                val unsafeClass = Class.forName("sun.misc.Unsafe")
+                val field = unsafeClass.getDeclaredField("theUnsafe")
+                field.isAccessible = true
+                val unsafe = field.get(null)
+                val invokeCleanerMethod = unsafeClass.getMethod("invokeCleaner", java.nio.ByteBuffer::class.java)
+                invokeCleanerMethod.invoke(unsafe, buffer)
+                return
+            } catch (_: Throwable) {}
+
+            try {
+                // Android / Java 8 DirectBuffer.cleaner().clean() fallback
+                val directBufferClass = Class.forName("sun.nio.ch.DirectBuffer")
+                if (directBufferClass.isInstance(buffer)) {
+                    val cleanerMethod = directBufferClass.getMethod("cleaner")
+                    val cleaner = cleanerMethod.invoke(buffer)
+                    if (cleaner != null) {
+                        val cleanMethod = cleaner.javaClass.getMethod("clean")
+                        cleanMethod.invoke(cleaner)
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
     }
 }
 

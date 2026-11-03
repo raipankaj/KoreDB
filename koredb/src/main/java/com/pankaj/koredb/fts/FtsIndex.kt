@@ -73,7 +73,8 @@ class FtsIndex(
                 val lenEntries = db.getByPrefixWithKeysRaw(ftsLenPrefix)
                 for ((k, v) in lenEntries) {
                     if (v.size >= 4) {
-                        val docId = String(k.copyOfRange(ftsLenPrefix.size, k.size), Charsets.UTF_8)
+                        val escapedDocId = String(k.copyOfRange(ftsLenPrefix.size, k.size), Charsets.UTF_8)
+                        val docId = unescape(escapedDocId)
                         val length = ByteBuffer.wrap(v).order(ByteOrder.LITTLE_ENDIAN).getInt()
                         docLengths[docId] = length
                         totalTokens.addAndGet(length.toLong())
@@ -89,7 +90,7 @@ class FtsIndex(
                         val colonIdx = keyStr.indexOf(':')
                         if (colonIdx > 0) {
                             val term = keyStr.substring(0, colonIdx)
-                            val docId = keyStr.substring(colonIdx + 1)
+                            val docId = unescape(keyStr.substring(colonIdx + 1))
                             val freq = ByteBuffer.wrap(v).order(ByteOrder.LITTLE_ENDIAN).getInt()
                             postings.getOrPut(term) { ConcurrentHashMap() }[docId] = freq
                             docTerms.getOrPut(docId) { ConcurrentHashMap.newKeySet() }.add(term)
@@ -116,6 +117,7 @@ class FtsIndex(
         text: String,
         batch: MutableList<Pair<ByteArray, ByteArray>>? = null
     ) {
+        ensureHydrated()
         val (frequencies, length) = KoreTokenizer.tokenize(text)
 
         // 1. Purge previous terms if updating existing document
@@ -239,6 +241,7 @@ class FtsIndex(
      * Removes a document from the full-text index.
      */
     fun removeDocument(docId: String, batch: MutableList<Pair<ByteArray, ByteArray>>? = null) {
+        ensureHydrated()
         val oldTerms = docTerms.remove(docId)
         if (oldTerms != null) {
             for (term in oldTerms) {
