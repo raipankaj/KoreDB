@@ -40,7 +40,7 @@ import java.util.UUID
  * Covering:
  * - Tier 1: Feature Coverage (>=5 test cases per feature)
  * - Tier 2: Boundary & Corner Cases (extreme timestamps, zero duration, instant invalidation)
- * - Tier 3: Cross-Feature Interactions (HippoRAG over bi-temporal active facts, spaced repetition boosts)
+ * - Tier 3: Cross-Feature Interactions (Hub-Damped PageRank over bi-temporal active facts, spaced repetition boosts)
  * - Tier 4: Real-World Scenarios (Dynamic agent episodic memory evolution over simulated 30-day timeline)
  */
 class BiTemporalCognitiveE2ETest {
@@ -660,7 +660,7 @@ class BiTemporalCognitiveE2ETest {
     // ========================================================================
 
     @Test
-    fun testHippoRAGTraversesOnlyActiveBiTemporalEdges() = runBlocking {
+    fun testHubDampedPageRankTraversesOnlyActiveBiTemporalEdges() = runBlocking {
         val db = KoreDatabase(testDir)
         val graph = db.graph()
 
@@ -677,8 +677,8 @@ class BiTemporalCognitiveE2ETest {
         assertEquals(1, activeEdges.size)
         assertEquals("Target_Active", activeEdges[0].targetId)
 
-        // Running HippoRAG on active edges only
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        // Running Hub-Damped PageRank on active edges only
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = setOf("A", "Target_Active"),
             outEdges = mapOf("A" to listOf("Target_Active" to 1.0)),
             seeds = mapOf("A" to 1.0)

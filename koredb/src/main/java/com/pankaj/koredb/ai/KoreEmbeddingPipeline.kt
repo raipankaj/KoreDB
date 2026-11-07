@@ -32,14 +32,14 @@ data class EmbeddingPipelineStats(
 /**
  * Zero-dependency On-Device Embedding Pipeline & Connector (`com.pankaj.koredb.ai`).
  *
- * Wraps any user-supplied embedding lambda (`suspend (String) -> FloatArray` from MediaPipe TextEmbedder,
- * LiteRT / TFLite, ONNX Runtime, Gemini Nano, or remote APIs) and provides:
+ * Wraps any user-supplied embedding lambda (`suspend (String) -> FloatArray` from a local neural
+ * embedding runtime, NPU/GPU inference engine, or remote API) and provides:
  * 1. **Thread-Safe LRU Embedding Cache**: Eliminates redundant NPU/CPU inference for repeated query terms,
  *    entity names, and L1 atomic propositions (~15ms model inference reduced to <1µs cache hit).
- * 2. **Matryoshka Representation Learning (MRL) Dimension Slicing**: Optionally truncates high-dimensional
+ * 2. **Multi-Resolution Prefix Dimension Slicing**: Optionally truncates high-dimensional
  *    embeddings (e.g., 768 or 1024 dims) to a compact prefix ([targetDimensions], such as 64, 128, 256, or 384)
  *    before indexing.
- * 3. **16-Lane Unrolled L2 Normalization**: Automatically normalizes vectors (or sliced MRL prefixes) to unit
+ * 3. **16-Lane Unrolled L2 Normalization**: Automatically normalizes vectors (or sliced prefixes) to unit
  *    length via [SimdVectorMath.normalizeL2InPlace16] so `COSINE` and `INNER_PRODUCT` run at peak accuracy.
  * 4. **Deduplicated Batch Execution ([embedBatch])**: Resolves cached entries first, deduplicates cache misses
  *    within the batch, and invokes the underlying model only once per unique miss.
@@ -51,7 +51,7 @@ data class EmbeddingPipelineStats(
  *     normalizeL2 = true,
  *     maxCacheEntries = 2048
  * ) { text ->
- *     mediaPipeEmbedder.embed(text)
+ *     localEmbedder.embed(text)
  * }
  *
  * // Pass directly to GraphVectorBridge or KoreMemoryPyramid:
@@ -202,7 +202,7 @@ class KoreEmbeddingPipeline(
     }
 
     /**
-     * Pre-warms the LRU cache with pre-computed embeddings (applying MRL slicing and L2 normalization).
+     * Pre-warms the LRU cache with pre-computed embeddings (applying prefix slicing and L2 normalization).
      */
     fun putAll(entries: Map<String, FloatArray>) {
         if (maxCacheEntries <= 0 || entries.isEmpty()) return

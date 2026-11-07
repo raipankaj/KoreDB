@@ -11,7 +11,7 @@ import com.pankaj.koredb.graph.Node
 import com.pankaj.koredb.hnsw.BinaryQuantizer
 import com.pankaj.koredb.hnsw.DistanceMetric
 import com.pankaj.koredb.hnsw.HNSWIndex
-import com.pankaj.koredb.hnsw.RaBitQCode
+import com.pankaj.koredb.hnsw.RotatedBinaryCode
 import com.pankaj.koredb.memory.AtomicFact
 import com.pankaj.koredb.memory.ConsolidationReport
 import com.pankaj.koredb.memory.DrillDownResult
@@ -35,25 +35,25 @@ import kotlin.system.measureNanoTime
  * SOTA 2025-2026 Agent Memory & Vector Database Industry Benchmark Suite.
  *
  * Evaluates KoreDB head-to-head against:
- * 1. SQLite + FTS5 + Flat Vector Scan (TencentDB Agent Memory's exact storage & retrieval architecture)
- * 2. Standard Flat Vector RAG (Mem0 / LangChain VectorStore baseline)
- * 3. Naive 2-Hop BFS GraphRAG (Standard GraphRAG without Hub-Noise Damping)
+ * 1. Append-Only SQLite + FTS5 + Flat Vector Scan (conventional relational agent memory architecture)
+ * 2. Standard Flat Vector RAG (append-only vector store baseline)
+ * 3. Naive 2-Hop BFS GraphRAG (standard GraphRAG without Hub-Noise Damping)
  *
  * Benchmarks covered:
- * - Benchmark 1: PersonaMem & LongMemEval (Temporal Contradiction & Point-in-Time `asOf` Accuracy)
- * - Benchmark 2: LoCoMo / HippoRAG 2 (Multi-Hop Associative Recall under High-Degree Hub Noise)
+ * - Benchmark 1: Temporal Contradiction & Point-in-Time Historical Recall (`asOf` Accuracy)
+ * - Benchmark 2: Multi-Hop Associative Recall under High-Degree Hub Noise
  * - Benchmark 3: Symbolic Working Memory & Token Efficiency (Mermaid + L0 LZ4 + Lossless Drill-Down)
- * - Benchmark 4: ANN-Benchmarks (HNSW FP32 vs MRL-64 vs SQ8 vs SQ8+MRL-64 vs RaBitQ 1-bit vs SQLite Scan)
+ * - Benchmark 4: ANN Vector Search (HNSW FP32 vs Prefix-64 vs SQ8 vs SQ8+Prefix-64 vs Rotated 1-Bit vs SQLite Scan)
  * - Benchmark 5: ACT-R / Ebbinghaus Spaced-Repetition Consolidation & Noise Pruning
  * - Benchmark 6: On-Device `KoreEmbeddingPipeline` Throughput under Zipfian Agent Workloads
  */
 class SotaAgentMemoryAndVectorBenchmarkTest {
 
     // =========================================================================
-    // BENCHMARK 1: PersonaMem & LongMemEval (Temporal Contradiction & Updates)
+    // BENCHMARK 1: Temporal Contradiction & Point-in-Time Historical Recall
     // =========================================================================
     @Test
-    fun benchmark1_PersonaMem_and_LongMemEval_TemporalAccuracy() = runBlocking {
+    fun benchmark1_TemporalContradiction_and_PointInTimeRecall_Accuracy() = runBlocking {
         val db = KoreDatabase.inMemory()
         val sqliteConn = DriverManager.getConnection("jdbc:sqlite::memory:")
         try {
@@ -63,14 +63,14 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             val baseTimeMs = 1_700_000_000_000L
             val sessionStepMs = 86_400_000L // 1 day per session
 
-            // Setup SQLite (TencentDB Agent Memory baseline: FTS5 + Vector Table)
+            // Setup SQLite (Append-Only FTS5 + Vector BLOB baseline)
             sqliteConn.createStatement().use { stmt ->
                 stmt.execute("CREATE TABLE memories (id TEXT PRIMARY KEY, subject TEXT, predicate TEXT, object TEXT, statement TEXT, session_ts INTEGER, embedding BLOB)")
                 stmt.execute("CREATE VIRTUAL TABLE memories_fts USING fts5(id UNINDEXED, statement)")
             }
 
             // Setup KoreDB Cognitive Memory Pyramid
-            val pyramid = db.memoryPyramid("personamem")
+            val pyramid = db.memoryPyramid("temporal_memory")
 
             // Deterministic orthogonal basis per attribute so each attribute maps to a distinct subspace
             val rng = Random(42)
@@ -150,7 +150,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             sqliteConn.commit()
             sqliteConn.autoCommit = true
 
-            // Load SQLite vectors for flat scan (as done by sqlite-vec / local SQLite memory engines)
+            // Load SQLite vectors for flat scan (as done by conventional SQLite BLOB vector engines)
             val sqliteAllFacts = mutableListOf<Triple<String, String, FloatArray>>() // id, objVal, vec
             sqliteConn.createStatement().executeQuery("SELECT id, object, embedding FROM memories").use { rs ->
                 while (rs.next()) {
@@ -165,7 +165,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             var koreDbActiveCorrect = 0
             var koreDbStaleInTop3 = 0
 
-            // Evaluate Task 1B: LongMemEval Point-in-Time Historical Query asOf(T2) & Lineage Audit
+            // Evaluate Task 1B: Point-in-Time Historical Query asOf(T2) & Lineage Audit
             val t2QueryTimeMs = baseTimeMs + 1 * sessionStepMs + 1000L // During Session 1 (T2)
             val t4TxTimeMs = baseTimeMs + 4 * sessionStepMs
             var koreDbAsOfCorrect = 0
@@ -183,7 +183,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
                 }.sortedByDescending { it.third }
                 if (flatRanked.first().second == expectedCurrentObj) flatVectorCorrect++
 
-                // --- Baseline 2: SQLite FTS5 + Vector RRF (TencentDB Agent Memory baseline) ---
+                // --- Baseline 2: Append-Only SQLite FTS5 + Vector RRF ---
                 val bm25Ranks = mutableListOf<Pair<String, Float>>()
                 sqliteConn.prepareStatement(
                     "SELECT id, -bm25(memories_fts) as score FROM memories_fts WHERE memories_fts MATCH ? ORDER BY score DESC LIMIT 10"
@@ -221,7 +221,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
                     koreDbStaleInTop3++
                 }
 
-                // --- KoreDB LongMemEval: Point-in-Time Historical Query asOf(validTime = T2, txTime = T4) ---
+                // --- KoreDB Bi-Temporal: Point-in-Time Historical Query asOf(validTime = T2, txTime = T4) ---
                 val candidatesForKey = db.graph().getNodesByProperty("L1_Fact", "contradictionKey", "user_persona:pref_attribute_$a")
                 val validAtT2 = candidatesForKey.map { AtomicFact.fromGraphNode(it) }.filter { fact ->
                     fact.isBiTemporallyValidAt(t2QueryTimeMs, t4TxTimeMs)
@@ -249,13 +249,13 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             val koreLineageAcc = (koreDbLineageComplete * 100.0) / numAttributes
 
             println("\n================================================================================")
-            println("BENCHMARK 1: PersonaMem & LongMemEval (Temporal Contradiction & Knowledge Update)")
+            println("BENCHMARK 1: Temporal Contradiction & Point-in-Time Historical Recall")
             println("Dataset: 50 Evolving Persona Attributes x 4 Sessions = 200 Episodic Facts")
             println("--------------------------------------------------------------------------------")
             println(String.format(Locale.US, "%-42s | %12s | %15s | %12s", "Engine / Retrieval Architecture", "Active Acc%", "Stale Pollution", "asOf(T2) Acc"))
             println("--------------------------------------------------------------------------------")
-            println(String.format(Locale.US, "%-42s | %11.1f%% | %14.1f%% | %12s", "Flat Vector RAG (Mem0 / Vector Baseline)", flatAcc, 100.0, "N/A (0.0%)"))
-            println(String.format(Locale.US, "%-42s | %11.1f%% | %14.1f%% | %12s", "SQLite FTS5 + Vector RRF (TencentDB Style)", sqliteRrfAcc, sqlitePollution, "N/A (0.0%)"))
+            println(String.format(Locale.US, "%-42s | %11.1f%% | %14.1f%% | %12s", "Flat Vector RAG (Append-Only Vector Store)", flatAcc, 100.0, "N/A (0.0%)"))
+            println(String.format(Locale.US, "%-42s | %11.1f%% | %14.1f%% | %12s", "Append-Only SQLite FTS5 + Vector RRF", sqliteRrfAcc, sqlitePollution, "N/A (0.0%)"))
             println(String.format(Locale.US, "%-42s | %11.1f%% | %14.1f%% | %11.1f%%", "KoreDB Bi-Temporal Pyramid (Active + asOf)", koreActiveAcc, korePollution, koreAsOfAcc))
             println("--------------------------------------------------------------------------------")
             println(String.format(Locale.US, "KoreDB SUPERSEDES Lineage Audit Completeness (T4->T3->T2->T1): %.1f%%", koreLineageAcc))
@@ -272,10 +272,10 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
     }
 
     // =========================================================================
-    // BENCHMARK 2: LoCoMo & HippoRAG 2 (Multi-Hop Recall under Hub Noise)
+    // BENCHMARK 2: Multi-Hop Associative Recall under High-Degree Hub Noise
     // =========================================================================
     @Test
-    fun benchmark2_LoCoMo_MultiHop_AssociativeRecall_Under_HubNoise() = runBlocking {
+    fun benchmark2_MultiHop_AssociativeRecall_Under_HubNoise() = runBlocking {
         val db = KoreDatabase.inMemory()
         try {
             val dim = 64
@@ -283,7 +283,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             val numDistractors = 240
             val rng = Random(100)
 
-            val vectors = db.vectorCollection("locomo_vec") {
+            val vectors = db.vectorCollection("multihop_vec") {
                 dimensions = dim
                 metric = DistanceMetric.COSINE
             }
@@ -336,7 +336,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
 
                 val seedVec = queryVectors[c].clone()
                 // Target vector is orthogonal/uncorrelated with queryVec[c] (sim ~ 0.0)
-                // This models LoCoMo multi-hop questions where the answer passage doesn't share embeddings with the question
+                // This models multi-hop questions where the answer passage doesn't share embeddings with the question
                 val rawTarget = FloatArray(dim) { rng.nextFloat() * 2f - 1f }
                 // Gram-Schmidt orthogonalization against seedVec
                 val dot = SimdVectorMath.dotProduct16(rawTarget, seedVec)
@@ -364,8 +364,8 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
 
             var flatVectorRecallAt5 = 0
             var naiveBfsGraphRagRecallAt5 = 0
-            var hippoRagHubDampedRecallAt5 = 0
-            var hippoRagTotalNs = 0L
+            var hubDampedPprRecallAt5 = 0
+            var hubDampedPprTotalNs = 0L
 
             for (c in 0 until numChains) {
                 val qVec = queryVectors[c]
@@ -379,10 +379,10 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
                 val bfsRes = bridge.graphRAGQuery(qVec, initialLimit = 1, maxHops = 2, finalLimit = 5)
                 if (bfsRes.any { it.id == expectedTargetId }) naiveBfsGraphRagRecallAt5++
 
-                // 3. KoreDB HippoRAG 2 with Hub-Noise Damping (hubDampingBeta = 0.8)
-                var hippoRes: List<com.pankaj.koredb.bridge.GraphVectorBridge.BridgeResult> = emptyList()
-                hippoRagTotalNs += measureNanoTime {
-                    hippoRes = bridge.hippoRAGQuery(
+                // 3. KoreDB Hub-Damped Personalized PageRank (hubDampingBeta = 0.8)
+                var pprRes: List<com.pankaj.koredb.bridge.GraphVectorBridge.BridgeResult> = emptyList()
+                hubDampedPprTotalNs += measureNanoTime {
+                    pprRes = bridge.associativePageRankQuery(
                         queryText = "",
                         queryVector = qVec,
                         seedLimit = 1,
@@ -392,27 +392,27 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
                         targetLabels = setOf("Chunk")
                     )
                 }
-                if (hippoRes.any { it.id == expectedTargetId }) hippoRagHubDampedRecallAt5++
+                if (pprRes.any { it.id == expectedTargetId }) hubDampedPprRecallAt5++
             }
 
             val flatRec = (flatVectorRecallAt5 * 100.0) / numChains
             val bfsRec = (naiveBfsGraphRagRecallAt5 * 100.0) / numChains
-            val hippoRec = (hippoRagHubDampedRecallAt5 * 100.0) / numChains
-            val avgHippoMs = (hippoRagTotalNs / 1_000_000.0) / numChains
+            val pprRec = (hubDampedPprRecallAt5 * 100.0) / numChains
+            val avgPprMs = (hubDampedPprTotalNs / 1_000_000.0) / numChains
 
             println("\n================================================================================")
-            println("BENCHMARK 2: LoCoMo / HippoRAG 2 Multi-Hop Associative Recall under Hub Noise")
+            println("BENCHMARK 2: Multi-Hop Associative Recall under High-Degree Hub Noise")
             println("Graph: 290 Chunks, 25 2-Hop Chains, 3 High-Degree Hubs (80+ edges each)")
             println("--------------------------------------------------------------------------------")
             println(String.format(Locale.US, "%-48s | %14s | %12s", "Retrieval Engine", "Hop-2 Recall@5", "Avg Latency"))
             println("--------------------------------------------------------------------------------")
             println(String.format(Locale.US, "%-48s | %13.1f%% | %10s", "Flat Vector Search (SQLite / Dense RAG)", flatRec, "< 0.5 ms"))
             println(String.format(Locale.US, "%-48s | %13.1f%% | %10s", "Naive 2-Hop BFS GraphRAG (Vector Reranked)", bfsRec, "~ 1.8 ms"))
-            println(String.format(Locale.US, "%-48s | %13.1f%% | %10s", "KoreDB HippoRAG 2 PPR (Hub-Noise Damped)", hippoRec, String.format(Locale.US, "%.2f ms", avgHippoMs)))
+            println(String.format(Locale.US, "%-48s | %13.1f%% | %10s", "KoreDB Hub-Damped PPR (Associative Recall)", pprRec, String.format(Locale.US, "%.2f ms", avgPprMs)))
             println("================================================================================")
 
-            assertTrue("KoreDB HippoRAG 2 multi-hop Recall@5 must be >= 95% (was $hippoRec%)", hippoRec >= 95.0)
-            assertTrue("Naive BFS GraphRAG fails on orthogonal multi-hop targets under hub noise", hippoRec > bfsRec + 50.0)
+            assertTrue("KoreDB Hub-Damped PPR multi-hop Recall@5 must be >= 95% (was $pprRec%)", pprRec >= 95.0)
+            assertTrue("Naive BFS GraphRAG fails on orthogonal multi-hop targets under hub noise", pprRec > bfsRec + 50.0)
         } finally {
             db.close()
         }
@@ -539,14 +539,14 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             println("BENCHMARK 3: Symbolic Working Memory & Context Token Efficiency (25-Step Agent)")
             println("--------------------------------------------------------------------------------")
             println(String.format(Locale.US, "Raw Agent Tool Transcript Tokens      : %,d tokens (%,d bytes)", totalRawTranscriptTokens, totalUncompressedBytes))
-            println(String.format(Locale.US, "TencentDB Reported Token Reduction    : 61.0%% (Reference Claim)"))
+            println(String.format(Locale.US, "Industry Baseline Token Reduction     : 61.0%% (Text Summary Baseline)"))
             println(String.format(Locale.US, "KoreDB Symbolic Mermaid Context Tokens: %,d tokens", symbolicTokens))
             println(String.format(Locale.US, "KoreDB Active Prompt Token Reduction  : %.1f%% fewer tokens", tokenReductionPct))
             println(String.format(Locale.US, "KoreDB L0 LZ4 Disk Compression Ratio  : %.2fx (%,d B -> %,d B)", lz4CompressionRatio, totalUncompressedBytes, totalCompressedBytes))
             println(String.format(Locale.US, "1-Call L2->L1->L0 Drill-Down Latency  : %.2f ms (Recovered %d lossless logs)", drillDownMs, recoveredLogs.size))
             println("================================================================================")
 
-            assertTrue("Token reduction must exceed TencentDB's 61% benchmark (was $tokenReductionPct%)", tokenReductionPct > 85.0)
+            assertTrue("Token reduction must exceed 85% (was $tokenReductionPct%)", tokenReductionPct > 85.0)
             assertTrue("LZ4 compression ratio on tool logs must exceed 2.5x", lz4CompressionRatio > 2.5)
             assertTrue("Lossless drill-down must recover exact raw tool logs", recoveredLogs.isNotEmpty() && recoveredLogs.first().rawContent.contains("AndroidRuntime"))
         } finally {
@@ -555,10 +555,10 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
     }
 
     // =========================================================================
-    // BENCHMARK 4: ANN-Benchmarks (Vector Latency, QPS, Recall@10, Memory)
+    // BENCHMARK 4: ANN Vector Search (Latency, QPS, Recall@10, Memory)
     // =========================================================================
     @Test
-    fun benchmark4_ANN_VectorSearch_HNSW_MRL_SQ8_RaBitQ_vs_SQLite() {
+    fun benchmark4_ANN_VectorSearch_HNSW_Prefix_SQ8_RotatedBQ_vs_SQLite() {
         val sqliteConn = DriverManager.getConnection("jdbc:sqlite::memory:")
         try {
             val dim = 256
@@ -567,7 +567,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             val topK = 10
             val rng = Random(2026)
 
-            // Generate 3,000 realistic Matryoshka-structured 256-d vectors (clustered around 30 semantic topics)
+            // Generate 3,000 realistic multi-resolution prefix-structured 256-d vectors (clustered around 30 semantic topics)
             val numCentroids = 30
             val centroids = Array(numCentroids) {
                 val c = FloatArray(dim) { d ->
@@ -598,7 +598,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
                 queries.add(qVec)
             }
 
-            // 1. Populate SQLite BLOB table (TencentDB / sqlite-vec flat scan baseline)
+            // 1. Populate SQLite BLOB table (SQLite flat vector scan baseline)
             sqliteConn.createStatement().execute("CREATE TABLE vec_items (id TEXT PRIMARY KEY, vec BLOB)")
             sqliteConn.autoCommit = false
             sqliteConn.prepareStatement("INSERT INTO vec_items VALUES (?, ?)").use { ps ->
@@ -634,13 +634,13 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             )
             for ((id, vec) in dataset) hnswSq8.insert(id, vec)
 
-            // 4. Build KoreDB RaBitQ 1-Bit Index (Orthogonal Rotation + Hardware POPCNT)
-            val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 42L)
-            val rabitqIndex = HashMap<String, RaBitQCode>(numVectors)
+            // 4. Build KoreDB Rotated 1-Bit Index (Orthogonal Rotation + Hardware POPCNT)
+            val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 42L)
+            val rotatedBqIndex = HashMap<String, RotatedBinaryCode>(numVectors)
             val rawMap = HashMap<String, FloatArray>(numVectors)
             for ((id, vec) in dataset) {
                 rawMap[id] = vec
-                rabitqIndex[id] = bq.quantizeRaBitQ(vec)
+                rotatedBqIndex[id] = bq.quantizeRotated(vec)
             }
 
             // Compute Exact Brute-Force Ground Truth (Top-10 per query)
@@ -655,11 +655,11 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
 
             // Warmup JVM JIT
             for (i in 0 until 10) {
-                hnswFp32.search(queries[i], topK, mrlCoarseDims = 0)
-                hnswFp32.search(queries[i], topK, mrlCoarseDims = 64)
-                hnswSq8.search(queries[i], topK, mrlCoarseDims = 0)
-                hnswSq8.search(queries[i], topK, mrlCoarseDims = 64)
-                bq.searchTwoStageRaBitQ(queries[i], rabitqIndex, limit = topK, oversampleFactor = 6) { rawMap[it] }
+                hnswFp32.search(queries[i], topK, coarsePrefixDims = 0)
+                hnswFp32.search(queries[i], topK, coarsePrefixDims = 64)
+                hnswSq8.search(queries[i], topK, coarsePrefixDims = 0)
+                hnswSq8.search(queries[i], topK, coarsePrefixDims = 64)
+                bq.searchTwoStageRotated(queries[i], rotatedBqIndex, limit = topK, oversampleFactor = 6) { rawMap[it] }
             }
 
             // Run Benchmark 4A: SQLite BLOB Scan + Cosine
@@ -685,17 +685,17 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             var fp32Hits = 0
             val fp32Ns = measureNanoTime {
                 for (qIdx in 0 until numQueries) {
-                    val res = hnswFp32.search(queries[qIdx], topK, mrlCoarseDims = 0)
+                    val res = hnswFp32.search(queries[qIdx], topK, coarsePrefixDims = 0)
                     fp32Hits += res.count { it.first in groundTruthTop10[qIdx] }
                 }
             }
 
-            // Run Benchmark 4C: KoreDB HNSW FP32 + MRL 64-dim Short-Circuiting
-            var mrl64Hits = 0
-            val mrl64Ns = measureNanoTime {
+            // Run Benchmark 4C: KoreDB HNSW FP32 + Prefix 64-dim Short-Circuiting
+            var prefix64Hits = 0
+            val prefix64Ns = measureNanoTime {
                 for (qIdx in 0 until numQueries) {
-                    val res = hnswFp32.search(queries[qIdx], topK, mrlCoarseDims = 64)
-                    mrl64Hits += res.count { it.first in groundTruthTop10[qIdx] }
+                    val res = hnswFp32.search(queries[qIdx], topK, coarsePrefixDims = 64)
+                    prefix64Hits += res.count { it.first in groundTruthTop10[qIdx] }
                 }
             }
 
@@ -703,41 +703,41 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             var sq8Hits = 0
             val sq8Ns = measureNanoTime {
                 for (qIdx in 0 until numQueries) {
-                    val res = hnswSq8.search(queries[qIdx], topK, mrlCoarseDims = 0)
+                    val res = hnswSq8.search(queries[qIdx], topK, coarsePrefixDims = 0)
                     sq8Hits += res.count { it.first in groundTruthTop10[qIdx] }
                 }
             }
 
-            // Run Benchmark 4E: KoreDB HNSW + SQ8 + MRL 64-dim Combined
-            var sq8MrlHits = 0
-            val sq8MrlNs = measureNanoTime {
+            // Run Benchmark 4E: KoreDB HNSW + SQ8 + Prefix 64-dim Combined
+            var sq8PrefixHits = 0
+            val sq8PrefixNs = measureNanoTime {
                 for (qIdx in 0 until numQueries) {
-                    val res = hnswSq8.search(queries[qIdx], topK, mrlCoarseDims = 64)
-                    sq8MrlHits += res.count { it.first in groundTruthTop10[qIdx] }
+                    val res = hnswSq8.search(queries[qIdx], topK, coarsePrefixDims = 64)
+                    sq8PrefixHits += res.count { it.first in groundTruthTop10[qIdx] }
                 }
             }
 
-            // Run Benchmark 4F: KoreDB RaBitQ (1-bit POPCNT + Two-Stage Rescore)
-            var rabitqHits = 0
-            val rabitqNs = measureNanoTime {
+            // Run Benchmark 4F: KoreDB Rotated 1-Bit POPCNT (Two-Stage Rescore)
+            var rotatedBqHits = 0
+            val rotatedBqNs = measureNanoTime {
                 for (qIdx in 0 until numQueries) {
-                    val res = bq.searchTwoStageRaBitQ(
+                    val res = bq.searchTwoStageRotated(
                         query = queries[qIdx],
-                        index = rabitqIndex,
+                        index = rotatedBqIndex,
                         limit = topK,
                         oversampleFactor = 15,
                         metric = DistanceMetric.COSINE,
                         exactVectorProvider = { rawMap[it] }
                     )
-                    rabitqHits += res.count { it.first in groundTruthTop10[qIdx] }
+                    rotatedBqHits += res.count { it.first in groundTruthTop10[qIdx] }
                 }
             }
 
             // Memory Footprint Calculations (Vector Payload Size for 3,000 x 256-dim vectors)
             val fp32Bytes = numVectors * dim * 4L // 1,024 B/vec = 3,072,000 B
             val sq8Bytes = numVectors * dim * 1L + (dim * 8L) // 256 B/vec + calibration = 770,048 B
-            val rabitqBytesPerVec = (dim / 64) * 8 + 8 // 4 Longs (32 B) + l2Norm (4 B) + scaleFactor (4 B) = 40 B/vec
-            val rabitqBytes = numVectors * rabitqBytesPerVec.toLong() // 120,000 B (25.6x compression!)
+            val rotatedBqBytesPerVec = (dim / 64) * 8 + 8 // 4 Longs (32 B) + l2Norm (4 B) + scaleFactor (4 B) = 40 B/vec
+            val rotatedBqBytes = numVectors * rotatedBqBytesPerVec.toLong() // 120,000 B (25.6x compression!)
 
             fun fmtRow(name: String, totalNs: Long, hits: Int, memBytes: Long): String {
                 val avgMs = (totalNs / 1_000_000.0) / numQueries
@@ -753,28 +753,28 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             }
 
             println("\n==========================================================================================")
-            println("BENCHMARK 4: ANN-Benchmarks (3,000 Vectors x 256-dim, 100 Queries, Top-10 Recall)")
+            println("BENCHMARK 4: ANN Vector Search (3,000 Vectors x 256-dim, 100 Queries, Top-10 Recall)")
             println("------------------------------------------------------------------------------------------")
             println(String.format(Locale.US, "%-38s | %11s | %8s | %10s | %16s", "Vector Engine Configuration", "Avg Latency", "QPS", "Recall@10", "Vector RAM (Comp)"))
             println("------------------------------------------------------------------------------------------")
             println(fmtRow("SQLite BLOB Scan + Cosine (Baseline)", sqliteNs, sqliteHits, fp32Bytes))
             println(fmtRow("KoreDB HNSW FP32 (16-Lane Fused SIMD)", fp32Ns, fp32Hits, fp32Bytes))
-            println(fmtRow("KoreDB HNSW FP32 + MRL-64 ShortCircuit", mrl64Ns, mrl64Hits, fp32Bytes))
+            println(fmtRow("KoreDB HNSW FP32 + Prefix-64 Funnel", prefix64Ns, prefix64Hits, fp32Bytes))
             println(fmtRow("KoreDB HNSW SQ8 (8-Lane Unrolled)", sq8Ns, sq8Hits, sq8Bytes))
-            println(fmtRow("KoreDB HNSW SQ8 + MRL-64 Combined", sq8MrlNs, sq8MrlHits, sq8Bytes))
-            println(fmtRow("KoreDB RaBitQ 1-Bit POPCNT (2-Stage)", rabitqNs, rabitqHits, rabitqBytes))
+            println(fmtRow("KoreDB HNSW SQ8 + Prefix-64 Combined", sq8PrefixNs, sq8PrefixHits, sq8Bytes))
+            println(fmtRow("KoreDB Rotated 1-Bit POPCNT (2-Stage)", rotatedBqNs, rotatedBqHits, rotatedBqBytes))
             println("==========================================================================================")
 
             val fp32Recall = (fp32Hits * 100.0) / (numQueries * topK)
-            val mrlRecall = (mrl64Hits * 100.0) / (numQueries * topK)
+            val prefixRecall = (prefix64Hits * 100.0) / (numQueries * topK)
             val sq8Recall = (sq8Hits * 100.0) / (numQueries * topK)
-            val rabitqRecall = (rabitqHits * 100.0) / (numQueries * topK)
+            val rotatedBqRecall = (rotatedBqHits * 100.0) / (numQueries * topK)
 
             assertTrue("KoreDB HNSW FP32 must be >5x faster than SQLite BLOB scan", fp32Ns * 5 < sqliteNs)
             assertTrue("HNSW FP32 Recall@10 must be >= 90% (was $fp32Recall%)", fp32Recall >= 90.0)
-            assertTrue("HNSW MRL-64 Recall@10 must be >= 88% (was $mrlRecall%)", mrlRecall >= 88.0)
+            assertTrue("HNSW Prefix-64 Recall@10 must be >= 88% (was $prefixRecall%)", prefixRecall >= 88.0)
             assertTrue("HNSW SQ8 Recall@10 must be >= 88% (was $sq8Recall%)", sq8Recall >= 88.0)
-            assertTrue("RaBitQ 2-Stage Recall@10 must be >= 85% (was $rabitqRecall%)", rabitqRecall >= 85.0)
+            assertTrue("Rotated 1-Bit 2-Stage Recall@10 must be >= 85% (was $rotatedBqRecall%)", rotatedBqRecall >= 85.0)
         } finally {
             sqliteConn.close()
         }
@@ -964,7 +964,7 @@ class SotaAgentMemoryAndVectorBenchmarkTest {
             }
         }
 
-        // 2. KoreEmbeddingPipeline: LRU Cache + Whitespace Normalization + 16-Lane MRL Slice & Normalize
+        // 2. KoreEmbeddingPipeline: LRU Cache + Whitespace Normalization + 16-Lane Prefix Slice & Normalize
         val pipeline = KoreEmbeddingPipeline(
             targetDimensions = targetDim,
             normalizeL2 = true,

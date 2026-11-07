@@ -175,7 +175,7 @@ class ScalarQuantizer(val dimensions: Int) {
     }
 
     /**
-     * Computes SQ8 distance over only the first [prefixDims] dimensions (supports MRL prefix evaluation
+     * Computes SQ8 distance over only the first [prefixDims] dimensions (supports coarse prefix evaluation
      * without allocating temporary dequantized FloatArrays).
      */
     fun computeDistancePrefix(

@@ -78,11 +78,11 @@ class KoreMemoryInspectorTest {
     @Test
     fun testGenerateMarkdownReportWithPopulatedHierarchy() = runBlocking {
         // L0
-        val ev1 = pyramid.recordEvidence("User query log: How do I tune HNSW MRL parameters?", mimeType = "application/json")
-        val ev2 = pyramid.recordEvidence("Documentation: MRL uses 64-dimensional prefix short circuiting.", mimeType = "text/markdown")
+        val ev1 = pyramid.recordEvidence("User query log: How do I tune HNSW prefix parameters?", mimeType = "application/json")
+        val ev2 = pyramid.recordEvidence("Documentation: Prefix funnel uses 64-dimensional prefix short circuiting.", mimeType = "text/markdown")
 
         // L1
-        val f1 = pyramid.addFact("MRL short circuits upper HNSW layers", evidenceIds = listOf(ev1))
+        val f1 = pyramid.addFact("Prefix funnel short circuits upper HNSW layers", evidenceIds = listOf(ev1))
         val f2 = pyramid.addFact("Vector search evaluates 64 dimensions first", evidenceIds = listOf(ev2))
         pyramid.linkFacts(f1, f2, MemoryEdgeTypes.RELATES_TO)
 
@@ -125,7 +125,7 @@ class KoreMemoryInspectorTest {
         assertTrue(report.contains("| CRITICAL |") || report.contains("[CRITICAL]"))
         assertTrue(report.contains("Active Facts: 2"))
         assertTrue(report.contains("Historical Facts: 1"))
-        assertTrue(report.contains("MRL short circuits upper HNSW layers"))
+        assertTrue(report.contains("Prefix funnel short circuits upper HNSW layers"))
         assertTrue(report.contains("Total Evidence Nodes: 2"))
         assertTrue(report.contains("application/json"))
         assertTrue(report.contains("```mermaid"))

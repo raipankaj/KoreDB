@@ -30,14 +30,14 @@ import java.util.Random
 import java.util.UUID
 import kotlin.math.abs
 
-class HippoRAG2PersonalizedPageRankTest {
+class HubDampedPersonalizedPageRankTest {
 
     private lateinit var testDir: File
     private lateinit var db: KoreDatabase
 
     @Before
     fun setUp() {
-        testDir = File("build/tmp/test_hipporag2_${UUID.randomUUID()}")
+        testDir = File("build/tmp/test_hub_damped_ppr_${UUID.randomUUID()}")
         testDir.mkdirs()
         db = KoreDatabase(testDir)
     }
@@ -86,7 +86,7 @@ class HippoRAG2PersonalizedPageRankTest {
             maxHops = 3
         )
 
-        // HippoRAG 2 with hub damping (beta = 0.75)
+        // Hub-Damped PPR with hub damping (beta = 0.75)
         val dampedRanks = GraphAlgorithms.personalizedPageRank(
             storage = graph,
             seedScores = seeds,
@@ -227,7 +227,7 @@ class HippoRAG2PersonalizedPageRankTest {
     }
 
     @Test
-    fun testHippoRAGQueryEndToEndInBridge() = runBlocking {
+    fun testAssociativePageRankQueryEndToEndInBridge() = runBlocking {
         val graph = db.graph()
         val vectorCol = db.vectorCollection("bridge_embeddings", dimensions = 64, metric = DistanceMetric.COSINE)
         val bridge = GraphVectorBridge(graph, vectorCol)
@@ -255,7 +255,7 @@ class HippoRAG2PersonalizedPageRankTest {
         qNorm = kotlin.math.sqrt(qNorm)
         for (i in 0 until 64) queryVec[i] /= qNorm
 
-        val results = bridge.hippoRAGQuery(
+        val results = bridge.associativePageRankQuery(
             queryText = "test query",
             queryVector = queryVec,
             seedLimit = 5,
@@ -314,7 +314,7 @@ class HippoRAG2PersonalizedPageRankTest {
             maxHops = 3
         )
 
-        // HippoRAG 2 PPR with hub damping (beta = 0.5)
+        // Hub-Damped PPR with hub damping (beta = 0.5)
         val dampedRanks = GraphAlgorithms.personalizedPageRank(
             storage = graph,
             seedScores = seeds,
@@ -448,14 +448,14 @@ class HippoRAG2PersonalizedPageRankTest {
     }
 
     @Test
-    fun testAdversarialHippoRAGQueryResilience() = runBlocking {
+    fun testAdversarialAssociativePageRankQueryResilience() = runBlocking {
         val graph = db.graph()
         val vectorCol = db.vectorCollection("adversarial_bridge_vecs", dimensions = 32, metric = DistanceMetric.COSINE)
         val bridge = GraphVectorBridge(graph, vectorCol)
 
         // Empty vector collection and empty graph
         val emptyQueryVec = FloatArray(32) { 0.1f }
-        val rEmpty = bridge.hippoRAGQuery(
+        val rEmpty = bridge.associativePageRankQuery(
             queryText = "unmatched text",
             queryVector = emptyQueryVec
         )
@@ -465,7 +465,7 @@ class HippoRAG2PersonalizedPageRankTest {
         vectorCol.insert("isolated_chunk_1", FloatArray(32) { 0.5f })
         vectorCol.waitForIndexing()
 
-        val rIsolated = bridge.hippoRAGQuery(
+        val rIsolated = bridge.associativePageRankQuery(
             queryText = "text",
             queryVector = FloatArray(32) { 0.5f },
             targetLabels = emptySet()

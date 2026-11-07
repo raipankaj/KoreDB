@@ -163,7 +163,7 @@ class AdvancedVectorTest {
     }
 
     @Test
-    fun `test Dimension 1536 (OpenAI ada-002)`() = runBlocking {
+    fun `test Dimension 1536 High-Dimensional Embedding`() = runBlocking {
         val vectors = db.vectorCollection("d1536")
         val v = FloatArray(1536) { 1f }
         vectors.insert("v", v)

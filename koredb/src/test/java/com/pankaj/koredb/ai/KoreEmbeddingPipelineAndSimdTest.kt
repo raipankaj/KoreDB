@@ -260,13 +260,13 @@ class KoreEmbeddingPipelineAndSimdTest {
             val chunkIds = bridge.ingestDocumentWithChunks(
                 documentId = "doc_ai",
                 title = "KoreDB SOTA Memory",
-                text = "KoreDB combines HNSW with MRL short-circuiting and RaBitQ quantization.",
+                text = "KoreDB combines HNSW with prefix short-circuiting and rotated 1-bit quantization.",
                 embedder = pipeline.asEmbedder()
             )
             assertTrue(chunkIds.isNotEmpty())
             assertEquals(1, modelCalls.get())
 
-            val queryVec = pipeline("KoreDB combines HNSW with MRL short-circuiting and RaBitQ quantization.")
+            val queryVec = pipeline("KoreDB combines HNSW with prefix short-circuiting and rotated 1-bit quantization.")
             // Identical text hits the LRU cache without invoking the model a second time!
             assertEquals(1, modelCalls.get())
 
@@ -280,12 +280,12 @@ class KoreEmbeddingPipelineAndSimdTest {
     }
 
     @Test
-    fun `HNSWIndex with SQ8 quantization and MRL 64-dim short-circuiting achieves high recall`() {
+    fun `HNSWIndex with SQ8 quantization and 64-dim prefix short-circuiting achieves high recall`() {
         val dim = 128
         val numVectors = 160 // > 100 so SQ8 auto-trains and upper HNSW layers (l >= 1) are populated
         val rng = Random(2026)
 
-        val sq8MrlIndex = com.pankaj.koredb.hnsw.HNSWIndex(
+        val sq8PrefixIndex = com.pankaj.koredb.hnsw.HNSWIndex(
             dimensions = dim,
             metric = DistanceMetric.COSINE,
             m = 16,
@@ -306,14 +306,14 @@ class KoreEmbeddingPipelineAndSimdTest {
         val dataset = HashMap<String, FloatArray>(numVectors)
         for (i in 0 until numVectors) {
             val id = "vec_$i"
-            // Generate Matryoshka-structured vector (higher energy in first 64 dims)
+            // Generate multi-resolution prefix vector (higher energy in first 64 dims)
             val v = FloatArray(dim) { d ->
                 val scale = if (d < 64) 2.0f else 0.5f
                 (rng.nextFloat() * 2f - 1f) * scale
             }
             SimdVectorMath.normalizeL2InPlace16(v)
             dataset[id] = v
-            sq8MrlIndex.insert(id, v)
+            sq8PrefixIndex.insert(id, v)
             exactIndex.insert(id, v)
         }
 
@@ -326,15 +326,15 @@ class KoreEmbeddingPipelineAndSimdTest {
             val query = FloatArray(dim) { d -> base[d] + (rng.nextFloat() - 0.5f) * 0.08f }
             SimdVectorMath.normalizeL2InPlace16(query)
 
-            val exactTop10 = exactIndex.search(query, limit = 10, mrlCoarseDims = 0).map { it.first }.toSet()
-            val sq8MrlTop10 = sq8MrlIndex.search(query, limit = 10, mrlCoarseDims = 64)
+            val exactTop10 = exactIndex.search(query, limit = 10, coarsePrefixDims = 0).map { it.first }.toSet()
+            val sq8PrefixTop10 = sq8PrefixIndex.search(query, limit = 10, coarsePrefixDims = 64)
 
-            assertEquals("Top-1 must match target $targetId", targetId, sq8MrlTop10.first().first)
-            totalHits += sq8MrlTop10.count { it.first in exactTop10 }
+            assertEquals("Top-1 must match target $targetId", targetId, sq8PrefixTop10.first().first)
+            totalHits += sq8PrefixTop10.count { it.first in exactTop10 }
         }
 
         val recallAt10 = totalHits.toDouble() / (numQueries * 10)
-        assertTrue("SQ8 + MRL64 Recall@10 should be >= 0.85, was $recallAt10", recallAt10 >= 0.85)
+        assertTrue("SQ8 + Prefix64 Recall@10 should be >= 0.85, was $recallAt10", recallAt10 >= 0.85)
     }
 
     @Test

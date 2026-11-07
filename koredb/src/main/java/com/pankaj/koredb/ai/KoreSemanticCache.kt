@@ -58,7 +58,7 @@ data class SemanticCacheStats(
  *
  * Intercepts semantically equivalent user prompts (e.g., *"What's my flight status?"* vs.
  * *"Check the status of my flight"*) before invoking expensive on-device NPU/GPU SLM inference
- * (such as Gemini Nano or MediaPipe LLM Inference) or cloud LLM APIs.
+ * or remote LLM APIs.
  *
  * Features:
  * - **Cosine Similarity Thresholding**: Configurable `defaultSimilarityThreshold` (default `0.90f`).

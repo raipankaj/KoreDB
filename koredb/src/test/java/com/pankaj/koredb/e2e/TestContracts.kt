@@ -226,10 +226,10 @@ object TestContracts {
     // ========================================================================
 
     /**
-     * Mathematical ground truth for HippoRAG 2 Personalized PageRank.
+     * Mathematical ground truth for Hub-Damped Personalized PageRank.
      * Computes power iteration with hub damping: W_uv = A_uv / (d_in(v))^beta.
      */
-    fun computeHippoRAGPageRankGroundTruth(
+    fun computeHubDampedPageRankGroundTruth(
         nodes: Set<String>,
         outEdges: Map<String, List<Pair<String, Double>>>, // u -> list of (v, weight)
         seeds: Map<String, Double>, // v -> seed score
@@ -333,7 +333,7 @@ object TestContracts {
     }
 
     /**
-     * Gram-Schmidt orthogonal matrix generation for RaBitQ ground truth.
+     * Gram-Schmidt orthogonal matrix generation for Rotated Binary Quantization ground truth.
      */
     fun generateOrthogonalMatrixGroundTruth(dim: Int, seed: Long = 42L): Array<FloatArray> {
         val random = Random(seed)
@@ -370,10 +370,10 @@ object TestContracts {
     }
 
     /**
-     * RaBitQ symmetric inner product estimation ground truth:
+     * Rotated Binary Quantization symmetric inner product estimation ground truth:
      * Estimator = c_q * c_x * (PI / 2) * (D - 2 * d_H)
      */
-    fun estimateRaBitQInnerProductGroundTruth(
+    fun estimateRotatedBinaryInnerProductGroundTruth(
         dim: Int,
         hammingDistance: Int,
         cq: Float,

@@ -507,14 +507,14 @@ class GraphVectorBridge(
     }
 
     /**
-     * Executes HippoRAG 2 multi-hop associative retrieval.
+     * Executes Hub-Damped Personalized PageRank multi-hop associative retrieval.
      *
      * 1. Dual Retrieval: Vector search (and optional BM25 keyword search if [collection] is provided).
      * 2. Reciprocal Rank Fusion (RRF) to generate seed scores.
-     * 3. HippoRAG 2 Personalized PageRank over graph with hub-noise elimination ($W_{uv} = A_{uv} / d_{in}(v)^\beta$).
+     * 3. Hub-Damped Personalized PageRank over graph with hub-noise elimination ($W_{uv} = A_{uv} / d_{in}(v)^\beta$).
      * 4. Passage extraction into [BridgeResult].
      */
-    suspend fun hippoRAGQuery(
+    suspend fun associativePageRankQuery(
         queryText: String,
         queryVector: FloatArray,
         collection: com.pankaj.koredb.core.KoreCollection<*>? = null,
@@ -606,7 +606,7 @@ class GraphVectorBridge(
         results
     }
 
-    suspend fun hippoRAGQuery(
+    suspend fun associativePageRankQuery(
         queryText: String,
         queryVector: FloatArray,
         seedLimit: Int = 15,
@@ -616,7 +616,7 @@ class GraphVectorBridge(
         iterations: Int = 20,
         finalLimit: Int = 10,
         targetLabels: Set<String> = setOf("Chunk", "Document")
-    ): List<BridgeResult> = hippoRAGQuery(
+    ): List<BridgeResult> = associativePageRankQuery(
         queryText = queryText,
         queryVector = queryVector,
         collection = null,
@@ -647,8 +647,7 @@ class GraphVectorBridge(
     )
 
     /**
-     * Assembled, token-budgeted context payload ready to inject into an on-device SLM prompt
-     * (e.g., Gemini Nano, Gemma, Llama).
+     * Assembled, token-budgeted context payload ready to inject into an on-device SLM prompt.
      */
     data class PromptContextWindow(
         val formattedContext: String,

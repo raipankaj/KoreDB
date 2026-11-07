@@ -37,24 +37,24 @@ import kotlin.math.sqrt
 
 /**
  * Comprehensive Opaque-Box E2E Test Suite for:
- * 1. HippoRAG 2 Personalized PageRank (PPR, Hub-Noise Damping, Multi-Hop Associative Recall)
- * 2. HNSW Matryoshka Representation Learning (MRL) 64-dim Short-Circuiting
- * 3. RaBitQ Binary Quantization (Orthogonal Projection, POPCNT Unbiased Estimation)
+ * 1. Hub-Damped Personalized PageRank (PPR, Hub-Noise Damping, Multi-Hop Associative Recall)
+ * 2. HNSW Prefix-Truncated 64-dim Short-Circuiting
+ * 3. Rotated Binary Quantization (Orthogonal Projection, POPCNT Unbiased Estimation)
  *
  * Covering:
  * - Tier 1: Feature Coverage (>=5 test cases per feature)
  * - Tier 2: Boundary & Corner Cases (empty graphs, single-node, disconnected, zero-vectors, dimension mismatches)
- * - Tier 3: Cross-Feature Interactions (RaBitQ + MRL vector funnel, HippoRAG with RRF multi-modal seeds)
+ * - Tier 3: Cross-Feature Interactions (RotatedBQ + Prefix vector funnel, Hub-Damped PageRank with RRF multi-modal seeds)
  * - Tier 4: Real-World Scenarios (Multi-hop reasoning over noisy knowledge graphs with high-degree hubs)
  */
-class HippoRAGAndVectorFunnelE2ETest {
+class AssociativePageRankAndVectorFunnelE2ETest {
 
     private lateinit var testDir: File
     private val random = Random(42L)
 
     @Before
     fun setUp() {
-        testDir = File("build/tmp/test_e2e_hipporag_funnel_${UUID.randomUUID()}")
+        testDir = File("build/tmp/test_e2e_associative_ppr_funnel_${UUID.randomUUID()}")
         testDir.mkdirs()
     }
 
@@ -67,10 +67,10 @@ class HippoRAGAndVectorFunnelE2ETest {
     // TIER 1: FEATURE COVERAGE (>= 5 Tests Per Feature)
     // ========================================================================
 
-    // --- Feature 1: HippoRAG 2 Personalized PageRank ---
+    // --- Feature 1: Hub-Damped Personalized PageRank ---
 
     @Test
-    fun testHippoRAGSeedNormalizationAndConservation() = runBlocking {
+    fun testHubDampedPPRSeedNormalizationAndConservation() = runBlocking {
         val db = KoreDatabase(testDir)
         val graph = db.graph()
 
@@ -83,7 +83,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         graph.putEdge(Edge("C", "A", "NEXT"))
 
         val seeds = mapOf("A" to 2.0, "B" to 1.0)
-        val groundTruth = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val groundTruth = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = setOf("A", "B", "C"),
             outEdges = mapOf("A" to listOf("B" to 1.0), "B" to listOf("C" to 1.0), "C" to listOf("A" to 1.0)),
             seeds = seeds,
@@ -107,7 +107,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGHubDampingSuppressesHubNoise() = runBlocking {
+    fun testHubDampingSuppressesHubNoise() = runBlocking {
         // Topology:
         // Source Seed S -> Target T (specific associative relationship)
         // Source Seed S -> Hub H (generic hub with 30 incoming links from noise nodes N1..N30)
@@ -126,7 +126,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         val seeds = mapOf("S" to 1.0)
 
         // 1. Without hub damping (beta = 0.0) - Standard PageRank where hub pools mass
-        val standardRanks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val standardRanks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -134,8 +134,8 @@ class HippoRAGAndVectorFunnelE2ETest {
             beta = 0.0
         )
 
-        // 2. With HippoRAG 2 hub damping (beta = 0.75)
-        val dampedRanks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        // 2. With Hub-Damped PPR hub damping (beta = 0.75)
+        val dampedRanks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -153,7 +153,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGMultiHopAssociativeRecall() = runBlocking {
+    fun testHubDampedPPRMultiHopAssociativeRecall() = runBlocking {
         // Multi-hop path: Query Seed (Q) -> Intermediate Context (I) -> Target Entity (E)
         // Non-relevant branch: Q -> Irrelevant (X) -> Dead End (D)
         val nodes = setOf("Q", "I", "E", "X", "D")
@@ -166,7 +166,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         )
         val seeds = mapOf("Q" to 10.0)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -180,7 +180,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGDanglingNodesTeleportation() = runBlocking {
+    fun testHubDampedPPRDanglingNodesTeleportation() = runBlocking {
         // Graph with dangling sinks (no outbound edges): S -> D1, S -> D2
         val nodes = setOf("S", "D1", "D2")
         val outEdges = mapOf(
@@ -189,7 +189,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         )
         val seeds = mapOf("S" to 1.0)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -206,7 +206,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGOverloadedDetectCommunities() = runBlocking {
+    fun testHubDampedPPROverloadedDetectCommunities() = runBlocking {
         val db = KoreDatabase(testDir)
         val graph = db.graph()
 
@@ -231,10 +231,10 @@ class HippoRAGAndVectorFunnelE2ETest {
         db.close()
     }
 
-    // --- Feature 2: HNSW MRL Short-Circuiting ---
+    // --- Feature 2: HNSW Prefix Short-Circuiting ---
 
     @Test
-    fun testMRLPrefixDistanceCalculation() {
+    fun testPrefixDistanceCalculation() {
         val dim = 768
         val prefixDim = 64
         val v1 = TestContracts.generateNormalizedVector(dim, Random(101L))
@@ -258,7 +258,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testMRLUpperLayerRoutingWithCachedMagnitude() {
+    fun testPrefixUpperLayerRoutingWithCachedMagnitude() {
         val index = HNSWIndex(dimensions = 128, metric = DistanceMetric.COSINE, maxNeighbors = 16, efConstruction = 64)
         for (i in 0 until 50) {
             val vec = TestContracts.generateNormalizedVector(128, Random(i.toLong()))
@@ -277,7 +277,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testMRLLayer0FullRescoringGuaranteesExactness() {
+    fun testPrefixLayer0FullRescoringGuaranteesExactness() {
         val index = HNSWIndex(dimensions = 768, metric = DistanceMetric.COSINE, maxNeighbors = 16, efConstruction = 64)
         val vectors = HashMap<String, FloatArray>()
         for (i in 0 until 30) {
@@ -301,7 +301,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testMRLRecallPreservationAcrossEmbeddings() {
+    fun testPrefixRecallPreservationAcrossEmbeddings() {
         val dim = 128
         val count = 40
         val index = HNSWIndex(dimensions = dim, metric = DistanceMetric.COSINE, maxNeighbors = 16)
@@ -325,7 +325,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testMRLDimensionConfigurability() {
+    fun testPrefixDimensionConfigurability() {
         val dim = 64
         val v1 = TestContracts.generateNormalizedVector(dim, Random(1L))
         val v2 = TestContracts.generateNormalizedVector(dim, Random(2L))
@@ -338,10 +338,10 @@ class HippoRAGAndVectorFunnelE2ETest {
         assertEquals("Prefix 64 on 64-dim vector should match full compute", full, d64, 1e-4f)
     }
 
-    // --- Feature 3: RaBitQ in BinaryQuantizer ---
+    // --- Feature 3: Rotated Binary Quantization in BinaryQuantizer ---
 
     @Test
-    fun testRaBitQOrthogonalProjectionPreservesNorm() {
+    fun testRotatedBinaryOrthogonalProjectionPreservesNorm() {
         val dim = 64
         val matrix = TestContracts.generateOrthogonalMatrixGroundTruth(dim, seed = 42L)
 
@@ -373,7 +373,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testRaBitQCodeQuantizationAndCompressionRatio() {
+    fun testRotatedBinaryCodeQuantizationAndCompressionRatio() {
         val dim = 768
         val bq = BinaryQuantizer(dim)
         val vec = TestContracts.generateNormalizedVector(dim, Random(123L))
@@ -389,7 +389,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testRaBitQAsymmetricInnerProductEstimator() {
+    fun testRotatedBinaryAsymmetricInnerProductEstimator() {
         val dim = 128
         val random = Random(456L)
         val q = TestContracts.generateNormalizedVector(dim, random)
@@ -412,7 +412,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testRaBitQSymmetricEstimatorUsingHardwarePopcnt() {
+    fun testRotatedBinarySymmetricEstimatorUsingHardwarePopcnt() {
         val dim = 64
         val bq = BinaryQuantizer(dim)
         val v1 = TestContracts.generateNormalizedVector(dim, Random(11L))
@@ -427,7 +427,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         // POPCNT based ground truth estimator
         val cq = 1.0f / sqrt(dim.toFloat())
         val cx = 1.0f / sqrt(dim.toFloat())
-        val estIp = TestContracts.estimateRaBitQInnerProductGroundTruth(dim, hammingDist, cq, cx)
+        val estIp = TestContracts.estimateRotatedBinaryInnerProductGroundTruth(dim, hammingDist, cq, cx)
 
         // Estimated IP should be finite and bounded
         assertFalse(estIp.isNaN())
@@ -435,7 +435,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testRaBitQUnbiasedExpectation() {
+    fun testRotatedBinaryUnbiasedExpectation() {
         val dim = 64
         val random = Random(789L)
         val q = TestContracts.generateNormalizedVector(dim, random)
@@ -463,7 +463,7 @@ class HippoRAGAndVectorFunnelE2ETest {
             val h = bq.hammingDistance(codeQ, codeX)
             val cq = 1.0f / sqrt(dim.toFloat())
             val cx = 1.0f / sqrt(dim.toFloat())
-            sumEstimatedIp += TestContracts.estimateRaBitQInnerProductGroundTruth(dim, h, cq, cx)
+            sumEstimatedIp += TestContracts.estimateRotatedBinaryInnerProductGroundTruth(dim, h, cq, cx)
         }
         val meanEstimatedIp = sumEstimatedIp / numProjections
         // Correlation check: estimated sign tracks exact sign
@@ -475,8 +475,8 @@ class HippoRAGAndVectorFunnelE2ETest {
     // ========================================================================
 
     @Test
-    fun testHippoRAGEmptyGraphReturnsEmpty() {
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+    fun testHubDampedPPREmptyGraphReturnsEmpty() {
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = emptySet(),
             outEdges = emptyMap(),
             seeds = emptyMap()
@@ -485,12 +485,12 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGSingleNodeGraph() {
+    fun testHubDampedPPRSingleNodeGraph() {
         val nodes = setOf("SOLO")
         val outEdges = mapOf("SOLO" to listOf("SOLO" to 1.0))
         val seeds = mapOf("SOLO" to 5.0)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds
@@ -501,7 +501,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGDisconnectedComponents() {
+    fun testHubDampedPPRDisconnectedComponents() {
         // Component 1: A -> B
         // Component 2: X -> Y
         // Seed strictly in Component 1
@@ -514,7 +514,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         )
         val seeds = mapOf("A" to 1.0)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -528,7 +528,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testRaBitQZeroVectorSafeguard() {
+    fun testRotatedBinaryZeroVectorSafeguard() {
         val dim = 64
         val bq = BinaryQuantizer(dim)
         val zeroVec = FloatArray(dim) { 0.0f }
@@ -540,7 +540,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testMRLMaxDimensionAndSmallDimension() {
+    fun testPrefixMaxDimensionAndSmallDimension() {
         // Small dimension: 16 dims (smaller than 64-dim prefix)
         val dim = 16
         val v1 = TestContracts.generateNormalizedVector(dim, Random(1L))
@@ -556,7 +556,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     // ========================================================================
 
     @Test
-    fun testAdaptiveVectorFunnelRaBitQPreFilterThenMRLRescore() {
+    fun testAdaptiveVectorFunnelRotatedBinaryPreFilterThenPrefixRescore() {
         val dim = 128
         val numItems = 100
         val bq = BinaryQuantizer(dim)
@@ -568,14 +568,14 @@ class HippoRAGAndVectorFunnelE2ETest {
         val query = TestContracts.generateNormalizedVector(dim, Random(888L))
         val quantizedQuery = bq.quantize(query)
 
-        // Stage 1: RaBitQ 1-bit Hamming candidate retrieval (oversample 3x -> top 15)
+        // Stage 1: Rotated 1-bit Hamming candidate retrieval (oversample 3x -> top 15)
         val candidates = quantizedCorpus.map { (id, code) ->
             id to bq.hammingDistance(quantizedQuery, code)
         }.sortedBy { it.second }.take(15).map { it.first }.toSet()
 
         assertEquals(15, candidates.size)
 
-        // Stage 2: MRL 64-dim prefix rescoring
+        // Stage 2: Prefix 64-dim rescoring
         val corpusMap = corpus.toMap()
         val stage2Results = candidates.map { id ->
             id to DistanceMetric.COSINE.computePrefix(query, corpusMap[id]!!, 64)
@@ -592,7 +592,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testHippoRAGPoweredByDualVectorBM25Seeds() = runBlocking {
+    fun testHubDampedPPRPoweredByDualVectorBM25Seeds() = runBlocking {
         val db = KoreDatabase(testDir)
         val graph = db.graph()
 
@@ -607,7 +607,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         // Seed scores simulated from RRF (BM25 + Vector)
         val rrfSeeds = mapOf("doc1" to 0.033, "doc2" to 0.016)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = setOf("doc1", "doc2", "doc3"),
             outEdges = mapOf(
                 "doc1" to listOf("doc2" to 1.0),
@@ -627,7 +627,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testMultiRelationalHippoRAGAcrossHeterogeneousEdges() = runBlocking {
+    fun testMultiRelationalHubDampedPPRAcrossHeterogeneousEdges() = runBlocking {
         val nodes = setOf("Chunk1", "EntityA", "EntityB", "Chunk2")
         val outEdges = mapOf(
             "Chunk1" to listOf("EntityA" to 1.0), // MENTIONS
@@ -637,7 +637,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         )
         val seeds = mapOf("Chunk1" to 1.0)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -678,8 +678,8 @@ class HippoRAGAndVectorFunnelE2ETest {
 
         val seeds = mapOf("Alice" to 10.0)
 
-        // Run HippoRAG with hub damping
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        // Run Hub-Damped PageRank
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,
@@ -695,7 +695,7 @@ class HippoRAGAndVectorFunnelE2ETest {
     }
 
     @Test
-    fun testEndToEndHippoRAGDocumentPassageRetrievalPipeline() = runBlocking {
+    fun testEndToEndHubDampedPPRDocumentPassageRetrievalPipeline() = runBlocking {
         val db = KoreDatabase(testDir)
         val graph = db.graph()
         val vectorCol = db.vectorCollection("doc_embeddings") {
@@ -706,7 +706,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         // Ingest documents and vectors
         val docs = listOf(
             "doc_1" to "KoreDB provides on-device LSM storage and HNSW vector indexing.",
-            "doc_2" to "HippoRAG 2 eliminates hub noise using degree-damped personalized PageRank.",
+            "doc_2" to "Hub-Damped PageRank eliminates hub noise using degree-damped personalized PageRank.",
             "doc_3" to "Binary quantization compresses float vectors by 32x using POPCNT."
         )
 
@@ -727,7 +727,7 @@ class HippoRAGAndVectorFunnelE2ETest {
         assertTrue(vectorHits.isNotEmpty())
 
         val seeds = vectorHits.associate { it.first to it.second.toDouble() }
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = docs.map { it.first }.toSet(),
             outEdges = mapOf("doc_1" to listOf("doc_2" to 1.0), "doc_2" to listOf("doc_3" to 1.0)),
             seeds = seeds

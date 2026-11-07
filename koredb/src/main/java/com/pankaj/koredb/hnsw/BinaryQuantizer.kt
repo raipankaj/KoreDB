@@ -21,20 +21,20 @@ import java.nio.ByteOrder
 import java.util.PriorityQueue
 
 /**
- * Compact RaBitQ quantized code representation.
+ * Compact Rotated Binary Quantization (Orthogonal Projection) code representation.
  *
  * @property bits Packed sign bits (1 bit per dimension, packed in 64-bit Longs).
  * @property l2Norm Exact L2 norm of the original vector ||x||_2.
  * @property scaleFactor Normalized L1 norm of the rotated vector: c_x = ||x~||_1 / D.
  */
-data class RaBitQCode(
+data class RotatedBinaryCode(
     val bits: LongArray,
     val l2Norm: Float,
     val scaleFactor: Float
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
-        if (other !is RaBitQCode) return false
+        if (other !is RotatedBinaryCode) return false
         return bits.contentEquals(other.bits) &&
                 l2Norm == other.l2Norm &&
                 scaleFactor == other.scaleFactor
@@ -56,35 +56,35 @@ data class RaBitQCode(
     }
 
     companion object {
-        fun unpackFromBytes(bytes: ByteArray): RaBitQCode {
+        fun unpackFromBytes(bytes: ByteArray): RotatedBinaryCode {
             val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
             val bitWords = (bytes.size - 8) ushr 3
             val bits = LongArray(bitWords) { buf.long }
             val l2Norm = buf.float
             val scaleFactor = buf.float
-            return RaBitQCode(bits, l2Norm, scaleFactor)
+            return RotatedBinaryCode(bits, l2Norm, scaleFactor)
         }
     }
 }
 
 /**
- * 1-Bit Binary Quantizer (BQ) & RaBitQ for ultra-dense on-device vector search.
+ * 1-Bit Binary Quantizer (BQ) & Rotated Binary Quantization for ultra-dense on-device vector search.
  *
  * Compresses 32-bit `FloatArray` embeddings into bit-packed 64-bit `LongArray` words,
  * achieving a **32x memory reduction** (e.g., a 768-dim vector shrinks from 3,072 bytes to 96 bytes)
  * and enabling hardware-accelerated Hamming distance via CPU `POPCNT` / ARM `CNT` instructions
  * (`java.lang.Long.bitCount(a xor b)`).
  *
- * Supports RaBitQ with deterministic orthogonal projection $R$, compact [RaBitQCode], and
- * unbiased asymmetric/symmetric distance estimators.
+ * Supports Orthogonal Projection Binary Quantization with deterministic orthogonal rotation $R$,
+ * compact [RotatedBinaryCode], and unbiased asymmetric/symmetric distance estimators.
  *
  * @property dimensions Vector dimensionality $D$.
- * @property enableRaBitQ Whether to enable orthogonal rotation for RaBitQ estimation.
+ * @property enableOrthogonalRotation Whether to enable orthogonal rotation for variance equalization and unbiased estimation.
  * @property randomSeed Seed for deterministic orthogonal matrix generation.
  */
 class BinaryQuantizer(
     val dimensions: Int,
-    val enableRaBitQ: Boolean = true,
+    val enableOrthogonalRotation: Boolean = true,
     val randomSeed: Long = 42L
 ) {
 
@@ -95,8 +95,8 @@ class BinaryQuantizer(
     /** Number of 64-bit `Long` words required to store [dimensions] bits. */
     val wordCount: Int = (dimensions + 63) ushr 6
 
-    /** Orthogonal rotation matrix for RaBitQ variance equalization and norm preservation. */
-    val rotationMatrix: Array<FloatArray> = if (enableRaBitQ) {
+    /** Orthogonal rotation matrix for variance equalization and norm preservation. */
+    val rotationMatrix: Array<FloatArray> = if (enableOrthogonalRotation) {
         Companion.generateOrthogonalMatrix(dimensions, randomSeed)
     } else {
         emptyArray()
@@ -258,7 +258,7 @@ class BinaryQuantizer(
      */
     fun rotate(vector: FloatArray): FloatArray {
         require(vector.size == dimensions) { "Expected $dimensions dimensions, got ${vector.size}" }
-        if (!enableRaBitQ || rotationMatrix.isEmpty()) return vector
+        if (!enableOrthogonalRotation || rotationMatrix.isEmpty()) return vector
         val out = FloatArray(dimensions)
         for (i in 0 until dimensions) {
             out[i] = com.pankaj.koredb.core.SimdVectorMath.dotProduct16(rotationMatrix[i], vector, dimensions)
@@ -267,12 +267,12 @@ class BinaryQuantizer(
     }
 
     /**
-     * Quantizes an FP32 vector using RaBitQ into a compact [RaBitQCode].
+     * Quantizes an FP32 vector using orthogonal projection into a compact [RotatedBinaryCode].
      */
-    fun quantizeRaBitQ(vector: FloatArray): RaBitQCode {
+    fun quantizeRotated(vector: FloatArray): RotatedBinaryCode {
         require(vector.size == dimensions) { "Expected $dimensions dimensions, got ${vector.size}" }
 
-        val rotated = if (enableRaBitQ) rotate(vector) else vector
+        val rotated = if (enableOrthogonalRotation) rotate(vector) else vector
         val l2Norm = com.pankaj.koredb.core.VectorMath.getMagnitude(vector)
 
         val bits = LongArray(wordCount)
@@ -289,16 +289,16 @@ class BinaryQuantizer(
         }
 
         val scaleFactor = l1Sum / dimensions.toFloat()
-        return RaBitQCode(bits, l2Norm, scaleFactor)
+        return RotatedBinaryCode(bits, l2Norm, scaleFactor)
     }
 
     /**
-     * Unbiased Asymmetric Inner Product estimation between full-precision query and [RaBitQCode]:
+     * Unbiased Asymmetric Inner Product estimation between full-precision query and [RotatedBinaryCode]:
      * <q, x>^ = c_x * <q~, b(x~)> * sqrt(PI / 2)
      */
-    fun estimateInnerProductAsymmetric(query: FloatArray, code: RaBitQCode): Float {
+    fun estimateInnerProductAsymmetric(query: FloatArray, code: RotatedBinaryCode): Float {
         require(query.size == dimensions) { "Expected $dimensions dimensions, got ${query.size}" }
-        val qRot = if (enableRaBitQ) rotate(query) else query
+        val qRot = if (enableOrthogonalRotation) rotate(query) else query
         var sumQOnes = 0.0f
         var sumQTotal = 0.0f
 
@@ -317,9 +317,9 @@ class BinaryQuantizer(
     }
 
     /**
-     * Unbiased Asymmetric Cosine Similarity estimation between full-precision query and [RaBitQCode].
+     * Unbiased Asymmetric Cosine Similarity estimation between full-precision query and [RotatedBinaryCode].
      */
-    fun estimateCosineAsymmetric(query: FloatArray, code: RaBitQCode): Float {
+    fun estimateCosineAsymmetric(query: FloatArray, code: RotatedBinaryCode): Float {
         val qNorm = com.pankaj.koredb.core.VectorMath.getMagnitude(query)
         val denom = qNorm * code.l2Norm
         if (denom <= 0f) return 0f
@@ -328,9 +328,9 @@ class BinaryQuantizer(
     }
 
     /**
-     * Unbiased Asymmetric Euclidean Distance estimation between full-precision query and [RaBitQCode].
+     * Unbiased Asymmetric Euclidean Distance estimation between full-precision query and [RotatedBinaryCode].
      */
-    fun estimateEuclideanAsymmetric(query: FloatArray, code: RaBitQCode): Float {
+    fun estimateEuclideanAsymmetric(query: FloatArray, code: RotatedBinaryCode): Float {
         val qNorm = com.pankaj.koredb.core.VectorMath.getMagnitude(query)
         val estIp = estimateInnerProductAsymmetric(query, code)
         val sqDist = (qNorm * qNorm) + (code.l2Norm * code.l2Norm) - (2.0f * estIp)
@@ -338,10 +338,10 @@ class BinaryQuantizer(
     }
 
     /**
-     * Unbiased Symmetric Inner Product estimation between two [RaBitQCode]s using POPCNT:
+     * Unbiased Symmetric Inner Product estimation between two [RotatedBinaryCode]s using POPCNT:
      * <q, x>^ = c_q * c_x * (PI / 2) * (D - 2 * d_H)
      */
-    fun estimateInnerProductSymmetric(qCode: RaBitQCode, xCode: RaBitQCode): Float {
+    fun estimateInnerProductSymmetric(qCode: RotatedBinaryCode, xCode: RotatedBinaryCode): Float {
         val hDist = hammingDistance(qCode.bits, xCode.bits)
         val innerSign = dimensions - (2 * hDist)
         val factor = (Math.PI / 2.0).toFloat()
@@ -349,9 +349,9 @@ class BinaryQuantizer(
     }
 
     /**
-     * Unbiased Symmetric Cosine Similarity estimation between two [RaBitQCode]s using POPCNT.
+     * Unbiased Symmetric Cosine Similarity estimation between two [RotatedBinaryCode]s using POPCNT.
      */
-    fun estimateCosineSymmetric(qCode: RaBitQCode, xCode: RaBitQCode): Float {
+    fun estimateCosineSymmetric(qCode: RotatedBinaryCode, xCode: RotatedBinaryCode): Float {
         val denom = qCode.l2Norm * xCode.l2Norm
         if (denom <= 0f) return 0f
         val estIp = estimateInnerProductSymmetric(qCode, xCode)
@@ -359,28 +359,28 @@ class BinaryQuantizer(
     }
 
     /**
-     * Unbiased Symmetric Euclidean Distance estimation between two [RaBitQCode]s using POPCNT.
+     * Unbiased Symmetric Euclidean Distance estimation between two [RotatedBinaryCode]s using POPCNT.
      */
-    fun estimateEuclideanSymmetric(qCode: RaBitQCode, xCode: RaBitQCode): Float {
+    fun estimateEuclideanSymmetric(qCode: RotatedBinaryCode, xCode: RotatedBinaryCode): Float {
         val estIp = estimateInnerProductSymmetric(qCode, xCode)
         val sqDist = (qCode.l2Norm * qCode.l2Norm) + (xCode.l2Norm * xCode.l2Norm) - (2.0f * estIp)
         return kotlin.math.sqrt(sqDist.coerceAtLeast(0.0f))
     }
 
     /**
-     * Two-stage search using RaBitQ symmetric estimators for Stage 1 candidate retrieval,
+     * Two-stage search using rotated 1-bit POPCNT estimators for Stage 1 candidate retrieval,
      * followed by Stage 2 exact rescoring.
      */
-    fun searchTwoStageRaBitQ(
+    fun searchTwoStageRotated(
         query: FloatArray,
-        index: Map<String, RaBitQCode>,
+        index: Map<String, RotatedBinaryCode>,
         limit: Int = 10,
         oversampleFactor: Int = 4,
         metric: DistanceMetric = DistanceMetric.COSINE,
         exactVectorProvider: (String) -> FloatArray?
     ): List<Pair<String, Float>> {
         if (index.isEmpty() || limit <= 0) return emptyList()
-        val queryCode = quantizeRaBitQ(query)
+        val queryCode = quantizeRotated(query)
         val stage1Limit = (limit * oversampleFactor.coerceAtLeast(1)).coerceAtMost(index.size)
 
         val topCoarse = PriorityQueue<Pair<String, Float>>(stage1Limit + 1) { a, b ->

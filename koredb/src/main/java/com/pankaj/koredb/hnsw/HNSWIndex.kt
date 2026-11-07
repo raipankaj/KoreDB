@@ -252,14 +252,14 @@ class HNSWIndex(
      * @param query The query vector.
      * @param limit Number of results to return.
      * @param filter Optional metadata filter (pre-filtering during traversal).
-     * @param mrlCoarseDims Truncated dimensions for upper-layer greedy search (default: 64).
+     * @param coarsePrefixDims Truncated prefix dimensions for upper-layer greedy search (default: 64).
      * @return List of (id, similarity) pairs sorted by descending similarity.
      */
     fun search(
         query: FloatArray,
         limit: Int,
         filter: VectorFilter = VectorFilter.EMPTY,
-        mrlCoarseDims: Int = 64
+        coarsePrefixDims: Int = 64
     ): List<Pair<String, Float>> {
         val startNode = entryNode.get() ?: return emptyList()
         val firstNode = nodes.values.firstOrNull()
@@ -269,18 +269,18 @@ class HNSWIndex(
         }
 
         val queryMag = VectorMath.getMagnitude(query)
-        val useMrl = mrlCoarseDims in 1 until query.size
-        val coarseDims = if (useMrl) mrlCoarseDims else query.size
-        val queryMag64 = if (useMrl) com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(query, coarseDims) else queryMag
+        val usePrefixShortCircuit = coarsePrefixDims in 1 until query.size
+        val coarseDims = if (usePrefixShortCircuit) coarsePrefixDims else query.size
+        val queryMag64 = if (usePrefixShortCircuit) com.pankaj.koredb.core.SimdVectorMath.getMagnitude16(query, coarseDims) else queryMag
 
         var currNode = startNode
-        var currDist = if (useMrl) {
+        var currDist = if (usePrefixShortCircuit) {
             computePrefixFast(query, queryMag64, currNode, coarseDims)
         } else {
             distance(query, queryMag, currNode)
         }
 
-        // Navigate upper layers greedily using truncated 64 dimensions
+        // Navigate upper layers greedily using truncated prefix dimensions
         val currentMaxLevel = maxLevel.get()
         if (currentMaxLevel >= 1) {
             for (l in currentMaxLevel downTo 1) {
@@ -291,7 +291,7 @@ class HNSWIndex(
                         for (neighborId in currNode.neighbors[l]) {
                             if (neighborId in tombstones) continue
                             val neighborNode = nodes[neighborId] ?: continue
-                            val d = if (useMrl) {
+                            val d = if (usePrefixShortCircuit) {
                                 computePrefixFast(query, queryMag64, neighborNode, coarseDims)
                             } else {
                                 distance(query, queryMag, neighborNode)
@@ -320,14 +320,14 @@ class HNSWIndex(
     fun search(query: FloatArray, k: Int): List<Pair<String, Float>> = search(query, limit = k)
 
     /**
-     * Executes a Two-Stage Matryoshka Representation Learning (MRL) Search:
+     * Executes a Two-Stage Prefix-Truncated Coarse-to-Fine Funnel Search:
      * 1. **Coarse Traversal**: Navigates the HNSW graph using only the first [coarseDims] dimensions
      *    (cutting per-comparison FLOPs by $D / d_{\text{coarse}}$, e.g. $12\times$ for $64$ vs $768$ dims)
      *    to shortlist `limit * oversampleFactor` candidates.
      * 2. **Fine Rescoring**: Rescores the shortlisted candidates using full $D$-dimensional vectors
      *    and returns the top [limit] results sorted by exact similarity descending.
      */
-    fun searchMatryoshka(
+    fun searchPrefixFunnel(
         query: FloatArray,
         limit: Int,
         coarseDims: Int = 64,

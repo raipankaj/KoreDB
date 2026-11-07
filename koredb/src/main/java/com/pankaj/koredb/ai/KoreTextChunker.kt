@@ -48,7 +48,7 @@ object KoreTextChunker {
 
     /**
      * Fast, allocation-free token estimator for English/multilingual BPE/SentencePiece tokenizers
-     * (e.g., Gemini Nano / Gemma / Llama tokenizers average ~3.8–4.0 chars per token, or ~1.3 tokens per word).
+     * (standard subword tokenizers average ~3.8–4.0 chars per token, or ~1.3 tokens per word).
      */
     fun estimateTokens(text: String): Int {
         if (text.isEmpty()) return 0

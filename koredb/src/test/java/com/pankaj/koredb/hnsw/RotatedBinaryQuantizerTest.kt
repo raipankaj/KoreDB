@@ -24,7 +24,7 @@ import java.util.Random
 import kotlin.math.abs
 import kotlin.math.sqrt
 
-class RaBitQTest {
+class RotatedBinaryQuantizerTest {
 
     private fun generateRandomVector(dim: Int, rng: Random): FloatArray {
         val vec = FloatArray(dim) { rng.nextGaussian().toFloat() }
@@ -63,7 +63,7 @@ class RaBitQTest {
     @Test
     fun testOrthogonalRotationPreservesNormAndInnerProduct() {
         val dim = 128
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 100L)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 100L)
         val rng = Random(2026L)
 
         val x = generateRandomVector(dim, rng)
@@ -86,13 +86,13 @@ class RaBitQTest {
     }
 
     @Test
-    fun testRaBitQCodeQuantizationAndCompression() {
+    fun testRotatedBinaryCodeQuantizationAndCompression() {
         val dim = 768
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true)
         val rng = Random(12345L)
         val vec = generateRandomVector(dim, rng)
 
-        val code = bq.quantizeRaBitQ(vec)
+        val code = bq.quantizeRotated(vec)
 
         // 768 dims / 64 bits = 12 Longs
         assertEquals(12, code.bits.size)
@@ -108,14 +108,14 @@ class RaBitQTest {
         assertEquals("Compression ratio should be ~29.5x", 29.538f, compressionRatio, 0.1f)
 
         // Round-trip pack / unpack
-        val restored = RaBitQCode.unpackFromBytes(packed)
+        val restored = RotatedBinaryCode.unpackFromBytes(packed)
         assertEquals(code, restored)
     }
 
     @Test
     fun testAsymmetricInnerProductEstimatorUnbiasedness() {
         val dim = 64
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 555L)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 555L)
         val rng = Random(9999L)
 
         var totalError = 0.0f
@@ -126,7 +126,7 @@ class RaBitQTest {
             val x = generateRandomVector(dim, rng)
 
             val exactIp = SimdVectorMath.dotProduct16(q, x, dim)
-            val codeX = bq.quantizeRaBitQ(x)
+            val codeX = bq.quantizeRotated(x)
             val estIp = bq.estimateInnerProductAsymmetric(q, codeX)
 
             totalError += (estIp - exactIp)
@@ -140,14 +140,14 @@ class RaBitQTest {
     @Test
     fun testSymmetricEstimatorHardwarePopcnt() {
         val dim = 128
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 888L)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 888L)
         val rng = Random(3333L)
 
         val q = generateRandomVector(dim, rng)
         val x = generateRandomVector(dim, rng)
 
-        val qCode = bq.quantizeRaBitQ(q)
-        val xCode = bq.quantizeRaBitQ(x)
+        val qCode = bq.quantizeRotated(q)
+        val xCode = bq.quantizeRotated(x)
 
         val estCos = bq.estimateCosineSymmetric(qCode, xCode)
         val exactCos = DistanceMetric.COSINE.compute(q, x)
@@ -165,20 +165,20 @@ class RaBitQTest {
     }
 
     @Test
-    fun testSearchTwoStageRaBitQ() {
+    fun testSearchTwoStageRotated() {
         val dim = 64
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 42L)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 42L)
         val rng = Random(777L)
 
         val numDocs = 50
         val rawVectors = HashMap<String, FloatArray>()
-        val rabitqIndex = HashMap<String, RaBitQCode>()
+        val rotatedIndex = HashMap<String, RotatedBinaryCode>()
 
         for (i in 0 until numDocs) {
             val id = "doc_$i"
             val vec = generateRandomVector(dim, rng)
             rawVectors[id] = vec
-            rabitqIndex[id] = bq.quantizeRaBitQ(vec)
+            rotatedIndex[id] = bq.quantizeRotated(vec)
         }
 
         // Query near doc_10
@@ -189,9 +189,9 @@ class RaBitQTest {
         qNorm = sqrt(qNorm)
         for (i in 0 until dim) query[i] /= qNorm
 
-        val results = bq.searchTwoStageRaBitQ(
+        val results = bq.searchTwoStageRotated(
             query = query,
-            index = rabitqIndex,
+            index = rotatedIndex,
             limit = 5,
             oversampleFactor = 4,
             metric = DistanceMetric.COSINE,

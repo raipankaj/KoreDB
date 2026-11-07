@@ -10,7 +10,7 @@ This guide provides an architectural blueprint for Android developers. It detail
 | :--- | :--- | :--- | :--- |
 | **Document Engine (`binaryCollection`)** | Caching API responses, user profiles, catalog entities without SQLite schema boilerplate. | Room, SQLite, SharedPreferences | 3.9x faster point reads; no SQL queries or migrations needed; uses binary CBOR. |
 | **Numeric Range Indexing** | Price slider filtering, timestamp range lookups, sensor logs (heart rate, step counts). | Room SQL `BETWEEN ? AND ?` | 6.1x faster; zero SQL parsing overhead; contiguous order-preserving binary byte scans. |
-| **Vector Engine (`vectorCollection`)** | On-device AI, local semantic search, image/audio retrieval (CLIP/Whisper), local LLM memory. | ObjectBox Vector, sqlite-vec | Sub-millisecond HNSW; native Kotlin without heavy C++ JNI bridge overhead; off-heap memory-mapped. |
+| **Vector Engine (`vectorCollection`)** | On-device AI, local semantic search, image/audio retrieval, local LLM memory. | Conventional Native / SQLite Vector Extensions | Sub-millisecond HNSW; native Kotlin without heavy C++ JNI bridge overhead; off-heap memory-mapped. |
 | **Scalar Quantization (SQ8)** | Devices with low RAM (2GB–4GB); indexing >20,000 embeddings without OOM. | None (manual quantization) | Automatic 4x RAM reduction with >98% recall accuracy; off-heap memory-mapped storage. |
 | **Property Graph (`graph()`)** | Friend networks, offline knowledge graphs, permission hierarchies, recommendation paths. | Room multi-table JOINs | Bidirectional $O(1)$ relationship traversal; key-only fast paths bypass payload reads; cascading deletes. |
 | **Hybrid Graph RAG (`GraphVectorBridge`)** | Contextual on-device AI assistants, personalized recommendation engines. | Custom glue code | Combines relational constraints + semantic similarity + BM25 text rank in one fluent pipeline. |
@@ -101,7 +101,7 @@ class HealthRepository(context: Context) {
 
 ### When is it helpful?
 - **On-Device Semantic Search**: Searching notes, documents, or photos based on semantic meaning rather than exact keywords (e.g., searching *"beach vacation"* finds photos tagged *"ocean sunset"*).
-- **Personalized On-Device AI & RAG**: Providing relevant local context to local LLMs (MediaPipe LLM Inference, Gemma 2B, Gemini Nano) without sending private user data to the cloud.
+- **Personalized On-Device AI & RAG**: Providing relevant local context to on-device small language models without sending private user data to the cloud.
 - **Similar Product / Item Recommendations**: Calculating nearest neighbor items based on user interactions.
 
 ### How to add it in Android:

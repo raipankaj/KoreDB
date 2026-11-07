@@ -472,7 +472,7 @@ class KoreDatabase(
 
     /**
      * Creates a zero-dependency On-Device Embedding Pipeline ([com.pankaj.koredb.ai.KoreEmbeddingPipeline])
-     * with LRU caching, Matryoshka (MRL) dimension slicing, and 16-lane L2 normalization.
+     * with LRU caching, multi-resolution prefix dimension slicing, and 16-lane L2 normalization.
      */
     fun embeddingPipeline(
         targetDimensions: Int? = null,

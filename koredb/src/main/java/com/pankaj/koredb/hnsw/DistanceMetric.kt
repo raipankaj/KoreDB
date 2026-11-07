@@ -116,7 +116,7 @@ enum class DistanceMetric {
 
     /**
      * Computes similarity/distance over only the first [prefixDims] dimensions
-     * without allocating sub-arrays (used by Matryoshka Representation Learning search).
+     * without allocating sub-arrays (used by prefix-truncated coarse-to-fine search).
      */
     abstract fun computePrefix(a: FloatArray, b: FloatArray, prefixDims: Int): Float
 

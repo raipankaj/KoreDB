@@ -26,7 +26,7 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * Adversarial Stress & Empirical Verification Test Suite for Milestone 1 (SOTA MRL & RaBitQ).
+ * Adversarial Stress & Empirical Verification Test Suite for Milestone 1 (Prefix Short-Circuiting & Rotated Binary Quantization).
  */
 class M1AdversarialChallengeTest {
 
@@ -41,7 +41,7 @@ class M1AdversarialChallengeTest {
         return vec
     }
 
-    private fun generateMrlVector(dim: Int, rng: Random, decayPower: Float = 0.5f): FloatArray {
+    private fun generatePrefixVector(dim: Int, rng: Random, decayPower: Float = 0.5f): FloatArray {
         val vec = FloatArray(dim) { idx ->
             val scale = 1.0f / (1.0f + idx * 0.05f).pow(decayPower)
             rng.nextGaussian().toFloat() * scale
@@ -54,15 +54,15 @@ class M1AdversarialChallengeTest {
     }
 
     // ========================================================================
-    // 1. RABITQ UNBIASEDNESS EMPIRICAL VERIFICATION (D = 128, 768)
+    // 1. ROTATED BINARY QUANTIZATION UNBIASEDNESS EMPIRICAL VERIFICATION (D = 128, 768)
     // ========================================================================
 
     @Test
-    fun testRaBitQUnbiasedness128Dim() {
+    fun testRotatedBinaryUnbiasedness128Dim() {
         val dim = 128
         val numPairs = 1000
         val rng = Random(424242L)
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 9999L)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 9999L)
 
         var totalAsymError = 0.0
         var totalSymError = 0.0
@@ -72,12 +72,12 @@ class M1AdversarialChallengeTest {
             val x = generateGaussianVector(dim, rng, normalized = true)
 
             val exactIp = SimdVectorMath.dotProduct16(q, x, dim).toDouble()
-            val codeX = bq.quantizeRaBitQ(x)
+            val codeX = bq.quantizeRotated(x)
             val estAsymIp = bq.estimateInnerProductAsymmetric(q, codeX).toDouble()
 
             totalAsymError += (estAsymIp - exactIp)
 
-            val codeQ = bq.quantizeRaBitQ(q)
+            val codeQ = bq.quantizeRotated(q)
             val estSymIp = bq.estimateInnerProductSymmetric(codeQ, codeX).toDouble()
             totalSymError += (estSymIp - exactIp)
         }
@@ -85,26 +85,26 @@ class M1AdversarialChallengeTest {
         val meanAsymBias = totalAsymError / numPairs
         val meanSymBias = totalSymError / numPairs
 
-        println("RaBitQ D=$dim Unbiasedness (N=$numPairs):")
+        println("RotatedBQ D=$dim Unbiasedness (N=$numPairs):")
         println("  Mean Asymmetric Error |E[<q,x>^] - <q,x>| = ${abs(meanAsymBias)} (raw: $meanAsymBias)")
         println("  Mean Symmetric Error  |E[<q,x>^] - <q,x>| = ${abs(meanSymBias)} (raw: $meanSymBias)")
 
         assertTrue(
-            "RaBitQ D=$dim Asymmetric sample mean error must be <= 0.05, was ${abs(meanAsymBias)}",
+            "RotatedBQ D=$dim Asymmetric sample mean error must be <= 0.05, was ${abs(meanAsymBias)}",
             abs(meanAsymBias) <= 0.05
         )
         assertTrue(
-            "RaBitQ D=$dim Symmetric sample mean error must be <= 0.05, was ${abs(meanSymBias)}",
+            "RotatedBQ D=$dim Symmetric sample mean error must be <= 0.05, was ${abs(meanSymBias)}",
             abs(meanSymBias) <= 0.05
         )
     }
 
     @Test
-    fun testRaBitQUnbiasedness768Dim() {
+    fun testRotatedBinaryUnbiasedness768Dim() {
         val dim = 768
         val numPairs = 1000
         val rng = Random(768768L)
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true, randomSeed = 8888L)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true, randomSeed = 8888L)
 
         var totalAsymError = 0.0
         var totalSymError = 0.0
@@ -114,12 +114,12 @@ class M1AdversarialChallengeTest {
             val x = generateGaussianVector(dim, rng, normalized = true)
 
             val exactIp = SimdVectorMath.dotProduct16(q, x, dim).toDouble()
-            val codeX = bq.quantizeRaBitQ(x)
+            val codeX = bq.quantizeRotated(x)
             val estAsymIp = bq.estimateInnerProductAsymmetric(q, codeX).toDouble()
 
             totalAsymError += (estAsymIp - exactIp)
 
-            val codeQ = bq.quantizeRaBitQ(q)
+            val codeQ = bq.quantizeRotated(q)
             val estSymIp = bq.estimateInnerProductSymmetric(codeQ, codeX).toDouble()
             totalSymError += (estSymIp - exactIp)
         }
@@ -127,16 +127,16 @@ class M1AdversarialChallengeTest {
         val meanAsymBias = totalAsymError / numPairs
         val meanSymBias = totalSymError / numPairs
 
-        println("RaBitQ D=$dim Unbiasedness (N=$numPairs):")
+        println("RotatedBQ D=$dim Unbiasedness (N=$numPairs):")
         println("  Mean Asymmetric Error |E[<q,x>^] - <q,x>| = ${abs(meanAsymBias)} (raw: $meanAsymBias)")
         println("  Mean Symmetric Error  |E[<q,x>^] - <q,x>| = ${abs(meanSymBias)} (raw: $meanSymBias)")
 
         assertTrue(
-            "RaBitQ D=$dim Asymmetric sample mean error must be <= 0.05, was ${abs(meanAsymBias)}",
+            "RotatedBQ D=$dim Asymmetric sample mean error must be <= 0.05, was ${abs(meanAsymBias)}",
             abs(meanAsymBias) <= 0.05
         )
         assertTrue(
-            "RaBitQ D=$dim Symmetric sample mean error must be <= 0.05, was ${abs(meanSymBias)}",
+            "RotatedBQ D=$dim Symmetric sample mean error must be <= 0.05, was ${abs(meanSymBias)}",
             abs(meanSymBias) <= 0.05
         )
     }
@@ -197,14 +197,14 @@ class M1AdversarialChallengeTest {
     fun testHardwarePopcntSpeedAndThroughput() {
         val dim = 768
         val rng = Random(12345L)
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true)
 
         val nVectors = 1000
         val rawVecs = Array(nVectors) { generateGaussianVector(dim, rng) }
-        val codes = Array(nVectors) { bq.quantizeRaBitQ(rawVecs[it]) }
+        val codes = Array(nVectors) { bq.quantizeRotated(rawVecs[it]) }
 
         val qRaw = generateGaussianVector(dim, rng)
-        val qCode = bq.quantizeRaBitQ(qRaw)
+        val qCode = bq.quantizeRotated(qRaw)
 
         // Warmup
         var warmSum = 0.0f
@@ -224,7 +224,7 @@ class M1AdversarialChallengeTest {
         }
         val fp32Nanos = System.nanoTime() - fp32Start
 
-        // Benchmark RaBitQ POPCNT Cosine
+        // Benchmark Rotated 1-Bit POPCNT Cosine
         val popcntStart = System.nanoTime()
         var popcntDummy = 0.0f
         for (it in 0 until iters) {
@@ -240,8 +240,8 @@ class M1AdversarialChallengeTest {
         val speedup = fp32Nanos.toDouble() / popcntNanos.toDouble()
 
         println("Speed Benchmark D=$dim across $totalOps ops:")
-        println("  FP32 Cosine:   ${fp32Nanos / 1_000_000} ms ($fp32OpsPerMs ops/ms)")
-        println("  POPCNT RaBitQ: ${popcntNanos / 1_000_000} ms ($popcntOpsPerMs ops/ms)")
+        println("  FP32 Cosine:     ${fp32Nanos / 1_000_000} ms ($fp32OpsPerMs ops/ms)")
+        println("  POPCNT RotatedBQ: ${popcntNanos / 1_000_000} ms ($popcntOpsPerMs ops/ms)")
         println("  Throughput speedup: %.2fx".format(speedup))
 
         assertTrue("POPCNT should achieve high throughput (> 1,000 ops/ms)", popcntOpsPerMs > 1_000)
@@ -250,16 +250,16 @@ class M1AdversarialChallengeTest {
     @Test
     fun testHardwarePopcntExtremeVectorsRobustness() {
         val dim = 128
-        val bq = BinaryQuantizer(dim, enableRaBitQ = true)
+        val bq = BinaryQuantizer(dim, enableOrthogonalRotation = true)
 
         // 1. All-zeros vector
         val zeros = FloatArray(dim) { 0.0f }
-        val zeroCode = bq.quantizeRaBitQ(zeros)
+        val zeroCode = bq.quantizeRotated(zeros)
         assertEquals(0.0f, zeroCode.l2Norm, 0.0f)
         assertEquals(0.0f, zeroCode.scaleFactor, 0.0f)
 
         val nonZero = generateGaussianVector(dim, Random(1L))
-        val nonZeroCode = bq.quantizeRaBitQ(nonZero)
+        val nonZeroCode = bq.quantizeRotated(nonZero)
 
         val cosZero1 = bq.estimateCosineSymmetric(zeroCode, nonZeroCode)
         val cosZero2 = bq.estimateCosineSymmetric(zeroCode, zeroCode)
@@ -272,8 +272,8 @@ class M1AdversarialChallengeTest {
         // 2. Unit basis vectors
         val e0 = FloatArray(dim) { if (it == 0) 1.0f else 0.0f }
         val eLast = FloatArray(dim) { if (it == dim - 1) 1.0f else 0.0f }
-        val codeE0 = bq.quantizeRaBitQ(e0)
-        val codeELast = bq.quantizeRaBitQ(eLast)
+        val codeE0 = bq.quantizeRotated(e0)
+        val codeELast = bq.quantizeRotated(eLast)
 
         val cosBasis = bq.estimateCosineSymmetric(codeE0, codeELast)
         assertTrue("Orthogonal basis estimated cosine must be close to 0", abs(cosBasis) < 0.4f)
@@ -282,8 +282,8 @@ class M1AdversarialChallengeTest {
         val hugeVec = FloatArray(dim) { 1e15f }
         val tinyVec = FloatArray(dim) { 1e-15f }
 
-        val codeHuge = bq.quantizeRaBitQ(hugeVec)
-        val codeTiny = bq.quantizeRaBitQ(tinyVec)
+        val codeHuge = bq.quantizeRotated(hugeVec)
+        val codeTiny = bq.quantizeRotated(tinyVec)
 
         assertFalse("L2 norm must not be NaN", codeHuge.l2Norm.isNaN())
         assertFalse("Scale factor must not be NaN", codeHuge.scaleFactor.isNaN())
@@ -297,19 +297,19 @@ class M1AdversarialChallengeTest {
         val posVec = generateGaussianVector(dim, Random(55L))
         val negVec = FloatArray(dim) { -posVec[it] }
 
-        val codePos = bq.quantizeRaBitQ(posVec)
-        val codeNeg = bq.quantizeRaBitQ(negVec)
+        val codePos = bq.quantizeRotated(posVec)
+        val codeNeg = bq.quantizeRotated(negVec)
 
         val cosOpposite = bq.estimateCosineSymmetric(codePos, codeNeg)
         assertTrue("Anti-parallel vectors must have estimated cosine < -0.5, was $cosOpposite", cosOpposite < -0.5f)
     }
 
     // ========================================================================
-    // 4. MRL UPPER-LAYER TRUNCATION RECALL EMPIRICAL AUDIT
+    // 4. PREFIX UPPER-LAYER TRUNCATION RECALL EMPIRICAL AUDIT
     // ========================================================================
 
     @Test
-    fun testMrlUpperLayerTruncationRecall() {
+    fun testPrefixUpperLayerTruncationRecall() {
         val dim = 128
         val numVectors = 300
         val topK = 5
@@ -325,7 +325,7 @@ class M1AdversarialChallengeTest {
         )
 
         for (i in 0 until numVectors) {
-            val vec = generateMrlVector(dim, rng)
+            val vec = generatePrefixVector(dim, rng)
             index.insert("v_$i", vec)
         }
 
@@ -333,21 +333,21 @@ class M1AdversarialChallengeTest {
         var totalExactRescoresVerified = 0
 
         for (q in 0 until numQueries) {
-            val query = generateMrlVector(dim, Random(q.toLong() * 1013 + 7))
+            val query = generatePrefixVector(dim, Random(q.toLong() * 1013 + 7))
 
-            // MRL short-circuiting: 64-dim in upper layers, Layer 0 full rescore
-            val mrlResults = index.search(query, limit = topK, mrlCoarseDims = 64)
-            val mrlIds = mrlResults.map { it.first }.toSet()
+            // Prefix short-circuiting: 64-dim in upper layers, Layer 0 full rescore
+            val prefixResults = index.search(query, limit = topK, coarsePrefixDims = 64)
+            val prefixIds = prefixResults.map { it.first }.toSet()
 
             // Baseline: full search without truncation
-            val fullResults = index.search(query, limit = topK, mrlCoarseDims = dim)
+            val fullResults = index.search(query, limit = topK, coarsePrefixDims = dim)
             val fullIds = fullResults.map { it.first }.toSet()
 
-            val overlap = mrlIds.intersect(fullIds).size
+            val overlap = prefixIds.intersect(fullIds).size
             totalRecallMatches += overlap
 
             // Verify Layer 0 rescore: exact cosine similarity returned
-            for (res in mrlResults) {
+            for (res in prefixResults) {
                 // If the top element has valid distance, verify it's exact
                 assertTrue("Returned distance should be valid cosine in [-1, 1]", res.second in -1.0f..1.0001f)
                 totalExactRescoresVerified++
@@ -356,17 +356,17 @@ class M1AdversarialChallengeTest {
 
         val totalExpected = topK * numQueries
         val recall = totalRecallMatches.toDouble() / totalExpected
-        println("MRL 64-dim Upper-Layer Truncation Recall (N=$numVectors, queries=$numQueries, topK=$topK):")
+        println("Prefix 64-dim Upper-Layer Truncation Recall (N=$numVectors, queries=$numQueries, topK=$topK):")
         println("  Recall vs Full Search = ${(recall * 100.0)}% ($totalRecallMatches / $totalExpected)")
 
         assertTrue(
-            "Top-K recall of MRL short-circuiting against full search must be >= 95%, was $recall",
+            "Top-K recall of prefix short-circuiting against full search must be >= 95%, was $recall",
             recall >= 0.95
         )
     }
 
     @Test
-    fun testMrlUpperLayerTruncation768DimStress() {
+    fun testPrefixUpperLayerTruncation768DimStress() {
         val dim = 768
         val numVectors = 200
         val topK = 10
@@ -382,36 +382,36 @@ class M1AdversarialChallengeTest {
         )
 
         for (i in 0 until numVectors) {
-            val vec = generateMrlVector(dim, rng, decayPower = 0.6f)
+            val vec = generatePrefixVector(dim, rng, decayPower = 0.6f)
             index.insert("v_$i", vec)
         }
 
         var totalRecallMatches = 0
         for (q in 0 until numQueries) {
-            val query = generateMrlVector(dim, Random(q.toLong() * 2027 + 13), decayPower = 0.6f)
+            val query = generatePrefixVector(dim, Random(q.toLong() * 2027 + 13), decayPower = 0.6f)
 
-            val mrlResults = index.search(query, limit = topK, mrlCoarseDims = 64)
-            val mrlIds = mrlResults.map { it.first }.toSet()
+            val prefixResults = index.search(query, limit = topK, coarsePrefixDims = 64)
+            val prefixIds = prefixResults.map { it.first }.toSet()
 
-            val fullResults = index.search(query, limit = topK, mrlCoarseDims = dim)
+            val fullResults = index.search(query, limit = topK, coarsePrefixDims = dim)
             val fullIds = fullResults.map { it.first }.toSet()
 
-            totalRecallMatches += mrlIds.intersect(fullIds).size
+            totalRecallMatches += prefixIds.intersect(fullIds).size
         }
 
         val totalExpected = topK * numQueries
         val recall = totalRecallMatches.toDouble() / totalExpected
-        println("MRL 768-dim -> 64-dim Upper-Layer Truncation (12x FLOP reduction):")
+        println("Prefix 768-dim -> 64-dim Upper-Layer Truncation (12x FLOP reduction):")
         println("  Recall@$topK = ${(recall * 100.0)}% ($totalRecallMatches / $totalExpected)")
 
         assertTrue(
-            "768-dim MRL recall with 64-dim short-circuiting should be >= 95%, was $recall",
+            "768-dim prefix recall with 64-dim short-circuiting should be >= 95%, was $recall",
             recall >= 0.95
         )
     }
 
     @Test
-    fun testMrlAdversarialNonMrlInvertedEnergyVectors() {
+    fun testPrefixAdversarialInvertedEnergyVectors() {
         // Adversarial scenario: Vectors where the first 64 dimensions carry NO discriminatory signal
         // (zero or pure noise) and signal is concentrated in dimensions 65..128.
         val dim = 128
@@ -448,20 +448,20 @@ class M1AdversarialChallengeTest {
         var totalMatches = 0
         for (q in 0 until numQueries) {
             val query = generateInvertedVector(dim, Random(q.toLong() * 333 + 1))
-            val mrlResults = index.search(query, limit = topK, mrlCoarseDims = 64)
-            val mrlIds = mrlResults.map { it.first }.toSet()
+            val prefixResults = index.search(query, limit = topK, coarsePrefixDims = 64)
+            val prefixIds = prefixResults.map { it.first }.toSet()
 
-            val fullResults = index.search(query, limit = topK, mrlCoarseDims = dim)
+            val fullResults = index.search(query, limit = topK, coarsePrefixDims = dim)
             val fullIds = fullResults.map { it.first }.toSet()
 
-            totalMatches += mrlIds.intersect(fullIds).size
+            totalMatches += prefixIds.intersect(fullIds).size
         }
 
         val totalExpected = topK * numQueries
         val recall = totalMatches.toDouble() / totalExpected
         println("Adversarial Inverted Energy Test (Energy concentrated in late dims):")
         println("  Recall@$topK = ${(recall * 100.0)}% ($totalMatches / $totalExpected)")
-        // Document: MRL short-circuiting explicitly requires MRL-trained representations (e.g. OpenAI text-embedding-3 or Matryoshka models).
+        // Document: Prefix short-circuiting explicitly targets multi-resolution prefix representations.
         // On inverted distributions, upper-layer navigation suffers.
     }
 }

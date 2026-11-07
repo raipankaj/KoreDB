@@ -79,7 +79,7 @@ class OnDeviceAiAndNewFeaturesTest {
 
         articles.insertBatch(
             mapOf(
-                "a1" to AnnotatedArticle("a1", "ai", Tier.PRO, 95.5, "Gemini Nano On-Device", "Local SLM inference with GraphRAG", "Alice"),
+                "a1" to AnnotatedArticle("a1", "ai", Tier.PRO, 95.5, "On-Device Neural Engine", "Local SLM inference with GraphRAG", "Alice"),
                 "a2" to AnnotatedArticle("a2", "db", Tier.ENTERPRISE, 88.0, "LSM Storage Engine", "Fast SSTable compaction and MVCC", "Bob"),
                 "a3" to AnnotatedArticle("a3", "tech", Tier.FREE, 72.0, "Kotlin Coroutines", "Structured concurrency on Android", "Alice"),
                 "a4" to AnnotatedArticle("a4", "ai", Tier.ENTERPRISE, 99.0, "Binary Quantization", "1-bit vector compression with popcount", "Charlie")
@@ -182,7 +182,7 @@ class OnDeviceAiAndNewFeaturesTest {
             For on-device AI applications, KoreDB provides GraphRAG and Reciprocal Rank Fusion.
             Documents are automatically split into overlapping chunks and linked in the knowledge graph.
 
-            Small language models like Gemini Nano have strict context window token budgets.
+            Small language models on edge devices have strict context window token budgets.
             KoreDB packs the most relevant chunks and graph relations without exceeding the token limit.
         """.trimIndent()
 
@@ -199,7 +199,7 @@ class OnDeviceAiAndNewFeaturesTest {
                 when (i) {
                     0 -> if ("lsm" in lower || "storage" in lower) 1.0f else 0.1f
                     1 -> if ("graphrag" in lower || "chunks" in lower) 1.0f else 0.1f
-                    2 -> if ("gemini" in lower || "token" in lower || "budget" in lower) 1.0f else 0.1f
+                    2 -> if ("edge" in lower || "token" in lower || "budget" in lower) 1.0f else 0.1f
                     else -> 0.05f * (i + 1)
                 }
             }
@@ -224,11 +224,11 @@ class OnDeviceAiAndNewFeaturesTest {
         assertTrue(graph.getOutboundTargetIds(chunkIds[0], "NEXT_CHUNK").contains(chunkIds[1]))
 
         // Add a custom domain relationship to test relationship inclusion in context packer
-        graph.putNode(Node("gemini_nano", setOf("Model"), mapOf("title" to "Gemini Nano")))
-        graph.putEdge(Edge(chunkIds.last(), "gemini_nano", "OPTIMIZED_FOR"))
+        graph.putNode(Node("edge_slm", setOf("Model"), mapOf("title" to "Edge SLM")))
+        graph.putEdge(Edge(chunkIds.last(), "edge_slm", "OPTIMIZED_FOR"))
 
-        // Assemble token-budgeted context for a query about Gemini Nano token budgets
-        val queryVec = embedder("gemini nano token budget")
+        // Assemble token-budgeted context for a query about edge SLM token budgets
+        val queryVec = embedder("edge slm token budget")
         val contextWindow = bridge.assemblePromptContext(
             query = queryVec,
             maxTokenBudget = 80,
@@ -393,7 +393,7 @@ class OnDeviceAiAndNewFeaturesTest {
 
         articles.insertBatch(
             mapOf(
-                "a1" to AnnotatedArticle("a1", "ai", Tier.PRO, 95.5, "Gemini Nano", "SLM inference", "Alice", listOf("android", "llm", "edge")),
+                "a1" to AnnotatedArticle("a1", "ai", Tier.PRO, 95.5, "Edge SLM", "SLM inference", "Alice", listOf("android", "llm", "edge")),
                 "a2" to AnnotatedArticle("a2", "ai", Tier.ENTERPRISE, 99.0, "GraphRAG", "Knowledge graphs", "Bob", listOf("graph", "llm", "rag")),
                 "a3" to AnnotatedArticle("a3", "db", Tier.ENTERPRISE, 88.0, "LSM Trees", "Storage engine", "Charlie", listOf("storage", "kotlin", "android"))
             )
@@ -420,7 +420,7 @@ class OnDeviceAiAndNewFeaturesTest {
     }
 
     @Test
-    fun `test Maximal Marginal Relevance (MMR) diversity search and Matryoshka progressive search`() = runBlocking {
+    fun `test Maximal Marginal Relevance (MMR) diversity search and Prefix Funnel progressive search`() = runBlocking {
         // 1. Test MMR Diversity Search
         val mmrCol = db.vectorCollection("mmr_vectors") {
             dimensions = 8
@@ -442,9 +442,9 @@ class OnDeviceAiAndNewFeaturesTest {
         val diverseTop2 = mmrCol.searchMMR(query, limit = 2, fetchK = 4, diversityLambda = 0.35f).map { it.first }
         assertEquals("MMR top-2 must pick best Topic A item and then diverse Topic B item", listOf("topicA_1", "topicB_diverse"), diverseTop2)
 
-        // 2. Test Matryoshka Representation Learning (MRL) Two-Stage Search
+        // 2. Test Prefix Funnel Two-Stage Search
         val dims = 128
-        val mrlCol = db.vectorCollection("mrl_vectors") {
+        val prefixCol = db.vectorCollection("prefix_vectors") {
             dimensions = dims
             metric = DistanceMetric.COSINE
         }
@@ -453,19 +453,19 @@ class OnDeviceAiAndNewFeaturesTest {
         for (i in 0 until 120) {
             val vec = FloatArray(dims) { (rng.nextFloat() - 0.5f) * 2f }
             if (i == 7) targetVec = vec
-            mrlCol.insert("mrl_$i", vec)
+            prefixCol.insert("pfx_$i", vec)
         }
-        mrlCol.waitForIndexing()
+        prefixCol.waitForIndexing()
 
-        val mrlQuery = FloatArray(dims) { idx -> targetVec[idx] + (rng.nextFloat() - 0.5f) * 0.02f }
-        val mrlResults = mrlCol.searchMatryoshka(
-            query = mrlQuery,
+        val prefixQuery = FloatArray(dims) { idx -> targetVec[idx] + (rng.nextFloat() - 0.5f) * 0.02f }
+        val prefixResults = prefixCol.searchPrefixFunnel(
+            query = prefixQuery,
             limit = 5,
             coarseDims = 32,
             oversampleFactor = 4
         )
-        assertEquals(5, mrlResults.size)
-        assertEquals("Matryoshka 32d->128d search must find exact target mrl_7", "mrl_7", mrlResults.first().first)
+        assertEquals(5, prefixResults.size)
+        assertEquals("Prefix funnel 32d->128d search must find exact target pfx_7", "pfx_7", prefixResults.first().first)
     }
 
     @Test

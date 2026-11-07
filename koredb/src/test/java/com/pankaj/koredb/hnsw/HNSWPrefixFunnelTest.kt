@@ -23,10 +23,10 @@ import org.junit.Test
 import java.util.Random
 import kotlin.math.sqrt
 
-class HNSWMRLTest {
+class HNSWPrefixFunnelTest {
 
-    private fun generateMRLVector(dim: Int, rng: Random): FloatArray {
-        // MRL vectors concentrate higher energy/variance in the leading dimensions
+    private fun generatePrefixVector(dim: Int, rng: Random): FloatArray {
+        // Multi-resolution prefix vectors concentrate higher energy/variance in the leading dimensions
         val vec = FloatArray(dim) { idx ->
             val scale = 1.0f / (1.0f + idx * 0.05f)
             rng.nextGaussian().toFloat() * scale
@@ -42,7 +42,7 @@ class HNSWMRLTest {
     fun testMagnitude64CachedOnHNSWNode() {
         val dim = 128
         val rng = Random(42L)
-        val vec = generateMRLVector(dim, rng)
+        val vec = generatePrefixVector(dim, rng)
         val expectedMag64 = SimdVectorMath.getMagnitude16(vec, 64)
 
         val fullMag = VectorMath.getMagnitude(vec)
@@ -70,7 +70,7 @@ class HNSWMRLTest {
         val data = ArrayList<Pair<String, FloatArray>>(numVectors)
         for (i in 0 until numVectors) {
             val id = "vec_$i"
-            val vec = generateMRLVector(dim, rng)
+            val vec = generatePrefixVector(dim, rng)
             data.add(id to vec)
             index.insert(id, vec)
         }
@@ -83,23 +83,23 @@ class HNSWMRLTest {
         val numQueries = 20
 
         for (q in 0 until numQueries) {
-            val query = generateMRLVector(dim, Random(q.toLong() * 997))
+            val query = generatePrefixVector(dim, Random(q.toLong() * 997))
 
-            // 1. MRL short-circuit search (evaluating first 64 dimensions in upper layers)
-            val mrlResults = index.search(query, limit = topK, mrlCoarseDims = 64)
-            val mrlIds = mrlResults.map { it.first }.toSet()
+            // 1. Prefix short-circuit search (evaluating first 64 dimensions in upper layers)
+            val prefixResults = index.search(query, limit = topK, coarsePrefixDims = 64)
+            val prefixIds = prefixResults.map { it.first }.toSet()
 
-            // 2. Full dimensional upper-layer search (mrlCoarseDims = dim disables short-circuiting)
-            val fullResults = index.search(query, limit = topK, mrlCoarseDims = dim)
+            // 2. Full dimensional upper-layer search (coarsePrefixDims = dim disables short-circuiting)
+            val fullResults = index.search(query, limit = topK, coarsePrefixDims = dim)
             val fullIds = fullResults.map { it.first }.toSet()
 
-            val overlap = mrlIds.intersect(fullIds).size
+            val overlap = prefixIds.intersect(fullIds).size
             totalMatches += overlap
         }
 
         val totalExpected = topK * numQueries
         val recall = totalMatches.toDouble() / totalExpected
-        assertTrue("MRL short-circuit search recall against full search must be >= 90%, was $recall",
+        assertTrue("Prefix short-circuit search recall against full search must be >= 90%, was $recall",
             recall >= 0.90)
     }
 
@@ -112,13 +112,13 @@ class HNSWMRLTest {
         val vectors = HashMap<String, FloatArray>()
         for (i in 0 until 50) {
             val id = "doc_$i"
-            val vec = generateMRLVector(dim, rng)
+            val vec = generatePrefixVector(dim, rng)
             vectors[id] = vec
             index.insert(id, vec)
         }
 
-        val query = generateMRLVector(dim, Random(555L))
-        val results = index.search(query, limit = 5, mrlCoarseDims = 64)
+        val query = generatePrefixVector(dim, Random(555L))
+        val results = index.search(query, limit = 5, coarsePrefixDims = 64)
 
         assertEquals(5, results.size)
         for (res in results) {
@@ -131,19 +131,19 @@ class HNSWMRLTest {
 
     @Test
     fun testSmallDimensionBoundaryCondition() {
-        // When dimensions <= 64, MRL short-circuiting should seamlessly evaluate all available dimensions
+        // When dimensions <= 64, prefix short-circuiting should seamlessly evaluate all available dimensions
         val dim = 32
         val rng = Random(777L)
         val index = HNSWIndex(dimensions = dim, metric = DistanceMetric.COSINE)
 
         for (i in 0 until 30) {
-            val vec = generateMRLVector(dim, rng)
+            val vec = generatePrefixVector(dim, rng)
             index.insert("item_$i", vec)
         }
 
-        val query = generateMRLVector(dim, Random(888L))
-        // mrlCoarseDims = 64 on a 32-dim index
-        val results = index.search(query, limit = 5, mrlCoarseDims = 64)
+        val query = generatePrefixVector(dim, Random(888L))
+        // coarsePrefixDims = 64 on a 32-dim index
+        val results = index.search(query, limit = 5, coarsePrefixDims = 64)
 
         assertEquals(5, results.size)
         // Verify results are monotonic descending by similarity
@@ -154,18 +154,18 @@ class HNSWMRLTest {
     }
 
     @Test
-    fun testMatryoshkaTwoStageSearchMethod() {
+    fun testPrefixFunnelTwoStageSearchMethod() {
         val dim = 128
         val rng = Random(333L)
         val index = HNSWIndex(dimensions = dim, metric = DistanceMetric.COSINE)
 
         for (i in 0 until 40) {
-            val vec = generateMRLVector(dim, rng)
+            val vec = generatePrefixVector(dim, rng)
             index.insert("id_$i", vec)
         }
 
-        val query = generateMRLVector(dim, Random(444L))
-        val results = index.searchMatryoshka(
+        val query = generatePrefixVector(dim, Random(444L))
+        val results = index.searchPrefixFunnel(
             query = query,
             limit = 5,
             coarseDims = 64,

@@ -21,7 +21,7 @@ package com.pankaj.koredb.ai
  *
  * Identifies shared semantic anchors across documents so that [com.pankaj.koredb.bridge.GraphVectorBridge]
  * can automatically link chunks from separate documents via shared `Entity` graph nodes:
- * 1. **Multi-word Proper Nouns** (e.g., `"Gemini Nano"`, `"Project Apollo"`, `"Google DeepMind"`)
+ * 1. **Multi-word Proper Nouns** (e.g., `"Nova Engine"`, `"Project Apollo"`, `"DeepSystems Research"`)
  * 2. **Technical / CamelCase Identifiers & Acronyms** (e.g., `"GraphRAG"`, `"KoreDB"`, `"HNSW"`, `"MVCC"`)
  * 3. **Explicit `#hashtags` and `@mentions`**
  */
@@ -50,9 +50,9 @@ object KoreEntityExtractor {
 
     private val HASHTAG_REGEX = Regex("""#([A-Za-z][A-Za-z0-9_-]{1,40})""")
     private val MENTION_REGEX = Regex("""@([A-Za-z][A-Za-z0-9_.-]{1,40})""")
-    // Matches 2 to 4 consecutive capitalized words (e.g. "Project Apollo", "Gemini Nano", "San Francisco")
+    // Matches 2 to 4 consecutive capitalized words (e.g. "Project Apollo", "Nova Engine", "San Francisco")
     private val MULTI_WORD_PROPER_REGEX = Regex("""\b([A-Z][a-z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+){1,3})\b""")
-    // Matches CamelCase (e.g. "KoreDB", "GraphRAG", "MediaPipe") or 3+ uppercase acronyms (e.g. "HNSW", "MVCC", "LSM")
+    // Matches CamelCase (e.g. "KoreDB", "GraphRAG", "VectorEngine") or 3+ uppercase acronyms (e.g. "HNSW", "MVCC", "LSM")
     private val TECHNICAL_CONCEPT_REGEX = Regex("""\b([A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*|[A-Z]{3,10})\b""")
 
     /**

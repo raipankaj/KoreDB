@@ -80,10 +80,10 @@ Explore the comprehensive documentation portal in the [`docs/`](docs/index.md) f
 *   **🏛️ 4-Layer Cognitive Memory Pyramid (`KoreMemoryPyramid`):** L0 LZ4-compressed raw evidence (`6.98×` compression), L1 dual-indexed atomic facts (BM25 + HNSW), L2 zero-LLM Louvain scenario clusters with normalized centroid vectors, and L3 persona/invariants.
 *   **⏳ Bi-Temporal Fact Invalidation (`AtomicFact` & `BiTemporalEdge`):** Tracks both Transaction Time (`ingestedAtMs`) and Validity Time (`validFromMs`, `validUntilMs`) with deterministic contradiction invalidation (`SUPERSEDES` / `SUPERSEDED_BY`), `asOf(validTime, txTime)` historical queries, and lineage tracing.
 *   **🗺️ Symbolic Working Memory & Lossless Drill-Down:** Encodes active agent state as a compact Mermaid graph (`GraphExport.toMermaid`) achieving **99.0% prompt token reduction**, with 1-call `drillDown(nodeId)` back to decompressed L0 raw logs in `~2.2 ms`.
-*   **🦛 HippoRAG 2 Personalized PageRank (`hippoRAGQuery`):** Multi-hop associative recall with hub-noise in-degree damping ($W_{uv} = A_{uv} / d_{\text{in}}(v)^\beta$) achieving **100% Hop-2 Recall@5** where naive BFS GraphRAG and flat vector search score `0%`.
+*   **🦛 Hub-Damped Personalized PageRank (`associativePageRankQuery`):** Multi-hop associative recall with hub-noise in-degree damping ($W_{uv} = A_{uv} / d_{\text{in}}(v)^\beta$) achieving **100% Hop-2 Recall@5** where naive BFS GraphRAG and flat vector search score `0%`.
 *   **🧠 ACT-R / Ebbinghaus Memory Consolidation (`KoreMemoryConsolidator`):** Spaced-repetition stability curves ($S(m)$, $R(m,t)$) that automatically preserve core invariants and reinforced memories while pruning decayed ephemeral noise during LSM compaction.
-*   **🚀 Matryoshka (MRL-64) HNSW & RaBitQ 1-Bit Quantization:** 64-dim prefix short-circuiting on upper HNSW layers (**20,774 QPS**, **56.8× faster** than SQLite) plus unbiased **RaBitQ** 1-bit quantization with orthogonal rotation (**25.6× RAM compression** at **100% Recall@10**).
-*   **⚡ Zero-Dependency `KoreEmbeddingPipeline` & `KoreMemoryInspector`:** Thread-safe LRU embedding cache + 16-lane MRL slicing/normalization (**15×–22× speedup** on Zipfian agent workloads) and human-readable Markdown/Mermaid memory inspection mirrors.
+*   **🚀 Prefix-64 Funnel HNSW & Rotated 1-Bit Quantization:** 64-dim prefix short-circuiting on upper HNSW layers (**20,774 QPS**, **56.8× faster** than SQLite) plus unbiased **Rotated 1-Bit Binary Quantization** with orthogonal rotation (**25.6× RAM compression** at **100% Recall@10**).
+*   **⚡ Zero-Dependency `KoreEmbeddingPipeline` & `KoreMemoryInspector`:** Thread-safe LRU embedding cache + 16-lane prefix slicing/normalization (**15×–22× speedup** on Zipfian agent workloads) and human-readable Markdown/Mermaid memory inspection mirrors.
 *   **🔀 BM25 + Semantic Hybrid Search (RRF):** Fuses keyword inverted search and HNSW vector search with zero glue code.
 *   **🧠 Cost-Based Adaptive Query Planner:** Automatically chooses between Graph-First and Vector-First execution based on cost estimation.
 *   **🔄 Dynamic Over-Fetching:** Solves recall drops by iteratively expanding $k$ ($2x \to 4x$) until requested limit is satisfied.
@@ -824,35 +824,35 @@ KoreDB follows the classic LSM-Tree pattern used by **Bigtable**, **Cassandra**,
 
 ---
 
-## 🧠 2026 SOTA Agent Memory & Vector Benchmarks (KoreDB vs. SQLite / TencentDB Architecture)
+## 🧠 2026 SOTA Agent Memory & Vector Benchmarks (KoreDB vs. Append-Only SQLite & Flat Vector Baselines)
 
-*(Executed via [`SotaAgentMemoryAndVectorBenchmarkTest.kt`](koredb/src/test/java/com/pankaj/koredb/benchmark/SotaAgentMemoryAndVectorBenchmarkTest.kt) comparing KoreDB head-to-head against SQLite + FTS5 + BLOB vector scan, Flat Vector RAG, and Naive 2-Hop BFS GraphRAG)*
+*(Executed via [`SotaAgentMemoryAndVectorBenchmarkTest.kt`](koredb/src/test/java/com/pankaj/koredb/benchmark/SotaAgentMemoryAndVectorBenchmarkTest.kt) comparing KoreDB head-to-head against Append-Only SQLite + FTS5 + BLOB vector scan, Flat Vector RAG, and Naive 2-Hop BFS GraphRAG)*
 
 ### 1. Storage-Layer Temporal Contradiction & Multi-Hop Retrieval (Controlled Embeddings)
-| Benchmark / Metric | SQLite FTS5 + Vector RRF (TencentDB Style) | Naive 2-Hop BFS GraphRAG | KoreDB SOTA Memory Engine |
+| Benchmark / Metric | Append-Only SQLite FTS5 + Vector RRF | Naive 2-Hop BFS GraphRAG | KoreDB SOTA Memory Engine |
 | :--- | :---: | :---: | :---: |
-| **PersonaMem Active Truth Accuracy (200 Evolving Facts)** | 54.0% | N/A | **100.0% (`KoreMemoryPyramid`)** |
+| **Temporal Contradiction Active Truth Accuracy (200 Evolving Facts)** | 54.0% | N/A | **100.0% (`KoreMemoryPyramid`)** |
 | **Stale Fact Pollution in Top-3 Context** | 100.0% | N/A | **0.0% (Bi-Temporal Filtering)** |
-| **LongMemEval Point-in-Time `asOf(T2)` Accuracy** | 0.0% (Unsupported) | 0.0% (Unsupported) | **100.0% (`AtomicFact.isBiTemporallyValidAt`)** |
-| **LoCoMo Hop-2 Associative Recall@5 (80-Edge Hub Noise)** | 0.0% | 0.0% | **100.0% (`HippoRAG 2 PPR`, 1.59 ms)** |
+| **Point-in-Time Historical `asOf(T2)` Accuracy** | 0.0% (Unsupported) | 0.0% (Unsupported) | **100.0% (`AtomicFact.isBiTemporallyValidAt`)** |
+| **Multi-Hop Associative Recall@5 (80-Edge Hub Noise)** | 0.0% | 0.0% | **100.0% (`Hub-Damped PPR`, 1.59 ms)** |
 
 ### 2. Symbolic Working Memory & Context Token Efficiency (25-Step Agent Trajectory)
-| Metric | Raw Tool Transcript | TencentDB Reported Claim | KoreDB Symbolic Memory |
+| Metric | Raw Tool Transcript | Text Summary Baseline | KoreDB Symbolic Memory |
 | :--- | :---: | :---: | :---: |
 | **Active Prompt Context Tokens** | 31,645 tokens | ~12,340 tokens | **325 tokens (`GraphExport.toMermaid`)** |
 | **Prompt Token Reduction (%)** | 0.0% | 61.0% | **99.0% fewer tokens** |
 | **L0 Raw Log Disk Footprint** | 126,525 B | 126,525 B (Plain SQLite) | **18,120 B (6.98× LZ4 Compression)** |
 | **1-Call `L2 -> L1 -> L0` Lossless Drill-Down** | N/A | SQL Join | **2.24 ms (100% byte fidelity)** |
 
-### 3. ANN-Benchmarks: 3,000 Vectors × 256-dim (100 Queries, Top-10 Recall)
+### 3. ANN Vector Search Benchmarks: 3,000 Vectors × 256-dim (100 Queries, Top-10 Recall)
 | Vector Engine Configuration | Avg Latency | Throughput (QPS) | Speedup vs. SQLite | Recall@10 | Vector RAM (Compression) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **SQLite BLOB Scan + Cosine (Baseline)** | 2.732 ms | 366 QPS | 1.0× | 100.0% | 3,000 KB (1.0×) |
 | **KoreDB HNSW FP32 (16-Lane Fused SIMD)** | **0.056 ms** | **17,939 QPS** | **49.0× faster** | **100.0%** | 3,000 KB (1.0×) |
-| **KoreDB HNSW FP32 + MRL-64 Short-Circuit** | **0.048 ms** | **20,774 QPS** | **56.8× faster** | **100.0%** | 3,000 KB (1.0×) |
+| **KoreDB HNSW FP32 + Prefix-64 Funnel** | **0.048 ms** | **20,774 QPS** | **56.8× faster** | **100.0%** | 3,000 KB (1.0×) |
 | **KoreDB HNSW SQ8 (8-Lane Unrolled)** | **0.076 ms** | **13,124 QPS** | **35.9× faster** | **97.6%** | **752 KB (4.0× smaller)** |
-| **KoreDB HNSW SQ8 + MRL-64 Combined** | **0.067 ms** | **14,846 QPS** | **40.6× faster** | **97.6%** | **752 KB (4.0× smaller)** |
-| **KoreDB RaBitQ 1-Bit POPCNT (2-Stage)** | **0.394 ms** | **2,538 QPS** | **6.9× faster** | **100.0%** | **117 KB (25.6× smaller)** |
+| **KoreDB HNSW SQ8 + Prefix-64 Combined** | **0.067 ms** | **14,846 QPS** | **40.6× faster** | **97.6%** | **752 KB (4.0× smaller)** |
+| **KoreDB Rotated 1-Bit POPCNT (2-Stage)** | **0.394 ms** | **2,538 QPS** | **6.9× faster** | **100.0%** | **117 KB (25.6× smaller)** |
 
 ---
 

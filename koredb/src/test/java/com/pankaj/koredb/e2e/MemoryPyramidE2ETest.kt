@@ -47,7 +47,7 @@ import kotlin.math.sqrt
  * Covering:
  * - Tier 1: Feature Coverage (>=5 test cases per feature)
  * - Tier 2: Boundary & Corner Cases (empty pyramid, 0-byte evidence, special characters, max text sizes)
- * - Tier 3: Cross-Feature Interactions (HippoRAG traversing pyramid layers, bi-temporal fact invalidation updating L2 clusters)
+ * - Tier 3: Cross-Feature Interactions (Hub-Damped PageRank traversing pyramid layers, bi-temporal fact invalidation updating L2 clusters)
  * - Tier 4: Real-World Scenarios (End-to-end agent cognitive session: chat ingestion -> fact extraction -> clustering -> inspection)
  */
 class MemoryPyramidE2ETest {
@@ -769,7 +769,7 @@ class MemoryPyramidE2ETest {
     // ========================================================================
 
     @Test
-    fun testHippoRAGAssociativeRecallTraversingMemoryPyramidLayers() = runBlocking {
+    fun testHubDampedAssociativeRecallTraversingMemoryPyramidLayers() = runBlocking {
         // Hierarchy: Persona -> Invariant -> Scenario Cluster -> Fact -> Evidence
         val nodes = setOf("L3_P", "L3_I", "L2_C", "L1_F", "L0_E")
         val outEdges = mapOf(
@@ -781,7 +781,7 @@ class MemoryPyramidE2ETest {
         )
         val seeds = mapOf("L3_P" to 1.0)
 
-        val ranks = TestContracts.computeHippoRAGPageRankGroundTruth(
+        val ranks = TestContracts.computeHubDampedPageRankGroundTruth(
             nodes = nodes,
             outEdges = outEdges,
             seeds = seeds,

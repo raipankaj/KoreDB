@@ -328,15 +328,15 @@ class KoreVectorCollection(
     }
 
     /**
-     * Executes a Two-Stage Matryoshka Representation Learning (MRL) Search:
+     * Executes a Two-Stage Prefix-Truncated Coarse-to-Fine Funnel Search:
      * 1. **Coarse Traversal**: Navigates the HNSW graph using only the first [coarseDims] dimensions
      *    (cutting per-comparison FLOPs by $D / d_{\text{coarse}}$, e.g. $12\times$ for $64$ vs $768$ dims)
      *    to shortlist `limit * oversampleFactor` candidates.
      * 2. **Fine Rescoring**: Rescores the shortlisted candidates using full $D$-dimensional vectors.
      *
-     * Ideal for modern Matryoshka embeddings (Gemini Embedding, Nomic v1.5, OpenAI v3, Gemma).
+     * Ideal for multi-resolution prefix embeddings where leading dimensions carry concentrated variance.
      */
-    suspend fun searchMatryoshka(
+    suspend fun searchPrefixFunnel(
         query: FloatArray,
         limit: Int = 10,
         coarseDims: Int = 64,
@@ -351,7 +351,7 @@ class KoreVectorCollection(
 
         ensureMutableHnsw()
         if (hnsw.size() > 0) {
-            return hnsw.searchMatryoshka(
+            return hnsw.searchPrefixFunnel(
                 query = query,
                 limit = limit,
                 coarseDims = coarseDims,

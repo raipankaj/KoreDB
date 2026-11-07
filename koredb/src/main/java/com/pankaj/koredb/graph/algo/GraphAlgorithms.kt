@@ -233,7 +233,7 @@ object GraphAlgorithms {
     }
 
     /**
-     * Executes HippoRAG 2 Personalized PageRank (PPR) with hub-noise elimination.
+     * Executes Hub-Damped Personalized PageRank (PPR) with hub-noise elimination.
      *
      * Propagates activation from [seedScores] across the graph, damping transitions into
      * high-degree hub nodes to prevent generic concepts from drowning out multi-hop reasoning.

@@ -220,7 +220,7 @@ object SimdVectorMath {
     }
 
     /**
-     * Slices [v] to [targetDimensions] (for Matryoshka Representation Learning embeddings)
+     * Slices [v] to [targetDimensions] (for multi-resolution prefix embeddings)
      * and optionally re-normalizes the prefix to unit L2 length in a single unrolled pass.
      */
     fun sliceAndNormalizeL216(
